@@ -24,8 +24,8 @@ $apiOut = Join-Path $root "api"
 if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed" }
 Write-Host "Published API → $apiOut"
 
-# 3) Root web.config (static + hide source)
-@'
+# 3) Root web.config — UTF-8 NO BOM; no httpLogging (causes HTTP 500 on this IIS)
+$webConfig = @'
 <?xml version="1.0" encoding="utf-8"?>
 <configuration>
   <system.webServer>
@@ -39,7 +39,6 @@ Write-Host "Published API → $apiOut"
       <remove fileExtension=".json" />
       <mimeMap fileExtension=".json" mimeType="application/json" />
     </staticContent>
-    <httpLogging dontLog="true" />
     <security>
       <requestFiltering>
         <hiddenSegments>
@@ -51,7 +50,9 @@ Write-Host "Published API → $apiOut"
     </security>
   </system.webServer>
 </configuration>
-'@ | Set-Content -Path (Join-Path $root "web.config") -Encoding UTF8
+'@
+$utf8 = New-Object System.Text.UTF8Encoding $false
+[System.IO.File]::WriteAllText((Join-Path $root "web.config"), $webConfig.Trim() + "`r`n", $utf8)
 
 Write-Host ""
 Write-Host "DONE."

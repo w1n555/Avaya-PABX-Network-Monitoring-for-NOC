@@ -1,23 +1,30 @@
-# Publish static web + API into deploy\CM for xcopy to C:\inetpub\wwwroot\CM
+# Publish in-place to this IIS site folder:
+#   C:\inetpub\wwwroot\CM  →  http://127.0.0.1:8888/CM
 $ErrorActionPreference = "Stop"
+
+# Project root = parent of scripts\
 $root = Split-Path -Parent $PSScriptRoot
+if (-not (Test-Path (Join-Path $root "src\CmApi\CmApi.csproj"))) {
+  throw "CmApi project not found under $root"
+}
+
 $dotnet = Join-Path $env:LOCALAPPDATA "Microsoft\dotnet\dotnet.exe"
 if (-not (Test-Path $dotnet)) { $dotnet = "dotnet" }
 
-$out = Join-Path $root "deploy\CM"
-Write-Host "Publishing to $out"
+Write-Host "Project root : $root"
+Write-Host "IIS URL      : http://127.0.0.1:8888/CM"
 
-if (Test-Path $out) { Remove-Item $out -Recurse -Force }
-New-Item -ItemType Directory -Path (Join-Path $out "api") -Force | Out-Null
+# 1) Static UI at site root (served as /CM/)
+Copy-Item -Path (Join-Path $root "web\*") -Destination $root -Force
+Write-Host "Copied web/* → site root"
 
-# Static frontend
-Copy-Item -Path (Join-Path $root "web\*") -Destination $out -Recurse -Force
-
-# API
-& $dotnet publish (Join-Path $root "src\CmApi\CmApi.csproj") -c Release -o (Join-Path $out "api") --self-contained false
+# 2) API → /CM/api
+$apiOut = Join-Path $root "api"
+& $dotnet publish (Join-Path $root "src\CmApi\CmApi.csproj") -c Release -o $apiOut --self-contained false
 if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed" }
+Write-Host "Published API → $apiOut"
 
-# Root web.config: default document only (API is sub-app)
+# 3) Root web.config (static + hide source)
 @'
 <?xml version="1.0" encoding="utf-8"?>
 <configuration>
@@ -33,11 +40,20 @@ if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed" }
       <mimeMap fileExtension=".json" mimeType="application/json" />
     </staticContent>
     <httpLogging dontLog="true" />
+    <security>
+      <requestFiltering>
+        <hiddenSegments>
+          <add segment="src" />
+          <add segment="scripts" />
+          <add segment=".git" />
+        </hiddenSegments>
+      </requestFiltering>
+    </security>
   </system.webServer>
 </configuration>
-'@ | Set-Content -Path (Join-Path $out "web.config") -Encoding UTF8
+'@ | Set-Content -Path (Join-Path $root "web.config") -Encoding UTF8
 
 Write-Host ""
-Write-Host "DONE. Copy deploy\CM\* to C:\inetpub\wwwroot\CM\"
-Write-Host "Then in IIS Manager: convert 'api' folder to Application (ASP.NET Core, No Managed Code pool)."
-Write-Host "Requires: ASP.NET Core 8 Hosting Bundle on server."
+Write-Host "DONE."
+Write-Host "Open: http://127.0.0.1:8888/CM/"
+Write-Host "Ensure IIS Application exists for /CM/api (No Managed Code pool + ASP.NET Core 8 Hosting Bundle)."

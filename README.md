@@ -22,46 +22,40 @@ deploy/CM/           → output of publish (xcopy this to IIS)
 
 ---
 
-## IIS deploy (xcopy)
+## Local path = IIS path (this machine)
 
-### Prerequisites on server
+| Item | Value |
+|------|--------|
+| **Source + site root** | `C:\inetpub\wwwroot\CM` |
+| **URL** | `http://127.0.0.1:8888/CM/` |
+| **API** | `http://127.0.0.1:8888/CM/api/` (auto-used by UI) |
 
-1. **IIS** with static content  
+```
+C:\inetpub\wwwroot\CM\
+  index.html, app.js, style.css, web.config   ← static UI (site root)
+  web\                                        ← edit static here, then publish
+  api\                                        ← published ASP.NET Core app
+  src\CmApi\                                  ← API source
+  scripts\publish-iis.ps1
+```
+
+### Prerequisites
+
+1. **IIS** (site on port **8888**)  
 2. **ASP.NET Core 8 Hosting Bundle**  
-   https://dotnet.microsoft.com/download/dotnet/8.0  
-3. Network path from IIS server → CM **TCP 5022**
+3. Network to CM **TCP 5022**  
+4. IIS: **`/CM/api` Convert to Application** · App Pool **No Managed Code**
 
-### Publish (on a build PC)
+### Publish (in-place)
 
 ```powershell
-cd scripts
+cd C:\inetpub\wwwroot\CM\scripts
 .\publish-iis.ps1
 ```
 
-Produces `deploy\CM\` with:
+Then open: **http://127.0.0.1:8888/CM/**
 
-```
-CM\
-  index.html
-  app.js
-  style.css
-  web.config
-  api\          ← published CmApi
-    web.config
-    CmApi.dll
-    ...
-```
-
-### Install
-
-1. Copy **contents** of `deploy\CM\` → `C:\inetpub\wwwroot\CM\`  
-2. IIS Manager → site → **CM\api** → **Convert to Application**  
-   - Application pool: **No Managed Code**, integrated  
-3. Browse: `http://localhost/CM/`  
-
-Frontend calls **`./api/...`** automatically (same folder tree).
-
-Optional: disable site logging in IIS (business requirement: no CDR / no local logging of calls).
+Frontend calls **`./api/...`** (same folder tree). Site `web.config` sets `httpLogging dontLog` (no call logging).
 
 ---
 

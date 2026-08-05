@@ -5,8 +5,11 @@ obj/
 *.suo
 deploy/
 publish/
+# Published ASP.NET output under IIS site (regenerate with scripts\publish-iis.ps1)
+/api/
 **/appsettings.*.local.json
 .env
 .DS_Store
 *.log
 node_modules/
+

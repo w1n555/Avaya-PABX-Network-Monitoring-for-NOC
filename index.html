@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Avaya PABX Network Monitoring for NOC</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="header">
+    <div class="header-left">
+      <h1>Avaya PABX Network Monitoring for NOC</h1>
+      <div class="header-meta">
+        <span><span class="label">CM</span> <span class="value" id="cm-host">—</span></span>
+        <span><span class="label">Status</span> <span class="value" id="conn-status">Disconnected</span></span>
+        <span><span class="label">Last success</span> <span class="value ok" id="last-success">—</span></span>
+        <span><span class="label">Last attempt</span> <span class="value" id="last-attempt">—</span></span>
+      </div>
+      <div class="error-line" id="error-line" hidden></div>
+    </div>
+    <div class="header-right">
+      <div class="live-clock" id="live-clock">--:--:--</div>
+      <span class="badge-live" id="live-badge"><span class="dot"></span><span id="live-badge-text">Idle</span></span>
+    </div>
+  </header>
+
+  <main class="main">
+    <!-- Connect bar (credentials never stored to disk by app) -->
+    <section class="connect-bar" id="connect-bar">
+      <label>Host <input id="inp-host" value="172.29.88.12" autocomplete="off" /></label>
+      <label>Port <input id="inp-port" value="5022" style="width:4.5rem" /></label>
+      <label>User <input id="inp-user" value="monitor" autocomplete="username" /></label>
+      <label>Password <input id="inp-pass" type="password" autocomplete="current-password" /></label>
+      <button type="button" class="btn btn-primary" id="btn-connect">Connect</button>
+      <button type="button" class="btn" id="btn-disconnect" disabled>Disconnect</button>
+      <label class="chk"><input type="checkbox" id="chk-auto" checked /> Auto 30s</label>
+    </section>
+
+    <!-- INDEX -->
+    <section id="view-index">
+      <div class="panel-toolbar">
+        <h2>Trunk Groups</h2>
+        <div class="panel-actions">
+          <div class="search-box">
+            <input type="search" id="trunk-filter" placeholder="Filter TG# / name / type…" />
+          </div>
+          <button type="button" class="btn btn-primary" id="btn-refresh">Refresh</button>
+          <button type="button" class="btn" id="btn-export-index">Export CSV</button>
+        </div>
+      </div>
+      <div class="stats" id="trunk-stats"></div>
+      <div class="table-wrap">
+        <table class="data-table" id="trunk-table">
+          <thead>
+            <tr>
+              <th data-sort="tg">TG#</th>
+              <th data-sort="name">Name</th>
+              <th data-sort="type">Type</th>
+              <th data-sort="total">Total</th>
+              <th data-sort="inUse">In-Use</th>
+              <th data-sort="usagePct">Usage%</th>
+              <th data-sort="oos">OOS</th>
+            </tr>
+          </thead>
+          <tbody id="trunk-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- DETAIL -->
+    <section id="view-detail" hidden>
+      <div class="panel-toolbar">
+        <h2 id="detail-title">Trunk Detail</h2>
+        <div class="panel-actions">
+          <button type="button" class="btn" id="btn-back">← Back</button>
+          <button type="button" class="btn btn-primary" id="btn-refresh-detail">Refresh</button>
+          <button type="button" class="btn" id="btn-export-detail">Export CSV</button>
+        </div>
+      </div>
+      <div class="config-box">
+        <h3>Trunk Config (read-only)</h3>
+        <pre id="detail-config" class="config-pre">—</pre>
+      </div>
+      <div class="stats" id="detail-stats"></div>
+      <div class="table-wrap">
+        <table class="data-table" id="channel-table">
+          <thead>
+            <tr>
+              <th>Member</th>
+              <th>Port</th>
+              <th>Service State</th>
+              <th>Mtce Busy</th>
+              <th>Connected Ports</th>
+              <th>Caller</th>
+              <th>Called</th>
+              <th>Duration</th>
+              <th>Extension</th>
+            </tr>
+          </thead>
+          <tbody id="channel-tbody"></tbody>
+        </table>
+      </div>
+      <p class="hint">Caller / Called / Duration / Extension：視 CM <code>status trunk</code> 即時畫面；idle 或無欄位時顯示 —。無 CDR。</p>
+    </section>
+  </main>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

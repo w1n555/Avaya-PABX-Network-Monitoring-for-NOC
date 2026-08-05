@@ -15,14 +15,15 @@ REQUIREMENT: Run as Administrator.
 5. Connect: Host 172.29.88.12  Port 5022  User monitor  Password (RO)
 
 What the script does:
-  - Check admin
+  - Check admin + progress 0-100%
   - Enable IIS if missing
-  - Install ASP.NET Core 8 Hosting Bundle if missing
+  - Download Hosting Bundle WITH progress bar (BITS/WebClient), install if missing
   - Copy files to C:\inetpub\wwwroot\CM
   - Publish API to C:\inetpub\wwwroot\CM\api
   - Create App Pool CmApiNoManaged (No Managed Code)
   - Create IIS Application /CM and /CM/api
-  - Test /CM/api/health
+  - Write safe web.config (UTF-8 no BOM; no httpLogging - fixes HTTP 500)
+  - Test /CM/api/health AND /CM/ UI
 
 Optional:
   .\one-click-deploy.ps1 -SitePort 8888

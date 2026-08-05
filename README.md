@@ -20,15 +20,17 @@ GitHub: https://github.com/w1n555/Avaya-PABX-Network-Monitoring-for-NOC
 
 ## Do I need IIS GUI every time?
 
-| Situation | Open IIS Manager? |
-|-----------|-------------------|
-| **First time** on a PC / new server | **Yes** (once) — follow section below |
-| Later: only update files (`publish-iis.ps1`) | **No** |
-| Move to **another server** | **Yes again** (once per server) |
+| Situation | What to do |
+|-----------|------------|
+| **First time** / new server | Run **`one-click-deploy.ps1`** as Admin (or Option B GUI once) |
+| **Later updates** (code change) | Run **`one-click-deploy.ps1`** again as Admin |
+| Hosting Bundle **already installed** | Script **auto-skips** download — no flag needed |
+
+Only one deploy script: **`scripts\one-click-deploy.ps1`**.
 
 ---
 
-# Option A — One-click deploy (recommended)
+# Option A — One-click deploy (only script you need)
 
 **Run PowerShell as Administrator**, then:
 
@@ -38,25 +40,37 @@ Set-ExecutionPolicy -Scope Process Bypass -Force
 .\one-click-deploy.ps1
 ```
 
+### Hosting Bundle — auto skip?
+
+**Yes.** The script checks for ASP.NET Core Module (ANCM):
+
+| Detected | Behaviour |
+|----------|-----------|
+| Bundle / ANCM **already installed** | Prints `ANCM already installed - skip download` and **does not download** |
+| **Not** installed | Downloads (with progress) and installs quietly |
+
+You do **not** need `-SkipBundleDownload` in normal use.  
+That switch is only for rare cases (e.g. offline machine, install bundle yourself later).
+
 The script shows a **0–100% progress bar** and will:
 
 1. Check Administrator  
 2. Detect / enable **IIS** (if missing)  
-3. Install **ASP.NET Core 8 Hosting Bundle** (if ANCM missing)  
+3. Install **ASP.NET Core 8 Hosting Bundle** only if missing (**auto-skip** if present)  
 4. Prepare `C:\inetpub\wwwroot\CM`  
 5. Copy project / static UI files  
 6. `dotnet publish` API → `CM\api`  
 7. Create App Pool **CmApiNoManaged** (**.NET CLR = No Managed Code**)  
 8. Create/update IIS Application **`/CM`** and **`/CM/api`**  
-9. Smoke-test `http://127.0.0.1:8888/CM/api/health`  
+9. Smoke-test UI + `http://127.0.0.1:8888/CM/api/health`  
 10. Finish at **100%**
 
-Optional:
+Optional (rarely needed):
 
 ```powershell
 .\one-click-deploy.ps1 -SitePort 8888
-.\one-click-deploy.ps1 -SkipBundleDownload    # bundle already installed
-.\one-click-deploy.ps1 -SkipIisFeatureInstall # IIS already fully installed
+.\one-click-deploy.ps1 -SkipBundleDownload      # force skip even if ANCM not detected
+.\one-click-deploy.ps1 -SkipIisFeatureInstall   # skip enabling IIS features
 ```
 
 See also: `scripts\ONE-CLICK-DEPLOY.txt`
@@ -87,14 +101,7 @@ C:\inetpub\wwwroot\CM\
   scripts\
 ```
 
-If `api\` is missing or empty, open **PowerShell** and run:
-
-```powershell
-cd C:\inetpub\wwwroot\CM\scripts
-.\publish-iis.ps1
-```
-
-(Requires .NET SDK on the build machine.)
+If `api\` is missing or empty, run **Option A** `one-click-deploy.ps1` as Administrator (requires .NET SDK to publish).
 
 ---
 
@@ -250,24 +257,23 @@ This is **not** CDR; we never collect call detail records.
 
 ---
 
-## After first setup — daily use (no IIS GUI)
+## After first setup — update / redeploy
 
 ```powershell
+# Admin PowerShell — same one-click script
 cd C:\inetpub\wwwroot\CM\scripts
-.\publish-iis.ps1
+.\one-click-deploy.ps1
 ```
 
+If Bundle is already installed, download is **skipped automatically**.  
 Then refresh browser: **http://127.0.0.1:8888/CM/**
 
 ---
 
-## New server checklist (do first-time steps again)
+## New server checklist
 
-1. Install IIS + Hosting Bundle + `iisreset`  
-2. Copy project to `C:\inetpub\wwwroot\CM` (or publish output)  
-3. Create/bind site (e.g. port 8888)  
-4. **Convert `CM\api` → Application** (No Managed Code pool)  
-5. Test `/CM/api/health` then `/CM/` Connect  
+Run **`one-click-deploy.ps1` as Administrator** on the new server (or Option B GUI once).  
+Copy/clone project into `C:\inetpub\wwwroot\CM` first if needed.
 
 ---
 
@@ -276,10 +282,10 @@ Then refresh browser: **http://127.0.0.1:8888/CM/**
 ```
 C:\inetpub\wwwroot\CM\
   index.html, app.js, style.css, web.config   ← served as /CM/
-  web\                                        ← edit UI here, then publish
+  web\                                        ← edit UI here, then redeploy
   api\                                        ← published ASP.NET Core (IIS Application)
   src\CmApi\                                  ← API source
-  scripts\publish-iis.ps1
+  scripts\one-click-deploy.ps1                ← only deploy script
   README.md
 ```
 

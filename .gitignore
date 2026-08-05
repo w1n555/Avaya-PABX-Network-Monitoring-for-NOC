@@ -13,3 +13,7 @@ publish/
 *.log
 node_modules/
 
+
+*.bak
+web.config.bak
+

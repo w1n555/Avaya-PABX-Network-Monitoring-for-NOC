@@ -19,9 +19,84 @@ const state = {
   lastAttempt: null,
   lastError: null,
   autoTimer: null,
+  busy: false,
+  apiLog: [], // browser-side last API calls
+  satTraces: [],
 };
 
 const $ = (s) => document.querySelector(s);
+
+function setBusy(on, label) {
+  state.busy = !!on;
+  document.body.classList.toggle("is-busy", state.busy);
+  const el = $("#busy-line");
+  if (!el) return;
+  if (on) {
+    el.hidden = false;
+    el.textContent = label || "⏳ Waiting for CM SAT… (live SSH — can take 5–30s)";
+  } else {
+    el.hidden = true;
+  }
+  // keep connect/disconnect semantics
+  $("#btn-connect").disabled = state.connected || state.busy;
+  $("#btn-disconnect").disabled = !state.connected || state.busy;
+  $("#btn-refresh").disabled = !state.connected || state.busy;
+  $("#btn-refresh-detail").disabled = !state.connected || state.busy;
+}
+
+function pushApiLog(entry) {
+  state.apiLog.unshift(entry);
+  if (state.apiLog.length > 30) state.apiLog.length = 30;
+  renderIoPanel();
+}
+
+function renderIoPanel() {
+  if ($("#chk-io") && !$("#chk-io").checked) {
+    $("#io-panel").style.display = "none";
+    return;
+  }
+  if ($("#io-panel")) $("#io-panel").style.display = "";
+  const apiEl = $("#api-io-log");
+  const satEl = $("#sat-io-log");
+  if (!apiEl || !satEl) return;
+
+  if (!state.apiLog.length) apiEl.textContent = "— no API calls yet —";
+  else {
+    apiEl.textContent = state.apiLog
+      .slice(0, 12)
+      .map((e) => {
+        const bodyHint = e.reqBody ? ` body=${e.reqBody}` : "";
+        return `[${e.at}] ${e.method} ${e.path} → ${e.status} ${e.ms}ms${bodyHint}\n${e.summary || ""}`;
+      })
+      .join("\n----------------\n");
+  }
+
+  if (!state.satTraces.length) satEl.textContent = "— no SAT traces yet (connect first) —";
+  else {
+    satEl.textContent = state.satTraces
+      .slice()
+      .reverse()
+      .slice(0, 8)
+      .map((t) => {
+        const cmd = t.command || t.Command || "";
+        const ms = t.durationMs ?? t.DurationMs ?? "?";
+        const ok = t.ok ?? t.Ok;
+        const pages = t.pagesFetched ?? t.PagesFetched ?? 0;
+        const err = t.error || t.Error || "";
+        const prev = t.outputPreview || t.OutputPreview || "";
+        return `[${t.at || t.At || ""}] SAT ${ok === false ? "FAIL" : "OK"} ${ms}ms pages=${pages}\n> ${cmd}${err ? "\nERR: " + err : ""}\n${prev.slice(0, 1200)}`;
+      })
+      .join("\n================\n");
+  }
+}
+
+function ingestSatTraces(body) {
+  const tr = body?.satTraces || body?.SatTraces;
+  if (Array.isArray(tr) && tr.length) {
+    state.satTraces = tr;
+    renderIoPanel();
+  }
+}
 
 function fmt(dt) {
   if (!dt) return "—";
@@ -40,17 +115,46 @@ function escapeHtml(s) {
 }
 
 async function api(path, opts = {}) {
-  const res = await fetch(API + path.replace(/^\//, ""), {
+  const method = (opts.method || "GET").toUpperCase();
+  const p = path.replace(/^\//, "");
+  const t0 = performance.now();
+  let reqBody = "";
+  if (opts.body && method !== "GET") {
+    try {
+      const j = JSON.parse(opts.body);
+      if (j.password) j.password = "***";
+      reqBody = JSON.stringify(j);
+    } catch {
+      reqBody = "(body)";
+    }
+  }
+  const res = await fetch(API + p, {
     credentials: "same-origin",
     headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
     ...opts,
   });
+  const ms = Math.round(performance.now() - t0);
   let body = null;
   try {
     body = await res.json();
   } catch {
     body = null;
   }
+  const summaryParts = [];
+  if (body?.items || body?.Items) summaryParts.push(`items=${(body.items || body.Items).length}`);
+  if (body?.channels || body?.Channels) summaryParts.push(`channels=${(body.channels || body.Channels).length}`);
+  if (body?.error || body?.Error) summaryParts.push(`error=${body.error || body.Error}`);
+  if (body?.ok === false || body?.Ok === false) summaryParts.push("ok=false");
+  pushApiLog({
+    at: new Date().toLocaleTimeString("en-GB", { hour12: false }),
+    method,
+    path: p,
+    status: res.status,
+    ms,
+    reqBody: reqBody.slice(0, 200),
+    summary: summaryParts.join(" "),
+  });
+  if (body) ingestSatTraces(body);
   if (!res.ok) {
     const msg = body?.error || body?.Error || res.statusText || `HTTP ${res.status}`;
     const err = new Error(msg);
@@ -89,10 +193,10 @@ function updateMeta() {
     badge.classList.add("paused");
     txt.textContent = "Idle";
   }
-  $("#btn-connect").disabled = state.connected;
-  $("#btn-disconnect").disabled = !state.connected;
-  $("#btn-refresh").disabled = !state.connected;
-  $("#btn-refresh-detail").disabled = !state.connected;
+  $("#btn-connect").disabled = state.connected || state.busy;
+  $("#btn-disconnect").disabled = !state.connected || state.busy;
+  $("#btn-refresh").disabled = !state.connected || state.busy;
+  $("#btn-refresh-detail").disabled = !state.connected || state.busy;
 }
 
 function filteredTrunks() {
@@ -216,6 +320,7 @@ function showDetail() {
 /* ---------- Live actions ---------- */
 
 async function connect() {
+  if (state.busy) return;
   setError("");
   const body = {
     host: $("#inp-host").value.trim(),
@@ -224,6 +329,7 @@ async function connect() {
     password: $("#inp-pass").value,
     terminalType: "VT220",
   };
+  setBusy(true, "⏳ Connecting SSH + VT220 to CM…");
   try {
     const res = await api("session/connect", { method: "POST", body: JSON.stringify(body) });
     state.connected = true;
@@ -231,13 +337,16 @@ async function connect() {
     state.lastSuccess = res.connectedAt || new Date().toISOString();
     state.lastAttempt = state.lastSuccess;
     updateMeta();
-    await refreshTrunks();
+    setBusy(true, "⏳ Loading trunk list from CM (list trunk-group)…");
+    await refreshTrunks({ nested: true });
     startAuto();
   } catch (e) {
     state.connected = false;
     state.lastAttempt = new Date().toISOString();
     setError("Connect failed: " + e.message);
     updateMeta();
+  } finally {
+    setBusy(false);
   }
 }
 
@@ -257,16 +366,16 @@ async function disconnect() {
   showIndex();
 }
 
-async function refreshTrunks() {
+async function refreshTrunks(opts = {}) {
   if (!state.connected) return;
+  if (state.busy && !opts.nested) return;
   state.lastAttempt = new Date().toISOString();
   updateMeta();
+  if (!opts.nested) setBusy(true, "⏳ list trunk-group on CM…");
   try {
     const res = await api("trunks");
-    // normalize casing from System.Text.Json default camelCase
     const items = (res.items || res.Items || []).map(normalizeTrunk);
     if (res.ok === false || res.Ok === false) {
-      // may still have cached items
       state.trunks = items.length ? items : state.trunks;
       state.lastSuccess = res.lastSuccessAt || res.LastSuccessAt || state.lastSuccess;
       state.lastAttempt = res.lastAttemptAt || res.LastAttemptAt || state.lastAttempt;
@@ -281,15 +390,17 @@ async function refreshTrunks() {
     renderIndex();
   } catch (e) {
     state.lastAttempt = new Date().toISOString();
-    // keep old trunks
     setError("Update failed: " + e.message + " — last success unchanged");
     if (e.body) {
       const items = (e.body.items || e.body.Items || []).map(normalizeTrunk);
       if (items.length) state.trunks = items;
       state.lastSuccess = e.body.lastSuccessAt || e.body.LastSuccessAt || state.lastSuccess;
+      ingestSatTraces(e.body);
     }
     updateMeta();
     renderIndex();
+  } finally {
+    if (!opts.nested) setBusy(false);
   }
 }
 
@@ -321,10 +432,12 @@ function normalizeChannel(c) {
 }
 
 async function openDetail(tg) {
+  if (state.busy) return;
   state.detailTg = tg;
   state.lastAttempt = new Date().toISOString();
   updateMeta();
   showDetail();
+  setBusy(true, `⏳ status trunk ${tg} + display trunk-group ${tg} (page 1 only)…`);
   try {
     const res = await api(`trunks/${tg}`);
     if (res.ok === false || res.Ok === false) {
@@ -342,7 +455,24 @@ async function openDetail(tg) {
   } catch (e) {
     setError("Detail update failed: " + e.message);
     state.lastAttempt = new Date().toISOString();
+    if (e.body) ingestSatTraces(e.body);
     updateMeta();
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function refreshIo() {
+  if (!state.connected) return;
+  try {
+    const res = await api("session/io");
+    const tr = res.traces || res.Traces || [];
+    if (Array.isArray(tr)) {
+      state.satTraces = tr;
+      renderIoPanel();
+    }
+  } catch (e) {
+    /* ignore */
   }
 }
 
@@ -406,11 +536,18 @@ function stopAuto() {
 function bind() {
   $("#btn-connect").addEventListener("click", connect);
   $("#btn-disconnect").addEventListener("click", disconnect);
-  $("#btn-refresh").addEventListener("click", refreshTrunks);
+  $("#btn-refresh").addEventListener("click", () => refreshTrunks());
   $("#btn-refresh-detail").addEventListener("click", () => state.detailTg != null && openDetail(state.detailTg));
   $("#btn-back").addEventListener("click", showIndex);
   $("#btn-export-index").addEventListener("click", exportIndex);
   $("#btn-export-detail").addEventListener("click", exportDetail);
+  $("#btn-refresh-io")?.addEventListener("click", refreshIo);
+  $("#btn-clear-io")?.addEventListener("click", () => {
+    state.apiLog = [];
+    state.satTraces = [];
+    renderIoPanel();
+  });
+  $("#chk-io")?.addEventListener("change", renderIoPanel);
   $("#trunk-filter").addEventListener("input", (e) => {
     state.filter = e.target.value;
     renderIndex();
@@ -421,7 +558,7 @@ function bind() {
   });
   $("#trunk-tbody").addEventListener("click", (e) => {
     const a = e.target.closest("[data-tg]");
-    if (!a) return;
+    if (!a || state.busy) return;
     e.preventDefault();
     openDetail(Number(a.dataset.tg));
   });
@@ -445,3 +582,4 @@ function bind() {
 bind();
 updateMeta();
 renderIndex();
+renderIoPanel();

@@ -700,3 +700,47 @@ a.trunk-link:hover { text-decoration: underline; }
   color: var(--text-dim);
 }
 .hint code { color: #93c5fd; }
+
+/* busy + IO debug */
+.busy-line {
+  margin-top: 0.35rem;
+  color: #fde68a;
+  font-size: 0.82rem;
+}
+.io-panel {
+  margin-top: 1.5rem;
+  padding: 0.85rem 1rem;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.io-cols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+}
+@media (max-width: 900px) {
+  .io-cols { grid-template-columns: 1fr; }
+}
+.io-panel h3 {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  margin-bottom: 0.35rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.io-pre {
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  background: #0b1224;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.6rem;
+  max-height: 16rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  color: #cbd5e1;
+  margin: 0;
+}
+body.is-busy { cursor: progress; }
+body.is-busy .btn, body.is-busy .trunk-link { pointer-events: none; opacity: 0.65; }

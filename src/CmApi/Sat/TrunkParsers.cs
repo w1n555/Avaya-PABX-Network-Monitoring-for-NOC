@@ -161,14 +161,16 @@ internal static partial class TrunkParsers
 
     public static string SummaryFromDisplay(string visible)
     {
-        // Keep a short readable config text for UI
+        // Collapse accidental multi-redraw garbage (same form repeated with single letters)
         var lines = visible.Split('\n')
             .Select(l => l.Trim())
-            .Where(l => l.Length > 0)
+            .Where(l => l.Length > 2)
             .Where(l => !l.StartsWith("display ", StringComparison.OrdinalIgnoreCase))
             .Where(l => !l.StartsWith("Command", StringComparison.OrdinalIgnoreCase))
             .Where(l => !l.Contains("press ", StringComparison.OrdinalIgnoreCase))
-            .Take(40);
+            .Where(l => l.Length > 1 || !char.IsLetter(l[0])) // drop single-letter noise
+            .Distinct()
+            .Take(50);
         return string.Join("\n", lines);
     }
 }

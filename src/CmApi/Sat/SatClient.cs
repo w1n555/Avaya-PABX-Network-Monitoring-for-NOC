@@ -1,7 +1,22 @@
+using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Text;
 using Renci.SshNet;
 
 namespace CmApi.Sat;
+
+/// <summary>One SAT exchange for UI debug (not written to disk).</summary>
+public sealed class SatIoTrace
+{
+    public DateTimeOffset At { get; set; }
+    public string Command { get; set; } = "";
+    public long DurationMs { get; set; }
+    public bool Ok { get; set; }
+    public string? Error { get; set; }
+    public string OutputPreview { get; set; } = "";
+    public int OutputLength { get; set; }
+    public int PagesFetched { get; set; }
+}
 
 /// <summary>
 /// Read-only Avaya CM SAT over SSH. Terminal VT220. Never issues change/save.
@@ -11,6 +26,8 @@ public sealed class SatClient : IDisposable
     private readonly object _gate = new();
     private SshClient? _ssh;
     private ShellStream? _shell;
+    private readonly ConcurrentQueue<SatIoTrace> _traces = new();
+    private const int MaxTraces = 20;
 
     public string Host { get; private set; } = "";
     public int Port { get; private set; } = 5022;
@@ -18,8 +35,12 @@ public sealed class SatClient : IDisposable
     public string Banner { get; private set; } = "";
     public bool IsConnected => _ssh?.IsConnected == true && _shell != null;
 
-    public static readonly string CancelPf1 = "\x1bOP";
-    public static readonly string NextPage = "\x1b[6~";
+    // Avaya VT220 mappings (ASA-style)
+    public static readonly string CancelPf1 = "\x1bOP";      // PF1 Cancel
+    public static readonly string NextPagePf2 = "\x1bOQ";  // PF2 Next
+    public static readonly string NextPageKey = "\x1b[6~"; // PageDown
+
+    public IReadOnlyList<SatIoTrace> GetTraces() => _traces.ToArray();
 
     public void Connect(string host, int port, string username, string password, string terminalType = "VT220")
     {
@@ -30,7 +51,6 @@ public sealed class SatClient : IDisposable
             Port = port;
             TerminalType = string.IsNullOrWhiteSpace(terminalType) ? "VT220" : terminalType.Trim();
 
-            // Avaya SAT often advertises keyboard-interactive (not pure "password")
             var kbi = new KeyboardInteractiveAuthenticationMethod(username);
             kbi.AuthenticationPrompt += (_, e) =>
             {
@@ -45,37 +65,33 @@ public sealed class SatClient : IDisposable
 
             _ssh = new SshClient(conn);
             _ssh.Connect();
-            _shell = _ssh.CreateShellStream("xterm", 140, 50, 800, 600, 8192);
-            Thread.Sleep(800);
+            // larger terminal reduces "more" paging for status lists
+            _shell = _ssh.CreateShellStream("vt220", 160, 60, 1024, 768, 16384);
+            Thread.Sleep(700);
             var intro = ReadAvailable(TimeSpan.FromSeconds(5));
             Banner = AnsiHelper.VisibleText(intro);
 
-            // Answer terminal type prompt
             if (Banner.Contains("Terminal Type", StringComparison.OrdinalIgnoreCase) ||
                 intro.Contains("Terminal Type", StringComparison.OrdinalIgnoreCase))
             {
-                _shell.Write(TerminalType + "\r");
-                Thread.Sleep(500);
-                var after = ReadAvailable(TimeSpan.FromSeconds(8));
-                Banner += "\n" + AnsiHelper.VisibleText(after);
+                WriteRaw(TerminalType + "\r");
+                Thread.Sleep(400);
+                Banner += "\n" + AnsiHelper.VisibleText(ReadAvailable(TimeSpan.FromSeconds(8)));
             }
 
-            if (!Banner.Contains("Command:", StringComparison.OrdinalIgnoreCase) &&
-                !afterHasCommand(Banner))
+            if (!Banner.Contains("Command:", StringComparison.OrdinalIgnoreCase))
             {
-                // try enter once
-                _shell.Write("\r");
-                Thread.Sleep(400);
+                WriteRaw("\r");
+                Thread.Sleep(300);
                 Banner += "\n" + AnsiHelper.VisibleText(ReadAvailable(TimeSpan.FromSeconds(3)));
             }
 
             if (!Banner.Contains("Command:", StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException("SAT Command: prompt not reached after terminal type. Check account / terminal.");
+                throw new InvalidOperationException("SAT Command: prompt not reached after terminal type.");
+
+            ForceCommandPrompt(maxAttempts: 4);
         }
     }
-
-    private static bool afterHasCommand(string s) =>
-        s.Contains("Command:", StringComparison.OrdinalIgnoreCase);
 
     public void Disconnect()
     {
@@ -91,95 +107,170 @@ public sealed class SatClient : IDisposable
 
     public void Dispose() => Disconnect();
 
-    public string RunReadOnly(string command, int maxPages = 20)
+    /// <param name="maxPages">0 = first screen only (no next-page). Good for display forms with many pages.</param>
+    public string RunReadOnly(string command, int maxPages = 5)
     {
-        if (command.IndexOf("change", StringComparison.OrdinalIgnoreCase) >= 0 ||
-            command.IndexOf("add ", StringComparison.OrdinalIgnoreCase) >= 0 ||
-            command.IndexOf("remove", StringComparison.OrdinalIgnoreCase) >= 0 ||
-            command.IndexOf("save ", StringComparison.OrdinalIgnoreCase) >= 0 ||
-            command.StartsWith("busyout", StringComparison.OrdinalIgnoreCase) ||
-            command.StartsWith("release", StringComparison.OrdinalIgnoreCase) ||
-            command.StartsWith("reset", StringComparison.OrdinalIgnoreCase))
-        {
+        if (IsBlocked(command))
             throw new InvalidOperationException("Blocked non-read-only command: " + command);
-        }
 
         lock (_gate)
         {
             if (_shell == null || _ssh?.IsConnected != true)
                 throw new InvalidOperationException("Not connected to CM SAT.");
 
-            EnsureCommandPrompt();
-            // Clear any residual input buffer noise
-            _ = ReadAvailable(TimeSpan.FromMilliseconds(150));
-
-            _shell.Write(command.Trim() + "\r");
-            Thread.Sleep(1200);
-            var sb = new StringBuilder();
-            sb.Append(ReadAvailable(TimeSpan.FromSeconds(12)));
-
-            for (var i = 0; i < maxPages; i++)
+            var sw = Stopwatch.StartNew();
+            var pages = 0;
+            try
             {
-                var text = sb.ToString();
-                var needsNext =
-                    text.Contains("NEXT PAGE", StringComparison.OrdinalIgnoreCase) ||
-                    text.Contains("press NEXT", StringComparison.OrdinalIgnoreCase) ||
-                    text.Contains("to continue", StringComparison.OrdinalIgnoreCase);
-                // avoid infinite next when already completed
-                if (needsNext && !text.Contains("Command successfully completed", StringComparison.OrdinalIgnoreCase))
+                // Critical: must be at Command: or each keystroke edits the open form
+                // (symptoms: single letters d,i,s,p... with form redraw — what you saw)
+                ForceCommandPrompt(maxAttempts: 10);
+                Drain(150);
+
+                // Send whole command at once + CR
+                WriteRaw(command.Trim() + "\r");
+                Thread.Sleep(800);
+
+                var sb = new StringBuilder();
+                sb.Append(ReadAvailable(TimeSpan.FromSeconds(8)));
+
+                // Only page when maxPages > 0 and prompt asks for NEXT PAGE
+                for (var i = 0; i < maxPages; i++)
                 {
-                    // Prefer PF2 then PageDown (Avaya mappings vary)
-                    _shell.Write("\x1bOQ");
-                    Thread.Sleep(200);
-                    _shell.Write(NextPage);
-                    Thread.Sleep(500);
-                    var more = ReadAvailable(TimeSpan.FromSeconds(6));
+                    var text = sb.ToString();
+                    if (!NeedsNextPage(text)) break;
+                    if (text.Contains("Command successfully completed", StringComparison.OrdinalIgnoreCase))
+                        break;
+
+                    WriteRaw(NextPagePf2);
+                    Thread.Sleep(150);
+                    WriteRaw(NextPageKey);
+                    Thread.Sleep(400);
+                    var more = ReadAvailable(TimeSpan.FromSeconds(4));
                     if (string.IsNullOrWhiteSpace(more)) break;
                     sb.Append(more);
+                    pages++;
                 }
-                else break;
-            }
 
-            // Cancel back to Command:
-            for (var i = 0; i < 6; i++)
+                // Leave form — Cancel only (do NOT keep paging remaining 20 pages)
+                ForceCommandPrompt(maxAttempts: 8);
+
+                var visible = AnsiHelper.VisibleText(sb.ToString());
+                sw.Stop();
+                PushTrace(new SatIoTrace
+                {
+                    At = DateTimeOffset.Now,
+                    Command = command,
+                    DurationMs = sw.ElapsedMilliseconds,
+                    Ok = true,
+                    OutputPreview = Truncate(visible, 4000),
+                    OutputLength = visible.Length,
+                    PagesFetched = pages,
+                });
+                return visible;
+            }
+            catch (Exception ex)
             {
-                var cur = sb.ToString();
-                if (EndsWithCommandPrompt(cur)) break;
-                _shell.Write(CancelPf1);
-                Thread.Sleep(350);
-                sb.Append(ReadAvailable(TimeSpan.FromSeconds(2.5)));
+                sw.Stop();
+                try { ForceCommandPrompt(maxAttempts: 5); } catch { /* ignore */ }
+                PushTrace(new SatIoTrace
+                {
+                    At = DateTimeOffset.Now,
+                    Command = command,
+                    DurationMs = sw.ElapsedMilliseconds,
+                    Ok = false,
+                    Error = ex.Message,
+                    OutputPreview = "",
+                    OutputLength = 0,
+                    PagesFetched = pages,
+                });
+                throw;
             }
-
-            return AnsiHelper.VisibleText(sb.ToString());
         }
     }
 
-    private void EnsureCommandPrompt()
+    private void PushTrace(SatIoTrace t)
     {
-        for (var i = 0; i < 6; i++)
+        _traces.Enqueue(t);
+        while (_traces.Count > MaxTraces && _traces.TryDequeue(out _)) { }
+    }
+
+    private static bool IsBlocked(string command)
+    {
+        var c = command.Trim();
+        return c.StartsWith("change", StringComparison.OrdinalIgnoreCase)
+               || c.StartsWith("add ", StringComparison.OrdinalIgnoreCase)
+               || c.StartsWith("remove", StringComparison.OrdinalIgnoreCase)
+               || c.StartsWith("save ", StringComparison.OrdinalIgnoreCase)
+               || c.StartsWith("busyout", StringComparison.OrdinalIgnoreCase)
+               || c.StartsWith("release", StringComparison.OrdinalIgnoreCase)
+               || c.StartsWith("reset", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool NeedsNextPage(string text)
+    {
+        // Prefer explicit NEXT PAGE — avoid matching unrelated "to continue"
+        return text.Contains("NEXT PAGE", StringComparison.OrdinalIgnoreCase)
+               || text.Contains("press NEXT", StringComparison.OrdinalIgnoreCase)
+               || text.Contains("--More--", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>Hammer Cancel until Command: prompt is visible.</summary>
+    private void ForceCommandPrompt(int maxAttempts)
+    {
+        for (var i = 0; i < maxAttempts; i++)
         {
-            var peek = ReadAvailable(TimeSpan.FromMilliseconds(400));
-            if (EndsWithCommandPrompt(peek) || (string.IsNullOrEmpty(peek) && i > 0))
+            var peek = ReadAvailable(TimeSpan.FromMilliseconds(350));
+            var vis = AnsiHelper.VisibleText(peek);
+            if (HasCommandPrompt(vis) || HasCommandPrompt(peek))
+                return;
+
+            // still on a form: Cancel (PF1), then Esc as fallback
+            WriteRaw(CancelPf1);
+            Thread.Sleep(200);
+            if (i % 3 == 2)
             {
-                // empty after cancel often means ready
-                if (EndsWithCommandPrompt(peek) || i >= 2) return;
+                WriteRaw("\x1b\x1b");
+                Thread.Sleep(100);
             }
-            _shell!.Write(CancelPf1);
-            Thread.Sleep(300);
+        }
+
+        // last drain
+        var last = AnsiHelper.VisibleText(ReadAvailable(TimeSpan.FromMilliseconds(500)));
+        if (!HasCommandPrompt(last))
+        {
+            // not fatal — next Write may still fail; caller will notice
         }
     }
 
-    private static bool EndsWithCommandPrompt(string buf)
+    private static bool HasCommandPrompt(string buf)
     {
         if (string.IsNullOrEmpty(buf)) return false;
-        var v = AnsiHelper.VisibleText(buf);
-        // last non-empty line is Command:
-        var lines = v.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        if (lines.Length == 0) return false;
-        var last = lines[^1];
-        return last.StartsWith("Command:", StringComparison.OrdinalIgnoreCase) ||
-               last.Equals("Command:", StringComparison.OrdinalIgnoreCase) ||
-               v.Contains("Command successfully completed", StringComparison.OrdinalIgnoreCase);
+        // Avoid false positive from "Command successfully completed" mid-form
+        if (buf.Contains("Command:", StringComparison.OrdinalIgnoreCase))
+        {
+            // if still showing NEXT PAGE / form header without clean prompt, treat carefully
+            var lines = buf.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            for (var i = lines.Length - 1; i >= 0 && i >= lines.Length - 5; i--)
+            {
+                if (lines[i].StartsWith("Command:", StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    private void WriteRaw(string s)
+    {
+        if (_shell == null) return;
+        // Write entire string (not char-by-char)
+        _shell.Write(s);
+        _shell.Flush();
+    }
+
+    private void Drain(int ms)
+    {
+        ReadAvailable(TimeSpan.FromMilliseconds(ms));
     }
 
     private string ReadAvailable(TimeSpan timeout)
@@ -188,7 +279,7 @@ public sealed class SatClient : IDisposable
         var sb = new StringBuilder();
         var end = DateTime.UtcNow + timeout;
         var lastData = DateTime.UtcNow;
-        var buffer = new byte[8192];
+        var buffer = new byte[16384];
         while (DateTime.UtcNow < end)
         {
             var readAny = false;
@@ -200,11 +291,18 @@ public sealed class SatClient : IDisposable
                 readAny = true;
                 lastData = DateTime.UtcNow;
             }
-            if (!readAny && sb.Length > 0 && (DateTime.UtcNow - lastData).TotalMilliseconds > 1000)
+            // idle after data → done
+            if (!readAny && sb.Length > 0 && (DateTime.UtcNow - lastData).TotalMilliseconds > 450)
                 break;
             if (!readAny)
-                Thread.Sleep(60);
+                Thread.Sleep(40);
         }
         return sb.ToString();
+    }
+
+    private static string Truncate(string s, int max)
+    {
+        if (string.IsNullOrEmpty(s) || s.Length <= max) return s;
+        return s[..max] + "\n...[truncated]...";
     }
 }

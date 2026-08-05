@@ -333,8 +333,14 @@ $csproj = Join-Path $TargetRoot "src\CmApi\CmApi.csproj"
 if (-not (Test-Path $csproj)) { $csproj = Join-Path $ProjectRoot "src\CmApi\CmApi.csproj" }
 $apiOut = Join-Path $TargetRoot "api"
 Write-Progress -Activity "Avaya NOC one-click deploy" -Status "dotnet publish..." -PercentComplete 70
+# Unlock DLL locked by w3wp
+$appcmdTmp = Get-AppCmd
+try { & $appcmdTmp stop apppool /apppool.name:"$AppPoolName" 2>$null | Out-Null } catch {}
+Start-Sleep -Seconds 1
 & $dotnet publish $csproj -c Release -o $apiOut --self-contained false
-if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed" }
+$pubExit = $LASTEXITCODE
+try { & $appcmdTmp start apppool /apppool.name:"$AppPoolName" 2>$null | Out-Null } catch {}
+if ($pubExit -ne 0) { throw "dotnet publish failed" }
 if (-not (Test-Path (Join-Path $apiOut "CmApi.dll"))) { throw "CmApi.dll missing" }
 Write-Host "  API published: $apiOut" -ForegroundColor Green
 

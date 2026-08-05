@@ -17,6 +17,7 @@
         <span><span class="label">Last attempt</span> <span class="value" id="last-attempt">—</span></span>
       </div>
       <div class="error-line" id="error-line" hidden></div>
+      <div class="busy-line" id="busy-line" hidden>⏳ Waiting for CM SAT… (each click is a live SSH command — can take 5–30s)</div>
     </div>
     <div class="header-right">
       <div class="live-clock" id="live-clock">--:--:--</div>
@@ -101,6 +102,29 @@
         </table>
       </div>
       <p class="hint">Caller / Called / Duration / Extension：視 CM <code>status trunk</code> 即時畫面；idle 或無欄位時顯示 —。無 CDR。</p>
+    </section>
+
+    <!-- Live API / SAT I/O debug (memory only, not file log) -->
+    <section class="io-panel" id="io-panel">
+      <div class="panel-toolbar">
+        <h2>Live API / SAT I/O (debug)</h2>
+        <div class="panel-actions">
+          <label class="chk"><input type="checkbox" id="chk-io" checked /> Show</label>
+          <button type="button" class="btn" id="btn-refresh-io">Refresh I/O</button>
+          <button type="button" class="btn" id="btn-clear-io">Clear local</button>
+        </div>
+      </div>
+      <p class="hint">唔會寫 disk log。顯示最近 API 請求同後端轉去 CM 嘅 SAT command / 輸出預覽 / 耗時。</p>
+      <div class="io-cols">
+        <div>
+          <h3>Browser → API</h3>
+          <pre id="api-io-log" class="io-pre">—</pre>
+        </div>
+        <div>
+          <h3>API → CM SAT</h3>
+          <pre id="sat-io-log" class="io-pre">—</pre>
+        </div>
+      </div>
     </section>
   </main>
 

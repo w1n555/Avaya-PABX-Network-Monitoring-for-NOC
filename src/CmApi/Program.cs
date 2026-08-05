@@ -103,6 +103,23 @@ app.MapGet("/session/status", (SessionStore store, HttpContext http) =>
     });
 });
 
+app.MapGet("/session/io", (SessionStore store, HttpContext http) =>
+{
+    var s = GetSession(store, http);
+    if (s == null)
+        return Results.Json(new { ok = false, error = "Not connected", traces = Array.Empty<object>() }, statusCode: 401);
+    var traces = s.Client.GetTraces();
+    return Results.Ok(new
+    {
+        ok = true,
+        host = s.Host,
+        lastSuccessAt = s.LastSuccessAt,
+        lastAttemptAt = s.LastAttemptAt,
+        lastError = s.LastError,
+        traces,
+    });
+});
+
 app.MapGet("/trunks", (SessionStore store, HttpContext http) =>
 {
     var s = GetSession(store, http);
@@ -114,7 +131,8 @@ app.MapGet("/trunks", (SessionStore store, HttpContext http) =>
     {
         var items = s.WithLock(() =>
         {
-            var raw = s.Client.RunReadOnly("list trunk-group", maxPages: 25);
+            // list trunk-group can be multi-page; cap pages for latency
+            var raw = s.Client.RunReadOnly("list trunk-group", maxPages: 12);
             return TrunkParsers.ParseTrunkGroups(raw);
         });
 
@@ -129,12 +147,12 @@ app.MapGet("/trunks", (SessionStore store, HttpContext http) =>
             LastSuccessAt = s.LastSuccessAt,
             LastAttemptAt = s.LastAttemptAt,
             Items = items,
+            SatTraces = s.Client.GetTraces().TakeLast(3).ToList(),
         });
     }
     catch (Exception ex)
     {
         s.LastError = ex.Message;
-        // Keep prior cache if any
         return Results.Json(new TrunkListResponse
         {
             Ok = false,
@@ -143,6 +161,7 @@ app.MapGet("/trunks", (SessionStore store, HttpContext http) =>
             LastSuccessAt = s.LastSuccessAt,
             LastAttemptAt = s.LastAttemptAt,
             Items = s.TrunkCache,
+            SatTraces = s.Client.GetTraces().TakeLast(5).ToList(),
         }, statusCode: 502);
     }
 });
@@ -158,13 +177,15 @@ app.MapGet("/trunks/{tg:int}", (int tg, SessionStore store, HttpContext http) =>
     {
         var result = s.WithLock(() =>
         {
-            // Status first (higher value for NOC); then display config
-            var stRaw = s.Client.RunReadOnly($"status trunk {tg}", maxPages: 30);
+            // 1) status trunk — NOC value (channels). Cap pages for speed.
+            var stRaw = s.Client.RunReadOnly($"status trunk {tg}", maxPages: 8);
             var channels = TrunkParsers.ParseChannels(stRaw);
+
+            // 2) display trunk-group — FIRST PAGE ONLY (forms can be 20+ pages; paging all = very slow + cancel mess)
             string cfgRaw = "";
             try
             {
-                cfgRaw = s.Client.RunReadOnly($"display trunk-group {tg}", maxPages: 6);
+                cfgRaw = s.Client.RunReadOnly($"display trunk-group {tg}", maxPages: 0);
             }
             catch
             {
@@ -185,6 +206,7 @@ app.MapGet("/trunks/{tg:int}", (int tg, SessionStore store, HttpContext http) =>
                     ? (stRaw.Length > 1500 ? stRaw[..1500] : stRaw)
                     : null,
                 Channels = channels,
+                SatTraces = s.Client.GetTraces().TakeLast(5).ToList(),
             };
         });
 
@@ -201,6 +223,7 @@ app.MapGet("/trunks/{tg:int}", (int tg, SessionStore store, HttpContext http) =>
             Error = ex.Message,
             LastSuccessAt = s.LastSuccessAt,
             LastAttemptAt = s.LastAttemptAt,
+            SatTraces = s.Client.GetTraces().TakeLast(5).ToList(),
         }, statusCode: 502);
     }
 });

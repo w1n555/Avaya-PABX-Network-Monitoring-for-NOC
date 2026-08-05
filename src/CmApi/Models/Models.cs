@@ -42,6 +42,7 @@ public sealed class TrunkListResponse
     public DateTimeOffset? LastAttemptAt { get; set; }
     public string? Host { get; set; }
     public IReadOnlyList<TrunkGroupDto> Items { get; set; } = Array.Empty<TrunkGroupDto>();
+    public object? SatTraces { get; set; }
 }
 
 public sealed class ChannelDto
@@ -69,6 +70,7 @@ public sealed class TrunkDetailResponse
     /// <summary>Debug aid: truncated visible status text if parse yields 0 channels.</summary>
     public string? RawStatusHint { get; set; }
     public IReadOnlyList<ChannelDto> Channels { get; set; } = Array.Empty<ChannelDto>();
+    public object? SatTraces { get; set; }
 }
 
 public sealed class SessionStatusResponse

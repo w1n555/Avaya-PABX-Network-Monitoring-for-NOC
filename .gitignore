@@ -1,0 +1,12 @@
+bin/
+obj/
+.vs/
+*.user
+*.suo
+deploy/
+publish/
+**/appsettings.*.local.json
+.env
+.DS_Store
+*.log
+node_modules/

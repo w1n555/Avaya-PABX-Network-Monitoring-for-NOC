@@ -28,9 +28,46 @@ GitHub: https://github.com/w1n555/Avaya-PABX-Network-Monitoring-for-NOC
 
 ---
 
-# First-time IIS setup (GUI) — step by step
+# Option A — One-click deploy (recommended)
 
-Do this **once** on each Windows server that will host the app.
+**Run PowerShell as Administrator**, then:
+
+```powershell
+cd C:\inetpub\wwwroot\CM\scripts
+Set-ExecutionPolicy -Scope Process Bypass -Force
+.\one-click-deploy.ps1
+```
+
+The script shows a **0–100% progress bar** and will:
+
+1. Check Administrator  
+2. Detect / enable **IIS** (if missing)  
+3. Install **ASP.NET Core 8 Hosting Bundle** (if ANCM missing)  
+4. Prepare `C:\inetpub\wwwroot\CM`  
+5. Copy project / static UI files  
+6. `dotnet publish` API → `CM\api`  
+7. Create App Pool **CmApiNoManaged** (**.NET CLR = No Managed Code**)  
+8. Create/update IIS Application **`/CM`** and **`/CM/api`**  
+9. Smoke-test `http://127.0.0.1:8888/CM/api/health`  
+10. Finish at **100%**
+
+Optional:
+
+```powershell
+.\one-click-deploy.ps1 -SitePort 8888
+.\one-click-deploy.ps1 -SkipBundleDownload    # bundle already installed
+.\one-click-deploy.ps1 -SkipIisFeatureInstall # IIS already fully installed
+```
+
+See also: `scripts\ONE-CLICK-DEPLOY.txt`
+
+If the one-click script cannot run (no admin / corporate policy), use **Option B (GUI)** below.
+
+---
+
+# Option B — First-time IIS setup (GUI) — step by step
+
+Do this **once** on each Windows server that will host the app (only if you do **not** use one-click).
 
 ---
 

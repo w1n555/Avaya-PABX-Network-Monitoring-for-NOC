@@ -1,0 +1,17 @@
+Avaya NOC — one-click deploy
+============================
+
+1. Right-click PowerShell → Run as administrator
+2. Run:
+
+   cd C:\inetpub\wwwroot\CM\scripts
+   Set-ExecutionPolicy -Scope Process Bypass -Force
+   .\one-click-deploy.ps1
+
+3. Wait for progress 0% → 100%
+4. Open: http://127.0.0.1:8888/CM/
+5. Connect: 172.29.88.12 / monitor / (your password)
+
+Optional:
+   .\one-click-deploy.ps1 -SitePort 8888
+   .\one-click-deploy.ps1 -SkipBundleDownload   # if Hosting Bundle already installed

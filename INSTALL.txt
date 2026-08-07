@@ -3,14 +3,15 @@ Avaya NOC — easy install (ZIP → IIS → Login)
 
 Your goal (supported):
   1. Install IIS yourself (Windows Features)
-  2. Extract this package to a folder (example: C:\inetpub\wwwroot\CM)
-  3. Run ONE script as Administrator:
+  2. Extract this package to ANY folder you choose
+     (example only: C:\inetpub\wwwroot\CM — any path is fine)
+  3. Admin PowerShell — go into that folder's scripts\ then:
 
-       powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
+       powershell -ExecutionPolicy Bypass -File .\install.ps1
 
-  4. When asked, confirm ROOT path (default = this package folder)
+  4. Confirm ROOT path when asked (default = package folder)
   5. Open the URL printed (e.g. http://127.0.0.1:8888/)
-  6. Enter CM Host + Password → Login → monitoring starts
+  6. Enter YOUR CM Host + Password → Login → monitoring starts
 
 What install.ps1 does:
   - Detects IIS (if missing, tells you to install IIS first — does NOT auto-install IIS)
@@ -42,7 +43,7 @@ ONE command for new install AND upgrade (auto-detect)
 ------------------------------------------------------------
 Always the same:
 
-  cd C:\inetpub\wwwroot\CM\scripts
+  cd <YOUR_EXTRACT_FOLDER>\scripts
   powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 Script detects:

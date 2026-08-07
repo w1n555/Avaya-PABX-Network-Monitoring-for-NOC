@@ -1,35 +1,43 @@
-# Start local OSSI bridge (127.0.0.1:18765) for NOC dashboard
-# Requires: pip install -e C:\Users\W1NGGG\source\AVAYA-OSSI-2026
+# Start local OSSI bridge (127.0.0.1:18765) — portable, no hard-coded machine paths.
+# Prefer: install.ps1 (auto). This script is for manual troubleshooting only.
 
 param(
-    [string]$DataDir = "C:\inetpub\wwwroot\CM\data",
-    [string]$Script = "C:\inetpub\wwwroot\CM\python\ossi_service.py",
+    [string]$Root = "",
     [int]$Port = 18765
 )
 
 $ErrorActionPreference = "Stop"
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+if (-not $Root) { $Root = (Resolve-Path (Join-Path $scriptDir "..")).Path }
+
+$DataDir = Join-Path $Root "data"
+$Script = Join-Path $Root "python\ossi_service.py"
+$WorkDir = Join-Path $Root "python"
 
 $pythonCandidates = @(
-    "$env:LOCALAPPDATA\hermes\hermes-agent\venv\Scripts\python.exe",
-    "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe",
-    "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe",
+    (Join-Path $Root "python\.venv\Scripts\python.exe"),
+    (Join-Path $env:LOCALAPPDATA "Programs\Python\Python312\python.exe"),
+    (Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\python.exe"),
+    "C:\Python312\python.exe",
+    "C:\Python311\python.exe",
     "python"
 )
 $py = $null
 foreach ($c in $pythonCandidates) {
-    if ($c -eq "python") { $py = $c; break }
-    if (Test-Path $c) { $py = $c; break }
+    if ($c -eq "python") {
+        $cmd = Get-Command python -ErrorAction SilentlyContinue
+        if ($cmd) { $py = $cmd.Source; break }
+        continue
+    }
+    if (Test-Path $c) {
+        & $c -c "import avaya_ossi" 2>$null
+        if ($LASTEXITCODE -eq 0) { $py = $c; break }
+        if (-not $py) { $py = $c }
+    }
 }
-if (-not $py) { throw "Python not found" }
-# Prefer interpreter that can import avaya_ossi
-foreach ($c in $pythonCandidates) {
-    $exe = if ($c -eq "python") { "python" } elseif (Test-Path $c) { $c } else { $null }
-    if (-not $exe) { continue }
-    & $exe -c "import avaya_ossi" 2>$null
-    if ($LASTEXITCODE -eq 0) { $py = $exe; break }
-}
+if (-not $py) { throw "Python not found. Run scripts\install.ps1 first." }
+if (-not (Test-Path $Script)) { throw "Missing $Script" }
 
-# already up?
 try {
     $r = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/health" -UseBasicParsing -TimeoutSec 2
     if ($r.StatusCode -eq 200) {
@@ -40,7 +48,7 @@ try {
 
 Write-Host "Starting OSSI bridge with $py ..."
 $argList = @($Script, "--host", "127.0.0.1", "--port", "$Port", "--data-dir", $DataDir)
-Start-Process -FilePath $py -ArgumentList $argList -WorkingDirectory (Split-Path $Script) -WindowStyle Hidden
+Start-Process -FilePath $py -ArgumentList $argList -WorkingDirectory $WorkDir -WindowStyle Hidden
 Start-Sleep -Seconds 1
 try {
     $r2 = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/health" -UseBasicParsing -TimeoutSec 5

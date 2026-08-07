@@ -2,8 +2,7 @@
 
 IIS web UI for **read-only** Avaya CM monitoring.
 
-**Path:** `C:\inetpub\wwwroot\CM`  
-**Data path:** OSSI package [AVAYA-OSSI-2026](https://github.com/w1n555/AVAYA-OSSI-2026) (`avaya-ossi`) — **not** SAT VT220 screen scraping.
+**Install anywhere** (any Windows folder). OSSI client is **bundled** under `vendor/avaya-ossi` — not SAT scraping.
 
 ---
 
@@ -35,21 +34,15 @@ data/monitored_trunks.json   which TG numbers to poll
 ## File structure
 
 ```text
-C:\inetpub\wwwroot\CM\
-  index.html          # UI (Trunk tab + placeholders)
-  style.css
-  app.js
-  web.config
-  data\
-    monitored_trunks.json
-    trunk_data.json
-  python\
-    ossi_service.py   # OSSI bridge
-    trunk_parse.py
-  api\                # published CmApi
-  src\CmApi\          # source
-  scripts\            # one-click deploy
-  README.md
+<your-extract-folder>/
+  index.html style.css app.js web.config
+  data/                 # runtime JSON (per machine)
+  python/               # OSSI bridge
+  vendor/avaya-ossi/    # bundled OSSI library
+  api/                  # published CmApi
+  src/CmApi/            # source
+  scripts/install.ps1   # one-click setup (any machine)
+  README.md INSTALL.txt
 ```
 
 ---
@@ -77,8 +70,8 @@ C:\inetpub\wwwroot\CM\
 ### 然後一鍵（Admin）
 
 ```powershell
-# 解壓 ZIP 到例如 C:\inetpub\wwwroot\CM 後：
-cd C:\inetpub\wwwroot\CM\scripts
+# 解壓到任意目錄後（Admin）：
+cd <你的解壓目錄>\scripts
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
@@ -104,7 +97,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 ### 新裝 / 舊機升級 — 同一句（自動 detect）
 
 ```powershell
-cd C:\inetpub\wwwroot\CM\scripts
+cd <你的解壓目錄>\scripts
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 

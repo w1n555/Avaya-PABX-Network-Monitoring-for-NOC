@@ -195,11 +195,12 @@ function Find-Python {
         (Join-Path $env:LOCALAPPDATA "Programs\Python\Python313\python.exe"),
         (Join-Path $env:LOCALAPPDATA "Programs\Python\Python312\python.exe"),
         (Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\python.exe"),
+        "C:\Program Files\Python313\python.exe",
         "C:\Program Files\Python312\python.exe",
         "C:\Program Files\Python311\python.exe",
+        "C:\Python313\python.exe",
         "C:\Python312\python.exe",
-        "C:\Python311\python.exe",
-        (Join-Path $env:LOCALAPPDATA "hermes\hermes-agent\venv\Scripts\python.exe")
+        "C:\Python311\python.exe"
     )
     foreach ($c in $cands) {
         if (-not (Test-Path $c)) { continue }

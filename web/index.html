@@ -30,9 +30,9 @@
 
     <section class="connect-panel">
       <div class="connect-fields">
-        <label>Host <input id="inp-host" value="172.29.88.12" autocomplete="off" /></label>
+        <label>Host <input id="inp-host" value="" placeholder="CM IP or hostname" autocomplete="off" /></label>
         <label>Port <input id="inp-port" value="5022" inputmode="numeric" /></label>
-        <label>User <input id="inp-user" value="monitor" autocomplete="username" /></label>
+        <label>User <input id="inp-user" value="" placeholder="RO login e.g. monitor" autocomplete="username" /></label>
         <label>Password <input id="inp-pass" type="password" autocomplete="current-password" /></label>
         <button type="button" class="btn btn-primary" id="btn-connect">Login</button>
         <button type="button" class="btn" id="btn-disconnect" disabled>Logout</button>
@@ -99,8 +99,7 @@
     </main>
 
     <footer class="footer">
-      Data via <strong>AVAYA-OSSI-2026</strong> (avaya-ossi) · No SAT screen scraping · No CDR · Local path
-      <code>C:\inetpub\wwwroot\CM</code>
+      Data via <strong>avaya-ossi</strong> (bundled) · Read-only OSSI · No SAT scraping · No CDR
     </footer>
   </div>
   <script src="app.js" type="module"></script>

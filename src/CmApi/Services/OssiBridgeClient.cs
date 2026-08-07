@@ -72,18 +72,23 @@ public sealed class OssiBridgeClient
 
     private List<string> PythonCandidates()
     {
-        var list = new List<string>();
-        // Prefer site-local venv (IIS app pool can execute under wwwroot)
-        list.Add(Path.Combine(_pythonDir, @".venv\Scripts\python.exe"));
+        // Portable: site venv first, then standard install locations only (no user-specific tools)
+        var list = new List<string>
+        {
+            Path.Combine(_pythonDir, @".venv\Scripts\python.exe"),
+        };
         var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        list.Add(Path.Combine(local, @"hermes\hermes-agent\venv\Scripts\python.exe"));
-        list.Add(Path.Combine(local, @"Programs\Python\Python312\python.exe"));
-        list.Add(Path.Combine(local, @"Programs\Python\Python311\python.exe"));
-        list.Add(Path.Combine(local, @"Programs\Python\Python313\python.exe"));
+        var pf = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+        foreach (var ver in new[] { "Python313", "Python312", "Python311" })
+        {
+            list.Add(Path.Combine(local, "Programs", "Python", ver, "python.exe"));
+            list.Add(Path.Combine(pf, ver, "python.exe"));
+            list.Add(Path.Combine(@"C:\", ver.Replace("Python", "Python"), "python.exe"));
+        }
+        // C:\Python3xx common silent-install layout
+        list.Add(@"C:\Python313\python.exe");
         list.Add(@"C:\Python312\python.exe");
         list.Add(@"C:\Python311\python.exe");
-        list.Add(@"C:\Program Files\Python312\python.exe");
-        list.Add(@"C:\Program Files\Python311\python.exe");
         try
         {
             var psi = new ProcessStartInfo

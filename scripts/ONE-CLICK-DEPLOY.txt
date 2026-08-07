@@ -1,38 +1,6 @@
-Avaya NOC - one-click deploy (ONLY script you need)
-===================================================
+Deprecated — use install.ps1 instead (portable, any machine).
 
-REQUIREMENT: Run as Administrator.
+  cd <YOUR_EXTRACT_FOLDER>\scripts
+  powershell -ExecutionPolicy Bypass -File .\install.ps1
 
-1. Right-click PowerShell -> Run as administrator
-2. Paste:
-
-   cd C:\inetpub\wwwroot\CM\scripts
-   Set-ExecutionPolicy -Scope Process Bypass -Force
-   .\one-click-deploy.ps1
-
-3. Watch progress bar 0% -> 100%
-4. Browser: http://127.0.0.1:8888/CM/
-5. Connect: Host 172.29.88.12  Port 5022  User monitor  Password (RO)
-
-Hosting Bundle:
-  - If ALREADY installed -> script AUTO-SKIPS download (you will see
-    "ANCM already installed - skip download").
-  - You do NOT need -SkipBundleDownload for normal use.
-  - -SkipBundleDownload is only if you want to force skip even when
-    ANCM is not detected (rare / offline).
-
-What the script does:
-  - Check admin + progress 0-100%
-  - Enable IIS if missing
-  - Download Hosting Bundle WITH progress ONLY if missing
-  - Copy files to C:\inetpub\wwwroot\CM
-  - Publish API to C:\inetpub\wwwroot\CM\api
-  - Create App Pool CmApiNoManaged (No Managed Code)
-  - Create IIS Application /CM and /CM/api
-  - Safe web.config (UTF-8 no BOM; no httpLogging)
-  - Test /CM/api/health AND /CM/ UI
-
-Optional (rare):
-  .\one-click-deploy.ps1 -SitePort 8888
-  .\one-click-deploy.ps1 -SkipBundleDownload
-  .\one-click-deploy.ps1 -SkipIisFeatureInstall
+See INSTALL.txt and README.md.

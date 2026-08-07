@@ -599,7 +599,15 @@ class Handler(BaseHTTPRequestHandler):
                 with _lock:
                     if _connected:
                         touch_ui()
+                    live = _connected
                 data = _read_json(PATHS.trunk_data, {"items": [], "connected": False})
+                if not isinstance(data, dict):
+                    data = {"items": [], "connected": False}
+                # Always override file cache with live session flag (stale connected:true was misleading UI)
+                data["connected"] = live
+                if not live:
+                    # keep last host/items for display, but never claim Monitoring from disk alone
+                    data["connected"] = False
                 self._send(200, {"ok": True, "data": data})
                 return
             # GET /trunks/123/detail

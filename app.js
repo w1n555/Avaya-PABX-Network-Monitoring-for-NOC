@@ -343,11 +343,13 @@ function applyMonitoredResponse(res) {
 
 function renderTrunkMeta(data) {
   $("meta-updated").textContent = fmtTime(data && data.lastUpdate);
+  // Last-known CM host from cache is OK to show; session label must follow LIVE state only
   if (data && data.host) $("meta-host").textContent = data.host;
-  if (data && data.connected) {
+  // Never set "Monitoring" from stale trunk_data.connected — only after real Login / session/status
+  if (state.connected) {
     setSessionLabel("Monitoring (OSSI)", true);
-  } else if (!state.connected) {
-    setSessionLabel("已斷線", false);
+  } else {
+    setSessionLabel("Disconnected", false);
   }
 }
 
@@ -582,7 +584,7 @@ async function connect() {
     state.connected = false;
     const msg = String(e.message || e);
     setError(msg);
-    setSessionLabel("已斷線", false);
+    setSessionLabel("Disconnected", false);
     setStatus("");
     applyUiMode();
     failLoginModal(msg);
@@ -641,8 +643,8 @@ async function disconnect() {
   }
   state.connected = false;
   state.disconnecting = false;
-  setSessionLabel("已斷線", false);
-  setStatus("已 Logout — OSSI session 已斷。");
+  setSessionLabel("Disconnected", false);
+  setStatus("Logged out — OSSI session closed.");
   clearAuto();
   closeDetail();
   applyUiMode();
@@ -766,24 +768,29 @@ async function init() {
 
   // Soft init: bridge down must not freeze the page (502 on /monitored)
   try {
-    await loadMonitoredSoft();
-    try {
-      await loadTrunkData();
-    } catch {
-      /* cache miss OK */
-    }
+    // Live session first — drives Session badge (not trunk_data cache)
     try {
       const st = await api("session/status");
       if (st.connected) {
         state.connected = true;
         $("meta-host").textContent = st.host || "—";
-        setSessionLabel("Connected (OSSI)", true);
+        setSessionLabel("Monitoring (OSSI)", true);
         applyUiMode();
         scheduleAuto();
         startHeartbeat();
+      } else {
+        state.connected = false;
+        setSessionLabel("Disconnected", false);
       }
     } catch {
-      /* session probe optional */
+      state.connected = false;
+      setSessionLabel("Disconnected", false);
+    }
+    await loadMonitoredSoft();
+    try {
+      await loadTrunkData(); // may show last numbers; will NOT flip Session to Monitoring if offline
+    } catch {
+      /* cache miss OK */
     }
   } catch {
     /* offline bridge */

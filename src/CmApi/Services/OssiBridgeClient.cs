@@ -200,7 +200,8 @@ public sealed class OssiBridgeClient
                 TryRunScheduledTask();
             }
 
-            for (var i = 0; i < 40; i++)
+            // Bat start is async; allow up to ~8s (was 10s of dead waits on bad Python path)
+            for (var i = 0; i < 32; i++)
             {
                 await Task.Delay(250, ct).ConfigureAwait(false);
                 if (await HealthyAsync(ct).ConfigureAwait(false))

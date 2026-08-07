@@ -378,15 +378,15 @@ async function loadMonitoredSoft() {
   }
 }
 
-/* ---------- Login progress modal (OSSI steps) ---------- */
+/* ---------- Login progress modal (English, 3 coarse steps) ---------- */
 function showLoginModal() {
   const m = $("login-modal");
   if (!m) return;
   m.hidden = false;
   $("btn-login-modal-close").hidden = true;
   $("login-modal-spinner").className = "modal-spinner";
-  $("login-modal-title").textContent = "OSSI Login 進度";
-  $("login-modal-sub").textContent = "連線中，請稍候…";
+  $("login-modal-title").textContent = "Connecting to CM";
+  $("login-modal-sub").textContent = "Please wait…";
   $("login-modal-detail").textContent = "";
   m.querySelectorAll(".progress-steps li").forEach((li) => {
     li.classList.remove("active", "done", "fail");
@@ -404,7 +404,7 @@ function hideLoginModal(delayMs = 0) {
 }
 
 /**
- * @param {number} step 1..6
+ * @param {number} step 1..3
  * @param {"active"|"done"|"fail"} kind
  * @param {string} [detail]
  */
@@ -426,18 +426,17 @@ function setLoginStep(step, kind, detail) {
   if (detail != null) $("login-modal-detail").textContent = detail;
   if (kind === "fail") {
     $("login-modal-spinner").className = "modal-spinner fail";
-    $("login-modal-sub").textContent = "Login 失敗";
+    $("login-modal-sub").textContent = "Login failed";
     $("btn-login-modal-close").hidden = false;
-  } else if (kind === "done" && step >= 6) {
+  } else if (kind === "done" && step >= 3) {
     $("login-modal-spinner").className = "modal-spinner done";
-    $("login-modal-sub").textContent = "已連線 · Monitoring";
+    $("login-modal-sub").textContent = "Connected · Monitoring";
   } else {
-    $("login-modal-sub").textContent = "連線中，請稍候…";
+    $("login-modal-sub").textContent = "Please wait…";
   }
 }
 
 function failLoginModal(msg) {
-  // mark current active as fail, or last step
   const active = $("login-progress-steps")?.querySelector("li.active");
   const step = active ? Number(active.dataset.step) : 2;
   setLoginStep(step, "fail", msg || "Login failed");
@@ -525,29 +524,28 @@ async function connect() {
       throw new Error("請填 Host、User、Password");
     }
 
-    // 1) Bridge warm-up / auto-start
-    setLoginStep(1, "active", "health?ensure=1 — 檢查本機 OSSI bridge…");
+    // 1) Bridge warm-up / auto-start (site-local Python)
+    setLoginStep(1, "active", "Starting local OSSI bridge…");
     try {
       const h = await api("health?ensure=1");
       if (h && h.bridgeHealthy) {
-        setLoginStep(1, "done", "OSSI bridge 就緒");
+        setLoginStep(1, "done", "OSSI bridge is ready");
       } else {
-        setLoginStep(
-          1,
-          "active",
-          "Bridge 未 healthy，Login 時會再試自動啟動… " + (h.bridgeError || "")
-        );
+        // connect will try ensure again
+        setLoginStep(1, "done", "Bridge warm-up skipped — will retry on connect");
       }
     } catch (e) {
-      setLoginStep(1, "active", "API health 未就緒，繼續試 connect… " + (e.message || ""));
+      setLoginStep(1, "done", "Bridge check failed — will retry on connect");
     }
 
-    // 2–3) SSH + OSSI login (single server call)
-    setLoginStep(2, "active", `SSH → ${body.host}:${body.port} …`);
-    setLoginStep(3, "active", `OSSI login as ${body.username}（read-only）…`);
+    // 2) SSH + OSSI login (one server call; includes first trunk poll)
+    setLoginStep(
+      2,
+      "active",
+      `SSH ${body.host}:${body.port} · OSSI login as ${body.username} (read-only)…`
+    );
     const res = await api("session/connect", { method: "POST", body: JSON.stringify(body) });
-    setLoginStep(2, "done");
-    setLoginStep(3, "done", "OSSI session 已開");
+    setLoginStep(2, "done", "OSSI session open");
 
     state.connected = true;
     state.disconnecting = false;
@@ -555,42 +553,31 @@ async function connect() {
     setSessionLabel("Monitoring (OSSI)", true);
     applyUiMode();
 
-    // 4) monitored list
-    setLoginStep(4, "active", "讀 monitored TG 清單…");
-    await loadMonitored();
-    setLoginStep(
-      4,
-      "done",
-      state.monitored.length
-        ? `監控 ${state.monitored.length} 個 TG：${state.monitored.map((x) => x.tg).join(", ")}`
-        : "清單空白 — 可之後 Add TG"
-    );
-
-    // 5) trunk status (already polled on connect if server returned trunkData)
-    setLoginStep(5, "active", "OSSI status trunk N — 拉取 trunk 狀態…");
+    // 3) Ready — load data quietly (no extra modal steps)
+    setLoginStep(3, "active", "Loading trunk data…");
+    try {
+      await loadMonitoredSoft();
+    } catch {
+      /* ignore */
+    }
     if (res.trunkData) {
       const td = res.trunkData;
       state.trunkItems = td.items || td.Items || [];
       renderTrunkMeta(td);
       renderTrunkTable();
     } else {
-      await loadTrunkData();
+      try {
+        await loadTrunkData();
+      } catch {
+        /* ignore */
+      }
     }
-    setLoginStep(
-      5,
-      "done",
-      state.trunkItems.length
-        ? `已更新 ${state.trunkItems.length} 組 trunk 狀態`
-        : "暫無 live 狀態（可撳 Refresh）"
-    );
-
-    // 6) done
-    setLoginStep(6, "done", "Heartbeat 30s · Auto refresh 60s · 關頁會斷 OSSI");
-    setStatus("已登入。開住呢頁先會 refresh（60s）。熄頁 / 關 tab 會斷 OSSI。");
+    setLoginStep(3, "done", "Monitoring active · auto-refresh 60s · close page to disconnect");
+    setStatus("Logged in. Keep this page open to monitor. Close tab disconnects OSSI.");
     $("chk-auto").checked = true;
     scheduleAuto();
     startHeartbeat();
-    hideLoginModal(900);
+    hideLoginModal(700);
   } catch (e) {
     state.connected = false;
     const msg = String(e.message || e);

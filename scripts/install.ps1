@@ -548,41 +548,98 @@ function Install-BridgeTask([string]$root, [string]$venvPy) {
     Write-Ok "Scheduled task $TaskName (auto-start bridge at logon)"
 }
 
-function Stop-BridgeOnPort([int]$port = 18765) {
+function Test-BridgeHealth([int]$port = 18765) {
     try {
-        Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue |
-            ForEach-Object {
-                try { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue } catch {}
-            }
+        $r = Invoke-WebRequest "http://127.0.0.1:$port/health" -UseBasicParsing -TimeoutSec 2
+        return ($r.StatusCode -eq 200)
+    } catch {
+        return $false
+    }
+}
+
+function Stop-BridgeOnPort([int]$port = 18765) {
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        # Only stop listeners we can identify; never throw
+        if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) {
+            Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue |
+                ForEach-Object {
+                    $pid = $_.OwningProcess
+                    if ($pid -and $pid -gt 4) {
+                        Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
+                    }
+                }
+        }
     } catch {}
+    finally { $ErrorActionPreference = $prev }
 }
 
 function Start-BridgeNow([string]$root, [string]$venvPy, [switch]$ForceRestart) {
-    if ($ForceRestart) {
-        Write-Info "Restarting OSSI bridge..."
-        Stop-BridgeOnPort 18765
-        Start-Sleep -Seconds 1
-    } else {
-        try {
-            $r = Invoke-WebRequest "http://127.0.0.1:18765/health" -UseBasicParsing -TimeoutSec 2
-            if ($r.StatusCode -eq 200) {
-                Write-Ok "OSSI bridge already running"
-                return
-            }
-        } catch {}
-    }
-
-    $script = Join-Path $root "python\ossi_service.py"
-    $data = Join-Path $root "data"
-    Start-Process -FilePath $venvPy -ArgumentList @(
-        $script, "--host", "127.0.0.1", "--port", "18765", "--data-dir", $data
-    ) -WorkingDirectory (Join-Path $root "python") -WindowStyle Hidden
-    Start-Sleep -Seconds 2
+    # Never fail the whole install if bridge start has issues — Login can retry.
     try {
-        $r2 = Invoke-WebRequest "http://127.0.0.1:18765/health" -UseBasicParsing -TimeoutSec 5
-        Write-Ok "OSSI bridge health: $($r2.Content)"
+        if ($ForceRestart) {
+            Write-Info "Restarting OSSI bridge..."
+            Stop-BridgeOnPort 18765
+            Start-Sleep -Seconds 1
+        } elseif (Test-BridgeHealth) {
+            Write-Ok "OSSI bridge already running"
+            return
+        }
+
+        $script = Join-Path $root "python\ossi_service.py"
+        $data = Join-Path $root "data"
+        $work = Join-Path $root "python"
+        New-Item -ItemType Directory -Force -Path $data | Out-Null
+
+        if (-not (Test-Path $script)) {
+            Write-Warn "Bridge script missing: $script"
+            return
+        }
+
+        # Resolve a runnable python (site venv preferred)
+        $py = $venvPy
+        if (-not $py -or -not (Test-Path $py)) {
+            $py = Join-Path $root "python\.venv\Scripts\python.exe"
+        }
+        if (-not (Test-Path $py)) {
+            $py = Find-Python
+        }
+        if (-not $py -or -not (Test-Path $py)) {
+            Write-Warn "No python.exe to start bridge. Login may still start it later."
+            return
+        }
+
+        Write-Info "Starting bridge: $py"
+        $arg = "`"$script`" --host 127.0.0.1 --port 18765 --data-dir `"$data`""
+        # Use cmd start so short-lived wrappers / venv stubs work on more machines
+        $cmd = "start `"`" /B `"$py`" $arg"
+        $p = Start-Process -FilePath "$env:ComSpec" -ArgumentList @("/c", $cmd) -WorkingDirectory $work -WindowStyle Hidden -PassThru -ErrorAction SilentlyContinue
+        if (-not $p) {
+            # Fallback: direct Start-Process
+            Start-Process -FilePath $py -ArgumentList @(
+                $script, "--host", "127.0.0.1", "--port", "18765", "--data-dir", $data
+            ) -WorkingDirectory $work -WindowStyle Hidden -ErrorAction SilentlyContinue | Out-Null
+        }
+
+        # Also try scheduled task if registered
+        if (-not (Test-BridgeHealth)) {
+            try { Start-ScheduledTask -TaskName "CM-NOC-OSSI-Bridge" -ErrorAction SilentlyContinue } catch {}
+        }
+
+        $ok = $false
+        for ($i = 0; $i -lt 10; $i++) {
+            Start-Sleep -Milliseconds 500
+            if (Test-BridgeHealth) { $ok = $true; break }
+        }
+        if ($ok) {
+            Write-Ok "OSSI bridge is healthy on 127.0.0.1:18765"
+        } else {
+            Write-Warn "Bridge not healthy yet. You can still open the web UI — Login will try auto-start."
+            Write-Warn "Manual: $py `"$script`" --data-dir `"$data`""
+        }
     } catch {
-        Write-Warn "Bridge not healthy yet (Login will retry auto-start): $_"
+        Write-Warn "Bridge start skipped: $($_.Exception.Message)"
     }
 }
 

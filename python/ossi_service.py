@@ -173,11 +173,19 @@ def disconnect_unlocked() -> None:
 def connect_unlocked(body: dict[str, Any]) -> dict[str, Any]:
     global _session, _cfg, _connected, _host, _username, _last_error, _tg_catalog
 
-    host = str(body.get("host") or "").strip()
-    port = int(body.get("port") or 5022)
-    username = str(body.get("username") or "").strip()
-    password = str(body.get("password") or "")
-    pin = str(body.get("pin") or "")
+    # Accept camelCase or PascalCase (C# / browsers)
+    def _g(*keys: str) -> str:
+        for k in keys:
+            if k in body and body[k] is not None:
+                return str(body[k])
+        return ""
+
+    host = _g("host", "Host").strip()
+    port_s = _g("port", "Port") or "5022"
+    port = int(port_s) if str(port_s).isdigit() else 5022
+    username = _g("username", "Username").strip()
+    password = _g("password", "Password")
+    pin = _g("pin", "Pin")
 
     if not host or not username or not password:
         raise ValueError("host, username, and password required")
@@ -378,10 +386,45 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _read_json(self) -> dict[str, Any]:
-        n = int(self.headers.get("Content-Length") or 0)
-        if n <= 0:
+        """Read JSON body. Supports Content-Length and chunked/no-length clients."""
+        raw = b""
+        try:
+            length = self.headers.get("Content-Length")
+            if length is not None and str(length).isdigit() and int(length) > 0:
+                raw = self.rfile.read(int(length))
+            else:
+                # HttpClient may use chunked transfer without Content-Length
+                te = (self.headers.get("Transfer-Encoding") or "").lower()
+                if "chunked" in te:
+                    while True:
+                        line = self.rfile.readline()
+                        if not line:
+                            break
+                        size_s = line.strip().split(b";")[0]
+                        try:
+                            size = int(size_s, 16)
+                        except ValueError:
+                            break
+                        if size == 0:
+                            self.rfile.readline()  # trailing CRLF
+                            break
+                        raw += self.rfile.read(size)
+                        self.rfile.readline()  # chunk CRLF
+                else:
+                    # last resort: short non-blocking-ish read
+                    self.connection.settimeout(0.5)
+                    try:
+                        while True:
+                            chunk = self.rfile.read(65536)
+                            if not chunk:
+                                break
+                            raw += chunk
+                    except Exception:
+                        pass
+        except Exception:
             return {}
-        raw = self.rfile.read(n)
+        if not raw:
+            return {}
         try:
             data = json.loads(raw.decode("utf-8"))
             return data if isinstance(data, dict) else {}
@@ -418,9 +461,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path.rstrip("/") or "/"
+        # debug headers/body length for Login 502 diagnosis (no passwords logged)
+        try:
+            cl = self.headers.get("Content-Length")
+            te = self.headers.get("Transfer-Encoding")
+            sys.stderr.write(f"POST {path} Content-Length={cl} Transfer-Encoding={te}\n")
+        except Exception:
+            pass
         body = self._read_json()
         try:
             if path == "/session/connect":
+                sys.stderr.write(
+                    f"connect keys={list(body.keys())} "
+                    f"host={bool(body.get('host') or body.get('Host'))} "
+                    f"user={bool(body.get('username') or body.get('Username'))} "
+                    f"pass={bool(body.get('password') or body.get('Password'))}\n"
+                )
                 with _lock:
                     result = connect_unlocked(body)
                 self._send(200, result)

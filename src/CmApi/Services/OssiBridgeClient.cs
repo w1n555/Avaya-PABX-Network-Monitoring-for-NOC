@@ -344,11 +344,18 @@ public sealed class OssiBridgeClient
         return JsonSerializer.Deserialize<JsonElement>(text, JsonOpts);
     }
 
+    private static readonly JsonSerializerOptions CamelJson = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+    };
+
     public async Task<JsonElement> PostAsync(string path, object? body, CancellationToken ct = default)
     {
         await EnsureBridgeRunningAsync(ct).ConfigureAwait(false);
-        using var res = await _http.PostAsJsonAsync(path.TrimStart('/'), body ?? new { }, ct)
-            .ConfigureAwait(false);
+        // Use StringContent so Content-Length is set (Python bridge needs it; chunked can empty body)
+        var json = JsonSerializer.Serialize(body ?? new { }, CamelJson);
+        using var content = new StringContent(json, Encoding.UTF8, "application/json");
+        using var res = await _http.PostAsync(path.TrimStart('/'), content, ct).ConfigureAwait(false);
         var text = await res.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
         if (!res.IsSuccessStatusCode)
             throw new InvalidOperationException(ExtractError(text) ?? res.ReasonPhrase ?? "bridge error");
@@ -358,8 +365,9 @@ public sealed class OssiBridgeClient
     public async Task<JsonElement> PutAsync(string path, object? body, CancellationToken ct = default)
     {
         await EnsureBridgeRunningAsync(ct).ConfigureAwait(false);
-        using var res = await _http.PutAsJsonAsync(path.TrimStart('/'), body ?? new { }, ct)
-            .ConfigureAwait(false);
+        var json = JsonSerializer.Serialize(body ?? new { }, CamelJson);
+        using var content = new StringContent(json, Encoding.UTF8, "application/json");
+        using var res = await _http.PutAsync(path.TrimStart('/'), content, ct).ConfigureAwait(false);
         var text = await res.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
         if (!res.IsSuccessStatusCode)
             throw new InvalidOperationException(ExtractError(text) ?? res.ReasonPhrase ?? "bridge error");

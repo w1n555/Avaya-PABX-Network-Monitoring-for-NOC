@@ -11,7 +11,9 @@ api/logs/
 # Python
 __pycache__/
 *.pyc
+python/.venv/
 .venv/
+data/logs/
 
 # Runtime logs / temp
 data/*.log

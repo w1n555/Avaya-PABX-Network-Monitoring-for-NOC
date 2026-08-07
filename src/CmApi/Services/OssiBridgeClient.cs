@@ -1,12 +1,14 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net.Http.Json;
+using System.Text;
 using System.Text.Json;
 
 namespace CmApi.Services;
 
 /// <summary>
 /// HTTP client for local Python OSSI bridge (avaya-ossi).
-/// Bridge must listen on 127.0.0.1 — never exposed publicly.
+/// Auto-starts the bridge on 127.0.0.1 when Login / API needs it — no manual start.
 /// </summary>
 public sealed class OssiBridgeClient
 {
@@ -21,106 +23,292 @@ public sealed class OssiBridgeClient
     private readonly string _dataDir;
     private readonly string _pythonDir;
     private readonly string _pythonExe;
-    private static readonly object StartGate = new();
+    private readonly string? _ossiSrc;
+    private readonly string _logDir;
+    private readonly SemaphoreSlim _startLock = new(1, 1);
 
     public OssiBridgeClient(IConfiguration config, ILogger<OssiBridgeClient> log)
     {
         _log = log;
         var baseUrl = config["OssiBridge:BaseUrl"] ?? DefaultBase;
-        _dataDir = config["OssiBridge:DataDir"]
-                   ?? Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "data"));
-        // Prefer site root python/ next to wwwroot CM
         var siteRoot = config["OssiBridge:SiteRoot"]
                        ?? Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, ".."));
+        _dataDir = config["OssiBridge:DataDir"]
+                   ?? Path.Combine(siteRoot, "data");
         _pythonDir = Path.Combine(siteRoot, "python");
-        _pythonExe = config["OssiBridge:Python"]
-                     ?? FindPython();
+        _ossiSrc = config["OssiBridge:OssiSrc"]
+                   ?? @"C:\Users\W1NGGG\source\AVAYA-OSSI-2026\src";
+        _logDir = Path.Combine(_dataDir, "logs");
+        Directory.CreateDirectory(_dataDir);
+        Directory.CreateDirectory(_logDir);
+
+        var configuredPy = config["OssiBridge:Python"];
+        if (!string.IsNullOrWhiteSpace(configuredPy) && File.Exists(configuredPy.Trim()))
+            _pythonExe = configuredPy.Trim();
+        else
+            _pythonExe = FindPythonWithAvayaOssi();
 
         _http = new HttpClient
         {
             BaseAddress = new Uri(baseUrl.TrimEnd('/') + "/"),
             Timeout = TimeSpan.FromMinutes(3),
         };
+
+        _log.LogInformation("OssiBridge python={Python} scriptDir={Dir}", _pythonExe, _pythonDir);
     }
 
-    private static string FindPython()
+    private List<string> PythonCandidates()
     {
-        var candidates = new[]
+        var list = new List<string>();
+        // Prefer site-local venv (IIS app pool can execute under wwwroot)
+        list.Add(Path.Combine(_pythonDir, @".venv\Scripts\python.exe"));
+        var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        list.Add(Path.Combine(local, @"hermes\hermes-agent\venv\Scripts\python.exe"));
+        list.Add(Path.Combine(local, @"Programs\Python\Python312\python.exe"));
+        list.Add(Path.Combine(local, @"Programs\Python\Python311\python.exe"));
+        list.Add(Path.Combine(local, @"Programs\Python\Python313\python.exe"));
+        list.Add(@"C:\Python312\python.exe");
+        list.Add(@"C:\Python311\python.exe");
+        list.Add(@"C:\Program Files\Python312\python.exe");
+        list.Add(@"C:\Program Files\Python311\python.exe");
+        try
         {
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                @"hermes\hermes-agent\venv\Scripts\python.exe"),
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                @"Programs\Python\Python312\python.exe"),
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                @"Programs\Python\Python311\python.exe"),
-            @"C:\Python311\python.exe",
-            "python",
-        };
-        foreach (var c in candidates)
+            var psi = new ProcessStartInfo
+            {
+                FileName = "where.exe",
+                Arguments = "python",
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            using var p = Process.Start(psi);
+            if (p != null)
+            {
+                var output = p.StandardOutput.ReadToEnd();
+                p.WaitForExit(3000);
+                foreach (var line in output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+                    list.Add(line.Trim());
+            }
+        }
+        catch { /* ignore */ }
+        list.Add("python");
+        return list;
+    }
+
+    private string FindPythonWithAvayaOssi()
+    {
+        foreach (var c in PythonCandidates())
         {
-            if (c == "python") return c;
-            if (File.Exists(c)) return c;
+            if (c != "python" && !File.Exists(c))
+                continue;
+            if (CanImportAvayaOssi(c))
+                return c;
+        }
+        // fall back to first existing file even if import check failed (will surface error on start)
+        foreach (var c in PythonCandidates())
+        {
+            if (c == "python" || File.Exists(c))
+                return c;
         }
         return "python";
     }
 
+    private bool CanImportAvayaOssi(string pythonExe)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = pythonExe,
+                ArgumentList = { "-c", "import avaya_ossi" },
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            if (!string.IsNullOrWhiteSpace(_ossiSrc) && Directory.Exists(_ossiSrc))
+                psi.Environment["PYTHONPATH"] = PrependPath(psi.Environment, "PYTHONPATH", _ossiSrc);
+
+            using var p = Process.Start(psi);
+            if (p == null) return false;
+            if (!p.WaitForExit(8000))
+            {
+                try { p.Kill(true); } catch { /* ignore */ }
+                return false;
+            }
+            return p.ExitCode == 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string PrependPath(System.Collections.Generic.IDictionary<string, string?> env, string key, string value)
+    {
+        env.TryGetValue(key, out var cur);
+        if (string.IsNullOrEmpty(cur)) return value;
+        return value + Path.PathSeparator + cur;
+    }
+
+    /// <summary>Start bridge if needed. Safe to call on every Login / request.</summary>
     public async Task EnsureBridgeRunningAsync(CancellationToken ct = default)
     {
         if (await HealthyAsync(ct).ConfigureAwait(false))
             return;
 
-        lock (StartGate)
+        await _startLock.WaitAsync(ct).ConfigureAwait(false);
+        try
         {
-            // double-check
+            if (await HealthyAsync(ct).ConfigureAwait(false))
+                return;
+
+            Exception? startEx = null;
+            try
+            {
+                StartBridgeProcess();
+            }
+            catch (Exception ex)
+            {
+                startEx = ex;
+                _log.LogWarning(ex, "Direct Process.Start failed; trying scheduled task CM-NOC-OSSI-Bridge");
+                TryRunScheduledTask();
+            }
+
+            for (var i = 0; i < 40; i++)
+            {
+                await Task.Delay(250, ct).ConfigureAwait(false);
+                if (await HealthyAsync(ct).ConfigureAwait(false))
+                {
+                    _log.LogInformation("OSSI bridge is healthy");
+                    return;
+                }
+            }
+
+            var errTail = ReadLogTail(Path.Combine(_logDir, "bridge.stderr.log"), 1200);
+            var hint = startEx?.Message ?? "";
+            throw new InvalidOperationException(
+                "OSSI bridge did not start on 127.0.0.1:18765. " +
+                "Login needs the bridge auto-running. " +
+                "Once as Admin run: scripts\\install-bridge-autostart.ps1 " +
+                "or ensure site venv python works. " +
+                hint + " " +
+                (string.IsNullOrEmpty(errTail) ? "" : "stderr: " + errTail));
         }
+        finally
+        {
+            _startLock.Release();
+        }
+    }
 
-        if (await HealthyAsync(ct).ConfigureAwait(false))
-            return;
+    private static void TryRunScheduledTask()
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "schtasks.exe",
+                Arguments = "/Run /TN \"CM-NOC-OSSI-Bridge\"",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            using var p = Process.Start(psi);
+            p?.WaitForExit(8000);
+        }
+        catch
+        {
+            /* optional path */
+        }
+    }
 
+    private void StartBridgeProcess()
+    {
         var script = Path.Combine(_pythonDir, "ossi_service.py");
         if (!File.Exists(script))
             throw new InvalidOperationException("ossi_service.py not found at " + script);
 
-        Directory.CreateDirectory(_dataDir);
+        var stdoutLog = Path.Combine(_logDir, "bridge.stdout.log");
+        var stderrLog = Path.Combine(_logDir, "bridge.stderr.log");
+
         var psi = new ProcessStartInfo
         {
             FileName = _pythonExe,
-            ArgumentList = { script, "--host", "127.0.0.1", "--port", "18765", "--data-dir", _dataDir },
             WorkingDirectory = _pythonDir,
             UseShellExecute = false,
             CreateNoWindow = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
+            // Don't keep parent wait handles that IIS might care about
+            RedirectStandardInput = false,
         };
+        psi.ArgumentList.Add(script);
+        psi.ArgumentList.Add("--host");
+        psi.ArgumentList.Add("127.0.0.1");
+        psi.ArgumentList.Add("--port");
+        psi.ArgumentList.Add("18765");
+        psi.ArgumentList.Add("--data-dir");
+        psi.ArgumentList.Add(_dataDir);
+
+        if (!string.IsNullOrWhiteSpace(_ossiSrc) && Directory.Exists(_ossiSrc))
+        {
+            psi.Environment["PYTHONPATH"] = PrependPath(psi.Environment, "PYTHONPATH", _ossiSrc!);
+        }
+
         try
         {
             var p = Process.Start(psi);
             if (p == null)
-                throw new InvalidOperationException("Failed to start OSSI bridge process");
-            _log.LogInformation("Started OSSI bridge PID {Pid}", p.Id);
+                throw new InvalidOperationException("Process.Start returned null for " + _pythonExe);
+
+            // Drain pipes to log files so the process never blocks on full buffers
+            _ = Task.Run(() => PumpStream(p.StandardOutput, stdoutLog));
+            _ = Task.Run(() => PumpStream(p.StandardError, stderrLog));
+
+            _log.LogInformation("Started OSSI bridge PID {Pid} via {Python}", p.Id, _pythonExe);
         }
         catch (Exception ex)
         {
             throw new InvalidOperationException(
-                "Cannot start Python OSSI bridge. Install avaya-ossi and ensure Python path is set. " + ex.Message,
+                $"Cannot start Python OSSI bridge (exe={_pythonExe}). {ex.Message}",
                 ex);
         }
+    }
 
-        for (var i = 0; i < 20; i++)
+    private static void PumpStream(StreamReader reader, string path)
+    {
+        try
         {
-            await Task.Delay(250, ct).ConfigureAwait(false);
-            if (await HealthyAsync(ct).ConfigureAwait(false))
-                return;
+            using var w = new StreamWriter(path, append: true, Encoding.UTF8) { AutoFlush = true };
+            while (!reader.EndOfStream)
+            {
+                var line = reader.ReadLine();
+                if (line != null)
+                    w.WriteLine(line);
+            }
         }
+        catch { /* ignore */ }
+    }
 
-        throw new InvalidOperationException("OSSI bridge did not become healthy on 127.0.0.1:18765");
+    private static string ReadLogTail(string path, int maxChars)
+    {
+        try
+        {
+            if (!File.Exists(path)) return "";
+            var text = File.ReadAllText(path);
+            return text.Length <= maxChars ? text : text[^maxChars..];
+        }
+        catch { return ""; }
     }
 
     public async Task<bool> HealthyAsync(CancellationToken ct = default)
     {
         try
         {
-            using var res = await _http.GetAsync("health", ct).ConfigureAwait(false);
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            cts.CancelAfter(TimeSpan.FromSeconds(2));
+            using var res = await _http.GetAsync("health", cts.Token).ConfigureAwait(false);
             return res.IsSuccessStatusCode;
         }
         catch

@@ -5,6 +5,7 @@ using CmApi.Services;
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddSingleton<OssiBridgeClient>();
+builder.Services.AddHostedService<BridgeWarmupService>();
 builder.Services.AddCors(o =>
 {
     o.AddDefaultPolicy(p => p
@@ -25,17 +26,31 @@ var siteRoot = Path.GetFullPath(Path.Combine(app.Environment.ContentRootPath, ".
 var dataDir = Path.Combine(siteRoot, "data");
 Directory.CreateDirectory(dataDir);
 
-app.MapGet("/health", async (OssiBridgeClient bridge) =>
+app.MapGet("/health", async (OssiBridgeClient bridge, HttpRequest req) =>
 {
+    var ensure = string.Equals(req.Query["ensure"], "1", StringComparison.OrdinalIgnoreCase)
+                 || string.Equals(req.Query["ensure"], "true", StringComparison.OrdinalIgnoreCase);
     var bridgeOk = false;
-    try { bridgeOk = await bridge.HealthyAsync(); } catch { /* ignore */ }
+    string? bridgeError = null;
+    try
+    {
+        if (ensure)
+            await bridge.EnsureBridgeRunningAsync();
+        bridgeOk = await bridge.HealthyAsync();
+    }
+    catch (Exception ex)
+    {
+        bridgeError = ex.Message;
+    }
     return Results.Ok(new
     {
         ok = true,
         service = "CmApi",
-        mode = "ossi-bridge",
+        mode = "ossi-bridge-auto",
         ossiPackage = "avaya-ossi (AVAYA-OSSI-2026)",
         bridgeHealthy = bridgeOk,
+        bridgeAutoStart = true,
+        bridgeError,
     });
 });
 
@@ -48,6 +63,9 @@ app.MapPost("/session/connect", async (ConnectRequest req, OssiBridgeClient brid
 
     try
     {
+        // Always auto-start OSSI bridge here if needed (no manual start-ossi-bridge.ps1)
+        await bridge.EnsureBridgeRunningAsync();
+
         var el = await bridge.PostAsync("session/connect", new
         {
             host = req.Host.Trim(),

@@ -174,7 +174,7 @@ async function loadMonitored() {
 
 async function connect() {
   setError("");
-  setStatus("Connecting via OSSI (avaya-ossi)…");
+  setStatus("Login… 自動啟動 OSSI bridge（如未開）→ 連 CM → 開始 monitor…");
   $("btn-connect").disabled = true;
   try {
     const body = {
@@ -183,17 +183,23 @@ async function connect() {
       username: $("inp-user").value.trim(),
       password: $("inp-pass").value,
     };
+    if (!body.host || !body.username || !body.password) {
+      throw new Error("請填 Host、User、Password");
+    }
+    // Login triggers API auto-start of Python bridge — no manual script
     const res = await api("session/connect", { method: "POST", body: JSON.stringify(body) });
     state.connected = true;
     $("btn-disconnect").disabled = false;
     $("btn-refresh-now").disabled = false;
     $("meta-host").textContent = res.host || body.host;
-    $("meta-session").textContent = "Connected (OSSI)";
+    $("meta-session").textContent = "Monitoring (OSSI)";
     $("meta-session").style.color = "var(--ok)";
-    setStatus("Connected. Polling monitored trunks via OSSI…");
+    setStatus("已登入。正在監控 monitored trunks（Auto 60s + bridge 背景刷新）。");
     await loadMonitored();
     if (res.trunkData) renderTrunkTable(res.trunkData);
     else await loadTrunkData();
+    // Always enable auto monitor after successful login
+    $("chk-auto").checked = true;
     scheduleAuto();
   } catch (e) {
     state.connected = false;
@@ -328,10 +334,17 @@ async function init() {
   }
 
   try {
-    const h = await api("health");
-    if (h && h.mode) setStatus(`API mode: ${h.mode}${h.bridgeHealthy ? " · bridge OK" : " · bridge starting…"}`);
+    // Warm-up: ask API to auto-start OSSI bridge in background (no user action)
+    const h = await api("health?ensure=1");
+    if (h && h.bridgeHealthy) {
+      setStatus("就緒：填 IP / Password → 撳 Login 即開始 monitor（OSSI 已自動準備）。");
+    } else if (h && h.bridgeError) {
+      setStatus("API 已上。Login 時會再試自動開 bridge。 " + (h.bridgeError || ""));
+    } else {
+      setStatus("就緒：填 IP / Password → 撳 Login（系統會自動開 OSSI 並開始 monitor）。");
+    }
   } catch {
-    setStatus("API not reachable — check IIS /CM/api deploy.");
+    setStatus("API 未就緒 — 檢查 IIS /CM/api。就緒後只需 Login。");
   }
 }
 

@@ -34,11 +34,12 @@
         <label>Port <input id="inp-port" value="5022" inputmode="numeric" /></label>
         <label>User <input id="inp-user" value="monitor" autocomplete="username" /></label>
         <label>Password <input id="inp-pass" type="password" autocomplete="current-password" /></label>
-        <button type="button" class="btn btn-primary" id="btn-connect">Connect (OSSI)</button>
-        <button type="button" class="btn" id="btn-disconnect" disabled>Disconnect</button>
+        <button type="button" class="btn btn-primary" id="btn-connect">Login</button>
+        <button type="button" class="btn" id="btn-disconnect" disabled>Logout</button>
         <button type="button" class="btn" id="btn-refresh-now" disabled>Refresh now</button>
-        <label class="chk"><input type="checkbox" id="chk-auto" checked /> Auto 60s</label>
+        <label class="chk"><input type="checkbox" id="chk-auto" checked /> Auto monitor 60s</label>
       </div>
+      <p class="hint connect-hint">填 Host / Password → 撳 <strong>Login</strong>。系統會<strong>自動</strong>開 OSSI bridge、連 CM、開始監控（唔使手動開 bridge）。</p>
       <div class="status-line" id="status-line" hidden></div>
       <div class="error-line" id="error-line" hidden></div>
     </section>

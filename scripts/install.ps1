@@ -9,12 +9,22 @@
     3) Checks / installs Python 3.12 (with PATH) if missing
     4) Asks local ROOT path (ZIP extract folder)
     5) Points IIS site + /api to that path
-    6) Site venv + bundled vendor/avaya-ossi + bridge autostart
-    7) Prints browser URL
+    6) OPTIONAL: pull latest code from GitHub if folder is a git repo (or -Update)
+    7) Site venv + bundled vendor/avaya-ossi + bridge autostart
+    8) Re-publish API, recycle pool, restart bridge
+    9) Prints browser URL
+
+  On a machine that already has the OLD repo running:
+    re-run this same script on the SAME root path = upgrade in one click
+    (git pull + reconfig IIS + refresh venv + republish + restart bridge)
+    data\monitored_trunks.json is kept.
 
 .EXAMPLE
   cd C:\inetpub\wwwroot\CM\scripts
   powershell -ExecutionPolicy Bypass -File .\install.ps1
+
+  # Old install - one-click upgrade:
+  .\install.ps1 -RootPath "C:\inetpub\wwwroot\CM" -Update -NonInteractive
 
   .\install.ps1 -RootPath "C:\inetpub\wwwroot\CM" -SitePort 8888 -NonInteractive
 #>
@@ -28,6 +38,8 @@ param(
     [switch]$SkipPublish,
     [switch]$SkipDotNetInstall,
     [switch]$SkipPythonInstall,
+    [switch]$Update,
+    [switch]$SkipUpdate,
     [switch]$NonInteractive
 )
 
@@ -404,10 +416,10 @@ function Ensure-PythonVenv([string]$root, [string]$basePython) {
     return $venvPy
 }
 
-function Ensure-ApiPublish([string]$root) {
+function Ensure-ApiPublish([string]$root, [switch]$Force) {
     $apiDll = Join-Path $root "api\CmApi.dll"
     $csproj = Join-Path $root "src\CmApi\CmApi.csproj"
-    if ((Test-Path $apiDll) -and $SkipPublish) {
+    if ((Test-Path $apiDll) -and $SkipPublish -and -not $Force) {
         Write-Ok "Using existing api\ publish"
         return
     }
@@ -537,14 +549,29 @@ function Install-BridgeTask([string]$root, [string]$venvPy) {
     Write-Ok "Scheduled task $TaskName (auto-start bridge at logon)"
 }
 
-function Start-BridgeNow([string]$root, [string]$venvPy) {
+function Stop-BridgeOnPort([int]$port = 18765) {
     try {
-        $r = Invoke-WebRequest "http://127.0.0.1:18765/health" -UseBasicParsing -TimeoutSec 2
-        if ($r.StatusCode -eq 200) {
-            Write-Ok "OSSI bridge already running"
-            return
-        }
+        Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                try { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue } catch {}
+            }
     } catch {}
+}
+
+function Start-BridgeNow([string]$root, [string]$venvPy, [switch]$ForceRestart) {
+    if ($ForceRestart) {
+        Write-Info "Restarting OSSI bridge..."
+        Stop-BridgeOnPort 18765
+        Start-Sleep -Seconds 1
+    } else {
+        try {
+            $r = Invoke-WebRequest "http://127.0.0.1:18765/health" -UseBasicParsing -TimeoutSec 2
+            if ($r.StatusCode -eq 200) {
+                Write-Ok "OSSI bridge already running"
+                return
+            }
+        } catch {}
+    }
 
     $script = Join-Path $root "python\ossi_service.py"
     $data = Join-Path $root "data"
@@ -557,6 +584,110 @@ function Start-BridgeNow([string]$root, [string]$venvPy) {
         Write-Ok "OSSI bridge health: $($r2.Content)"
     } catch {
         Write-Warn "Bridge not healthy yet (Login will retry auto-start): $_"
+    }
+}
+
+function Test-GitRepo([string]$root) {
+    return (Test-Path (Join-Path $root ".git"))
+}
+
+function Update-CodeFromGit([string]$root) {
+    if ($SkipUpdate) {
+        Write-Info "SkipUpdate set - leaving files as-is on disk"
+        return $false
+    }
+
+    $isGit = Test-GitRepo $root
+    $doUpdate = $false
+    if ($Update) {
+        $doUpdate = $true
+    } elseif ($isGit) {
+        if ($NonInteractive) {
+            $doUpdate = $true
+        } else {
+            $ans = Read-Host "This folder looks like an existing install (git). Pull latest from GitHub + upgrade? [Y/n]"
+            if ($ans -notmatch '^[nN]') { $doUpdate = $true }
+        }
+    }
+
+    if (-not $doUpdate) {
+        Write-Info "Using existing files on disk (no git pull)"
+        return $false
+    }
+
+    if (-not $isGit) {
+        Write-Warn "Not a git clone - cannot auto-pull code."
+        Write-Warn "For one-click upgrades later, use git clone once, or overwrite folder from ZIP then re-run install.ps1"
+        Write-Host "  git clone https://github.com/w1n555/Avaya-PABX-Network-Monitoring-for-NOC.git `"$root`""
+        return $false
+    }
+
+    $git = Get-Command git -ErrorAction SilentlyContinue
+    if (-not $git) {
+        Write-Warn "git not found - skip pull. Install Git for Windows for one-click upgrades."
+        return $false
+    }
+
+    Write-Info "Updating code from GitHub (git fetch + pull)..."
+    # Preserve local monitoring list
+    $dataDir = Join-Path $root "data"
+    $backup = Join-Path $env:TEMP ("cm-noc-data-backup-" + [guid]::NewGuid().ToString("N"))
+    if (Test-Path $dataDir) {
+        New-Item -ItemType Directory -Force -Path $backup | Out-Null
+        Copy-Item (Join-Path $dataDir "*") $backup -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Info "Backed up data\ to $backup"
+    }
+
+    Push-Location $root
+    try {
+        # stop API lock before file updates when possible
+        $appcmd = Get-AppCmd
+        try { & $appcmd stop apppool /apppool.name:"$AppPoolName" 2>$null | Out-Null } catch {}
+        Stop-BridgeOnPort 18765
+
+        & git fetch --all --prune 2>&1 | Out-Host
+        $branch = (& git rev-parse --abbrev-ref HEAD 2>$null)
+        if (-not $branch) { $branch = "main" }
+        # Prefer fast-forward; if dirty, stash data-related only is hard - stash all local non-data changes
+        $status = & git status --porcelain 2>$null
+        if ($status) {
+            Write-Warn "Local changes detected - stashing before pull (data\ backup kept separately)"
+            & git stash push -u -m "cm-noc-install-auto-stash" 2>&1 | Out-Host
+        }
+        & git pull --ff-only origin $branch 2>&1 | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warn "ff-only pull failed - trying merge pull"
+            & git pull origin $branch 2>&1 | Out-Host
+        }
+        $head = & git log -1 --oneline 2>$null
+        Write-Ok "Code updated: $head"
+    } finally {
+        Pop-Location
+    }
+
+    # Restore monitored_trunks if pull wiped or reset data
+    if (Test-Path $backup) {
+        $monSrc = Join-Path $backup "monitored_trunks.json"
+        $monDst = Join-Path $dataDir "monitored_trunks.json"
+        if (Test-Path $monSrc) {
+            New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
+            Copy-Item $monSrc $monDst -Force
+            Write-Ok "Restored data\monitored_trunks.json"
+        }
+    }
+    return $true
+}
+
+function Restart-AppPool {
+    $appcmd = Get-AppCmd
+    if (-not $appcmd) { return }
+    try {
+        & $appcmd stop apppool /apppool.name:"$AppPoolName" 2>$null | Out-Null
+        Start-Sleep -Seconds 2
+        & $appcmd start apppool /apppool.name:"$AppPoolName" 2>$null | Out-Null
+        Write-Ok "Recycled app pool $AppPoolName"
+    } catch {
+        Write-Warn "Could not recycle app pool: $_"
     }
 }
 
@@ -584,12 +715,18 @@ try {
     $root = Read-UserPath -defaultPath $defaultRoot
     $port = Read-Port -defaultPort 8888
 
-    $need = @("index.html", "app.js", "python\ossi_service.py", "vendor\avaya-ossi")
+    # One-click upgrade path for machines that already have an old copy
+    $didUpdate = Update-CodeFromGit -root $root
+
+    $need = @("index.html", "app.js", "python\ossi_service.py")
     foreach ($rel in $need) {
         $p = Join-Path $root $rel
         if (-not (Test-Path $p)) {
-            throw "Missing $rel under $root - wrong folder or incomplete ZIP?"
+            throw "Missing $rel under $root - wrong folder or incomplete package?"
         }
+    }
+    if (-not (Test-Path (Join-Path $root "vendor\avaya-ossi"))) {
+        Write-Warn "vendor\avaya-ossi missing - OSSI package may be incomplete after old install"
     }
     Write-Ok "App files found under $root"
 
@@ -600,14 +737,24 @@ try {
     Write-Ok "Python: $basePy"
     $venvPy = Ensure-PythonVenv -root $root -basePython $basePy
 
-    Ensure-ApiPublish -root $root
+    # Always republish on update so new C# code is live (DLL unlock via stopped pool)
+    if ($didUpdate) {
+        Ensure-ApiPublish -root $root -Force
+    } else {
+        Ensure-ApiPublish -root $root
+    }
     Set-JsonAppSettings -root $root -pythonExe $venvPy
     Set-IisSite -root $root -port $port
     Set-Acls -root $root
     Install-BridgeTask -root $root -venvPy $venvPy
-    Start-BridgeNow -root $root -venvPy $venvPy
+    if ($didUpdate) {
+        Start-BridgeNow -root $root -venvPy $venvPy -ForceRestart
+    } else {
+        Start-BridgeNow -root $root -venvPy $venvPy
+    }
+    Restart-AppPool
 
-    Start-Sleep -Seconds 1
+    Start-Sleep -Seconds 2
     $url = "http://127.0.0.1:${port}/"
     $apiHealth = "http://127.0.0.1:${port}/api/health"
     try {
@@ -619,7 +766,11 @@ try {
 
     Write-Host ""
     Write-Host "============================================================" -ForegroundColor Green
-    Write-Host "  DONE - easy path for users" -ForegroundColor Green
+    if ($didUpdate) {
+        Write-Host "  DONE - UPGRADED existing install (code + IIS + bridge)" -ForegroundColor Green
+    } else {
+        Write-Host "  DONE - install / reconfigure complete" -ForegroundColor Green
+    }
     Write-Host "============================================================" -ForegroundColor Green
     Write-Host ""
     Write-Host "  1. Open browser:  $url"
@@ -630,7 +781,8 @@ try {
     Write-Host "  Site:  $SiteName  port $port"
     Write-Host "  Bridge auto-starts at Windows logon (task CM-NOC-OSSI-Bridge)"
     Write-Host ""
-    Write-Host "No need to run bridge manually every time."
+    Write-Host "Next time you want latest GitHub code on this machine:"
+    Write-Host "  powershell -ExecutionPolicy Bypass -File .\install.ps1 -RootPath `"$root`" -Update"
     Write-Host ""
 }
 catch {

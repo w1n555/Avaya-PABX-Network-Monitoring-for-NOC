@@ -61,6 +61,22 @@ body {
   margin: 0.75rem 0 0.5rem;
   box-shadow: var(--shadow);
 }
+/* After Login: dim credentials, keep Logout usable */
+.connect-panel.is-logged-in .connect-fields label {
+  opacity: 0.45;
+  pointer-events: none;
+}
+.connect-panel.is-logged-in #btn-connect {
+  opacity: 0.4;
+}
+.connect-panel.is-logged-in #btn-disconnect {
+  opacity: 1;
+  pointer-events: auto;
+}
+.connect-panel.is-logged-in input:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
 .connect-fields {
   display: flex;
   flex-wrap: wrap;

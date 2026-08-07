@@ -103,16 +103,18 @@ app.MapPost("/session/disconnect", async (OssiBridgeClient bridge) =>
 });
 
 // Browser open keep-alive; if no heartbeat ~90s, bridge logs off OSSI
+// Light path: no bridge auto-start storm; soft 200 on transient failure so UI does not thrash
 app.MapPost("/session/heartbeat", async (OssiBridgeClient bridge) =>
 {
     try
     {
-        var el = await bridge.PostAsync("session/heartbeat", new { });
+        var el = await bridge.PostLightAsync("session/heartbeat", new { });
         return Results.Json(el);
     }
     catch (Exception ex)
     {
-        return Results.Json(new { ok = false, error = ex.Message }, statusCode: 502);
+        // Soft-fail: keep browser quiet; next poll retries. Do not force 502 every 30s.
+        return Results.Json(new { ok = false, soft = true, error = ex.Message });
     }
 });
 
@@ -134,6 +136,22 @@ app.MapPost("/refresh", async (OssiBridgeClient bridge) =>
     try
     {
         var el = await bridge.PostAsync("refresh", new { });
+        return Results.Json(el);
+    }
+    catch (Exception ex)
+    {
+        return Results.Json(new { ok = false, error = ex.Message }, statusCode: 502);
+    }
+});
+
+// Single TG progressive update
+app.MapPost("/refresh/one", async (TgRequest req, OssiBridgeClient bridge) =>
+{
+    if (req.Tg < 1)
+        return Results.BadRequest(new { ok = false, error = "tg must be >= 1" });
+    try
+    {
+        var el = await bridge.PostAsync("refresh/one", new { tg = req.Tg });
         return Results.Json(el);
     }
     catch (Exception ex)

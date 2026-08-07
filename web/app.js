@@ -11,6 +11,8 @@ const state = {
   connected: false,
   timer: null,
   heartbeatTimer: null,
+  /** Fast poll of trunk_data while progressive OSSI status runs */
+  livePollTimer: null,
   /** @type {{tg:number,order:number,note:string}[]} */
   monitored: [],
   /** @type {object[]} live trunk rows joined with notes */
@@ -75,13 +77,16 @@ function setSessionLabel(text, ok) {
   el.style.color = ok ? "var(--ok)" : "";
 }
 
-/** Login state machine: before login hide tabs/content; after show; dim when mid-session drop. */
+/** Login state machine: before login hide tabs/content; after show; dim login fields. */
 function applyUiMode() {
   const tabs = $("main-tabs");
   const panel = $("panel-trunk");
   const card = $("trunk-card");
   const btnRef = $("btn-refresh-now");
   const btnDisc = $("btn-disconnect");
+  const btnConn = $("btn-connect");
+  const fields = ["inp-host", "inp-port", "inp-user", "inp-pass"];
+  const connectPanel = $("connect-panel");
 
   if (state.connected) {
     tabs.hidden = false;
@@ -89,10 +94,15 @@ function applyUiMode() {
     card.classList.remove("dimmed");
     btnRef.disabled = false;
     btnDisc.disabled = false;
+    btnConn.disabled = true;
+    fields.forEach((id) => {
+      const el = $(id);
+      if (el) el.disabled = true;
+    });
+    if (connectPanel) connectPanel.classList.add("is-logged-in");
     $("connect-hint").textContent =
-      "已登入。開住呢頁先會 auto refresh（60s）。熄頁會斷 OSSI；無心跳約 90 秒亦會 logoff。Idle 上限 30 分鐘。";
+      "Logged in. Keep this page open for auto refresh (60s). Close tab disconnects OSSI. Idle max 30 min.";
   } else {
-    // keep tabs visible if we had data before (dimmed), else hide until first login in this page load
     if (state.trunkItems.length || state.monitored.length) {
       tabs.hidden = false;
       panel.classList.remove("hidden");
@@ -103,6 +113,12 @@ function applyUiMode() {
     }
     btnRef.disabled = true;
     btnDisc.disabled = true;
+    btnConn.disabled = false;
+    fields.forEach((id) => {
+      const el = $(id);
+      if (el) el.disabled = false;
+    });
+    if (connectPanel) connectPanel.classList.remove("is-logged-in");
   }
 }
 
@@ -353,16 +369,34 @@ function renderTrunkMeta(data) {
   }
 }
 
-async function loadTrunkData() {
-  const res = await api("trunk-data");
-  const data = res.data || res;
-  state.trunkItems = (data && data.items) || [];
-  // keep notes from monitored when live items omit them
-  renderTrunkMeta(data);
-  renderTrunkTable();
-  if (data.error) setError(data.error);
-  else setError("");
-  return data;
+/**
+ * @param {{ soft?: boolean }} [opts] soft: never throw / never wipe rows on empty or 502
+ */
+async function loadTrunkData(opts = {}) {
+  const soft = !!opts.soft;
+  try {
+    const res = await api("trunk-data");
+    const data = res.data || res;
+    const items = (data && data.items) || [];
+    // Never flash empty table on transient empty/error while we already have rows
+    if (items.length > 0 || state.trunkItems.length === 0) {
+      state.trunkItems = items;
+    }
+    renderTrunkMeta(data);
+    renderTrunkTable();
+    if (data.error && !data.refreshing) setError(data.error);
+    else if (!data.error) setError("");
+    if (data.refreshing) {
+      setStatus("Updating trunks… (live, per TG)");
+    }
+    return data;
+  } catch (e) {
+    if (soft) {
+      console.warn("trunk-data soft fail:", e.message || e);
+      return null;
+    }
+    throw e;
+  }
 }
 
 async function loadMonitored() {
@@ -574,11 +608,12 @@ async function connect() {
         /* ignore */
       }
     }
-    setLoginStep(3, "done", "Monitoring active · auto-refresh 60s · close page to disconnect");
+    setLoginStep(3, "done", "Monitoring active · live row updates · close page to disconnect");
     setStatus("Logged in. Keep this page open to monitor. Close tab disconnects OSSI.");
     $("chk-auto").checked = true;
     scheduleAuto();
     startHeartbeat();
+    startLivePoll();
     hideLoginModal(700);
   } catch (e) {
     state.connected = false;
@@ -604,9 +639,27 @@ function startHeartbeat() {
   stopHeartbeat();
   state.heartbeatTimer = setInterval(() => {
     if (!state.connected) return;
+    // Soft: 502 / bridge busy must NOT clear table or flip session
     api("session/heartbeat", { method: "POST", body: "{}" }).catch(() => {});
   }, 30_000);
   api("session/heartbeat", { method: "POST", body: "{}" }).catch(() => {});
+}
+
+function stopLivePoll() {
+  if (state.livePollTimer) {
+    clearInterval(state.livePollTimer);
+    state.livePollTimer = null;
+  }
+}
+
+/** Poll trunk_data every 2s so progressive status trunk N writes appear row-by-row */
+function startLivePoll() {
+  stopLivePoll();
+  state.livePollTimer = setInterval(() => {
+    if (!state.connected) return;
+    loadTrunkData({ soft: true });
+  }, 2000);
+  loadTrunkData({ soft: true });
 }
 
 function disconnectOnPageClose() {
@@ -614,6 +667,7 @@ function disconnectOnPageClose() {
   state.disconnecting = true;
   state.connected = false;
   stopHeartbeat();
+  stopLivePoll();
   clearAuto();
   try {
     const url = apiUrl("session/disconnect");
@@ -636,6 +690,7 @@ function disconnectOnPageClose() {
 async function disconnect() {
   state.disconnecting = true;
   stopHeartbeat();
+  stopLivePoll();
   try {
     await api("session/disconnect", { method: "POST", body: "{}" });
   } catch {
@@ -651,14 +706,25 @@ async function disconnect() {
 }
 
 async function refreshNow() {
-  setStatus("Refreshing via OSSI…");
+  setStatus("Refreshing… each TG updates as soon as status trunk N returns");
+  setError("");
   try {
-    await api("refresh", { method: "POST", body: "{}" });
-    await loadTrunkData();
+    // Fire full progressive refresh (server writes after each TG); UI live-poll paints rows
+    const refreshPromise = api("refresh", { method: "POST", body: "{}" });
+    // Meanwhile poll while refresh runs
+    const poll = setInterval(() => loadTrunkData({ soft: true }), 1200);
+    try {
+      await refreshPromise;
+    } finally {
+      clearInterval(poll);
+    }
+    await loadTrunkData({ soft: true });
     if (state.detailTg) await loadDetail(state.detailTg);
     setStatus("Refresh complete.");
   } catch (e) {
+    // Keep existing rows on failure
     setError(String(e.message || e));
+    await loadTrunkData({ soft: true });
   }
 }
 
@@ -707,15 +773,18 @@ function clearAuto() {
 function scheduleAuto() {
   clearAuto();
   if (!$("chk-auto").checked) return;
+  // UI only re-reads progressive trunk_data; server auto-loop does status trunk N every 60s
   state.timer = setInterval(async () => {
     if (!state.connected) return;
-    try {
-      await loadTrunkData();
-      if (state.detailTg) await loadDetail(state.detailTg);
-    } catch {
-      /* quiet poll miss */
+    await loadTrunkData({ soft: true });
+    if (state.detailTg) {
+      try {
+        await loadDetail(state.detailTg);
+      } catch {
+        /* ignore */
+      }
     }
-  }, 60_000);
+  }, 5000);
 }
 
 function bindTabs() {
@@ -778,6 +847,7 @@ async function init() {
         applyUiMode();
         scheduleAuto();
         startHeartbeat();
+        startLivePoll();
       } else {
         state.connected = false;
         setSessionLabel("Disconnected", false);

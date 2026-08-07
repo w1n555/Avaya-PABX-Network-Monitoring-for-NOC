@@ -392,6 +392,19 @@ public sealed class OssiBridgeClient
     public async Task<JsonElement> PostAsync(string path, object? body, CancellationToken ct = default)
     {
         await EnsureBridgeRunningAsync(ct).ConfigureAwait(false);
+        return await PostRawAsync(path, body, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>POST without auto-start (heartbeat) — fail fast if bridge is briefly busy/down.</summary>
+    public async Task<JsonElement> PostLightAsync(string path, object? body, CancellationToken ct = default)
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        cts.CancelAfter(TimeSpan.FromSeconds(8));
+        return await PostRawAsync(path, body, cts.Token).ConfigureAwait(false);
+    }
+
+    private async Task<JsonElement> PostRawAsync(string path, object? body, CancellationToken ct)
+    {
         // Use StringContent so Content-Length is set (Python bridge needs it; chunked can empty body)
         var json = JsonSerializer.Serialize(body ?? new { }, CamelJson);
         using var content = new StringContent(json, Encoding.UTF8, "application/json");

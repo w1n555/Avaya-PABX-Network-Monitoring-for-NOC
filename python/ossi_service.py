@@ -82,6 +82,9 @@ UI_GONE_SEC = 90
 UI_WATCH_SEC = 15
 
 _lock = threading.RLock()
+# Serialize OSSI SSH commands only — do NOT hold _lock during long status trunk runs
+# so heartbeat / trunk-data reads stay responsive.
+_ossi_lock = threading.Lock()
 _session: OssiSession | None = None
 _cfg: SessionConfig | None = None
 _connected = False
@@ -92,6 +95,7 @@ _tg_catalog: dict[int, dict[str, Any]] = {}
 _stop = threading.Event()
 _last_ui_seen = 0.0  # time.monotonic(); 0 = no UI since process start
 _last_refresh_at = 0.0
+_refreshing = False
 
 
 def _now_iso() -> str:
@@ -217,7 +221,12 @@ def save_monitored(trunks: list[int]) -> dict[str, Any]:
     return save_monitored_items(items)
 
 
-def write_trunk_data(items: list[dict[str, Any]], *, error: str | None = None) -> dict[str, Any]:
+def write_trunk_data(
+    items: list[dict[str, Any]],
+    *,
+    error: str | None = None,
+    refreshing: bool | None = None,
+) -> dict[str, Any]:
     # Attach notes/order from monitored config (local cache metadata)
     meta = {it["tg"]: it for it in load_monitored_items()}
     for it in items:
@@ -233,10 +242,27 @@ def write_trunk_data(items: list[dict[str, Any]], *, error: str | None = None) -
         "connected": _connected,
         "error": error,
         "source": "avaya-ossi",
+        "refreshing": bool(_refreshing if refreshing is None else refreshing),
         "items": items,
     }
     _write_json(PATHS.trunk_data, obj)
     return obj
+
+
+def _load_trunk_items_map() -> dict[int, dict[str, Any]]:
+    raw = _read_json(PATHS.trunk_data, {"items": []})
+    items = raw.get("items") if isinstance(raw, dict) else []
+    out: dict[int, dict[str, Any]] = {}
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        try:
+            tg = int(it.get("tg") or 0)
+        except (TypeError, ValueError):
+            continue
+        if tg >= 1:
+            out[tg] = dict(it)
+    return out
 
 
 def ensure_seed_files() -> None:
@@ -335,117 +361,168 @@ def connect_unlocked(body: dict[str, Any]) -> dict[str, Any]:
 
     touch_ui()  # Login counts as UI present
 
-    # first collect
-    data = refresh_unlocked()
+    # First trunk poll is done by caller OUTSIDE _lock so heartbeat stays free
     return {
         "ok": True,
         "host": host,
         "username": username,
         "connected": True,
         "catalogSize": len(_tg_catalog),
-        "trunkData": data,
+        "trunkData": None,
         "uiTimeoutSec": UI_GONE_SEC,
         "sessionIdleLogoffMin": 30,
     }
 
 
+def _status_one_tg(sess: OssiSession, tg: int, catalog: dict[int, dict[str, Any]]) -> dict[str, Any]:
+    """Run one OSSI `status trunk N` and return a trunk row dict."""
+    meta = catalog.get(tg, {})
+    st = sess.run(f"status trunk {tg}", max_more_pages=12)
+    if not st.ok:
+        return {
+            "tg": tg,
+            "name": meta.get("name") or f"TG {tg}",
+            "type": meta.get("type") or "",
+            "tac": meta.get("tac") or "",
+            "total": int(meta.get("total") or 0),
+            "idle": 0,
+            "busy": 0,
+            "oos": 0,
+            "utilizationPct": 0.0,
+            "statusColor": "red",
+            "lastUpdate": _now_iso(),
+            "error": st.error or "status failed",
+        }
+    counts = parse_channel_counts(st.text)
+    total = counts["total"] or int(meta.get("total") or 0)
+    idle = counts["idle"]
+    busy = counts["busy"]
+    oos = counts["oos"]
+    if counts["total"] == 0 and total > 0:
+        idle = total
+        busy = 0
+        oos = 0
+    util = utilization_pct(busy, total if total > 0 else (idle + busy + oos))
+    tot = total if total > 0 else (idle + busy + oos)
+    color = status_color(idle, util)
+    return {
+        "tg": tg,
+        "name": meta.get("name") or f"TG {tg}",
+        "type": meta.get("type") or "",
+        "tac": meta.get("tac") or "",
+        "total": tot,
+        "idle": idle,
+        "busy": busy,
+        "oos": oos,
+        "utilizationPct": util,
+        "statusColor": color,
+        "lastUpdate": _now_iso(),
+        "error": None,
+    }
+
+
 def refresh_unlocked() -> dict[str, Any]:
-    global _last_error, _tg_catalog, _last_refresh_at
+    """
+    Poll each monitored TG with `status trunk N`.
+    Writes trunk_data.json after EACH TG so the UI can update progressively.
+    Does not hold _lock during OSSI I/O (caller should release before long work,
+    or use refresh_progressive which manages locks).
+    """
+    global _last_error, _tg_catalog, _last_refresh_at, _refreshing
 
-    if not _connected or _session is None:
-        data = write_trunk_data([], error="Not connected")
-        return data
+    with _lock:
+        if not _connected or _session is None:
+            # Keep last rows; only flip connected flag
+            by = _load_trunk_items_map()
+            return write_trunk_data(list(by.values()), error="Not connected", refreshing=False)
+        sess = _session
+        monitored = load_monitored()
+        catalog = dict(_tg_catalog)
+        _refreshing = True
 
-    monitored = load_monitored()
-    items: list[dict[str, Any]] = []
+    # Seed map with previous values so partial pass still shows old numbers for pending TGs
+    by_tg = _load_trunk_items_map()
+    # Drop TGs no longer monitored
+    mon_set = set(monitored)
+    by_tg = {k: v for k, v in by_tg.items() if k in mon_set}
     errors: list[str] = []
 
-    # refresh catalog lightly if empty
-    if not _tg_catalog:
-        cat = _session.run("list trunk-group", max_more_pages=15)
+    # catalog if empty (one OSSI call)
+    if not catalog:
+        with _ossi_lock:
+            with _lock:
+                if not _connected or _session is None:
+                    _refreshing = False
+                    return write_trunk_data(list(by_tg.values()), error="Not connected", refreshing=False)
+                sess = _session
+            cat = sess.run("list trunk-group", max_more_pages=15)
         if cat.ok:
-            _tg_catalog = parse_trunk_groups(cat.text)
+            with _lock:
+                _tg_catalog = parse_trunk_groups(cat.text)
+                catalog = dict(_tg_catalog)
 
     for tg in monitored:
+        with _lock:
+            if not _connected or _session is None:
+                break
+            sess = _session
+            catalog = dict(_tg_catalog)
         try:
-            st = _session.run(f"status trunk {tg}", max_more_pages=12)
-            if not st.ok:
-                errors.append(f"TG{tg}: {st.error or 'status failed'}")
-                meta = _tg_catalog.get(tg, {})
-                items.append(
-                    {
-                        "tg": tg,
-                        "name": meta.get("name") or f"TG {tg}",
-                        "type": meta.get("type") or "",
-                        "tac": meta.get("tac") or "",
-                        "total": meta.get("total") or 0,
-                        "idle": 0,
-                        "busy": 0,
-                        "oos": 0,
-                        "utilizationPct": 0.0,
-                        "statusColor": "red",
-                        "lastUpdate": _now_iso(),
-                        "error": st.error or "status failed",
-                    }
-                )
-                continue
-
-            counts = parse_channel_counts(st.text)
-            meta = _tg_catalog.get(tg, {})
-            total = counts["total"] or int(meta.get("total") or 0)
-            idle = counts["idle"]
-            busy = counts["busy"]
-            oos = counts["oos"]
-            # If parser found channels, trust sum; else fall back catalog total
-            if counts["total"] == 0 and total > 0:
-                idle = total
-                busy = 0
-                oos = 0
-            util = utilization_pct(busy, total if total > 0 else (idle + busy + oos))
-            tot = total if total > 0 else (idle + busy + oos)
-            color = status_color(idle, util)
-            items.append(
-                {
-                    "tg": tg,
-                    "name": meta.get("name") or f"TG {tg}",
-                    "type": meta.get("type") or "",
-                    "tac": meta.get("tac") or "",
-                    "total": tot,
-                    "idle": idle,
-                    "busy": busy,
-                    "oos": oos,
-                    "utilizationPct": util,
-                    "statusColor": color,
-                    "lastUpdate": _now_iso(),
-                    "error": None,
-                }
-            )
-            # gentle pace — avoid hammering Main CM
-            time.sleep(0.35)
+            with _ossi_lock:
+                row = _status_one_tg(sess, tg, catalog)
+            if row.get("error"):
+                errors.append(f"TG{tg}: {row['error']}")
+            by_tg[tg] = row
+            # Progressive disk write — UI polls trunk-data and paints immediately
+            partial_err = "; ".join(errors) if errors else None
+            with _lock:
+                write_trunk_data(list(by_tg.values()), error=partial_err, refreshing=True)
+            time.sleep(0.25)
         except Exception as exc:
             errors.append(f"TG{tg}: {exc}")
-            meta = _tg_catalog.get(tg, {})
-            items.append(
-                {
-                    "tg": tg,
-                    "name": meta.get("name") or f"TG {tg}",
-                    "type": meta.get("type") or "",
-                    "tac": meta.get("tac") or "",
-                    "total": int(meta.get("total") or 0),
-                    "idle": 0,
-                    "busy": 0,
-                    "oos": 0,
-                    "utilizationPct": 0.0,
-                    "statusColor": "red",
-                    "lastUpdate": _now_iso(),
-                    "error": str(exc),
-                }
-            )
+            meta = catalog.get(tg, {})
+            by_tg[tg] = {
+                "tg": tg,
+                "name": meta.get("name") or f"TG {tg}",
+                "type": meta.get("type") or "",
+                "tac": meta.get("tac") or "",
+                "total": int(meta.get("total") or 0),
+                "idle": 0,
+                "busy": 0,
+                "oos": 0,
+                "utilizationPct": 0.0,
+                "statusColor": "red",
+                "lastUpdate": _now_iso(),
+                "error": str(exc),
+            }
+            with _lock:
+                write_trunk_data(list(by_tg.values()), error="; ".join(errors), refreshing=True)
 
     err = "; ".join(errors) if errors else None
-    _last_error = err
-    _last_refresh_at = time.monotonic()
-    return write_trunk_data(items, error=err)
+    with _lock:
+        _last_error = err
+        _last_refresh_at = time.monotonic()
+        _refreshing = False
+        return write_trunk_data(list(by_tg.values()), error=err, refreshing=False)
+
+
+def refresh_one_tg(tg: int) -> dict[str, Any]:
+    """Single TG status + immediate write (for on-demand progressive UI)."""
+    global _last_error, _refreshing
+    with _lock:
+        if not _connected or _session is None:
+            raise RuntimeError("Not connected")
+        sess = _session
+        catalog = dict(_tg_catalog)
+    with _ossi_lock:
+        row = _status_one_tg(sess, int(tg), catalog)
+    by_tg = _load_trunk_items_map()
+    by_tg[int(tg)] = row
+    with _lock:
+        if row.get("error"):
+            _last_error = f"TG{tg}: {row['error']}"
+        data = write_trunk_data(list(by_tg.values()), error=_last_error, refreshing=False)
+    return {"ok": not bool(row.get("error")), "item": row, "data": data}
 
 
 def session_public() -> dict[str, Any]:
@@ -474,34 +551,40 @@ def session_public() -> dict[str, Any]:
 def _auto_loop() -> None:
     """
     - Every UI_WATCH_SEC: if connected but no UI heartbeat → disconnect (page closed)
-    - Every AUTO_REFRESH_SEC while UI present: status trunk poll
-    - If no UI: do NOT refresh (so CM/OSSI idle can apply; we also force disconnect)
+    - Every AUTO_REFRESH_SEC while UI present: status trunk poll (progressive writes)
+    - If no UI: do NOT refresh
     """
     global _last_error
     while not _stop.is_set():
         if _stop.wait(UI_WATCH_SEC):
             break
+        do_refresh = False
         with _lock:
             if not _connected or _session is None:
                 continue
-            # Page closed / no heartbeat → logoff OSSI
             if not ui_is_present():
                 try:
                     disconnect_unlocked()
-                    write_trunk_data([], error=None)
+                    # Keep last TG rows; only mark offline (UI should not flash empty)
+                    by = _load_trunk_items_map()
+                    write_trunk_data(list(by.values()), error=None, refreshing=False)
                     _last_error = "UI closed or silent — OSSI logged off"
                 except Exception as exc:
                     _last_error = str(exc)
                 continue
-            # UI open: full trunk refresh on interval
             due = (_last_refresh_at <= 0) or (
                 (time.monotonic() - _last_refresh_at) >= AUTO_REFRESH_SEC
             )
-            if due:
-                try:
-                    refresh_unlocked()
-                except Exception as exc:
+            if due and not _refreshing:
+                do_refresh = True
+        if do_refresh:
+            try:
+                # refresh_unlocked manages its own short lock sections + progressive writes
+                refresh_unlocked()
+            except Exception as exc:
+                with _lock:
                     _last_error = str(exc)
+                    _refreshing = False
 
 
 # ---------------------------------------------------------------------------
@@ -657,25 +740,46 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/session/connect":
                 with _lock:
                     result = connect_unlocked(body)
+                # Progressive status trunk outside connect lock
+                try:
+                    data = refresh_unlocked()
+                    result["trunkData"] = data
+                except Exception as exc:
+                    result["trunkData"] = None
+                    result["refreshError"] = str(exc)
                 self._send(200, result)
                 return
             if path == "/session/disconnect":
                 with _lock:
                     disconnect_unlocked()
-                    write_trunk_data([], error=None)
+                    by = _load_trunk_items_map()
+                    write_trunk_data(list(by.values()), error=None, refreshing=False)
                 self._send(200, {"ok": True, "connected": False})
                 return
             if path in ("/session/heartbeat", "/heartbeat"):
+                # Never block on long OSSI refresh — only stamp UI + quick status
+                touch_ui()
                 with _lock:
-                    touch_ui()
                     st = session_public()
                 self._send(200, {"ok": True, **st})
                 return
             if path == "/refresh":
-                with _lock:
-                    touch_ui()
-                    data = refresh_unlocked()
+                touch_ui()
+                # Do not hold _lock for entire multi-TG poll
+                data = refresh_unlocked()
                 self._send(200, {"ok": True, "data": data})
+                return
+            if path in ("/refresh/one", "/refresh/tg"):
+                touch_ui()
+                tg = int(body.get("tg") or body.get("Tg") or 0)
+                if tg < 1:
+                    self._send(400, {"ok": False, "error": "tg required"})
+                    return
+                try:
+                    result = refresh_one_tg(tg)
+                    self._send(200, result)
+                except Exception as exc:
+                    self._send(401 if "Not connected" in str(exc) else 500, {"ok": False, "error": str(exc)})
                 return
             if path == "/monitored/add":
                 tg = int(body.get("tg") or body.get("Tg") or 0)
@@ -688,8 +792,12 @@ class Handler(BaseHTTPRequestHandler):
                     if not any(i["tg"] == tg for i in items):
                         items.append({"tg": tg, "order": len(items), "note": note})
                     obj = save_monitored_items(items)
-                    if _connected:
-                        refresh_unlocked()
+                    connected = _connected
+                if connected:
+                    try:
+                        refresh_one_tg(tg)
+                    except Exception:
+                        pass
                 self._send(200, {"ok": True, **obj})
                 return
             if path == "/monitored/remove":
@@ -697,8 +805,10 @@ class Handler(BaseHTTPRequestHandler):
                 with _lock:
                     items = [i for i in load_monitored_items() if i["tg"] != tg]
                     obj = save_monitored_items(items)
-                    if _connected:
-                        refresh_unlocked()
+                    by = _load_trunk_items_map()
+                    if tg in by:
+                        del by[tg]
+                        write_trunk_data(list(by.values()), error=None)
                 self._send(200, {"ok": True, **obj})
                 return
             if path == "/monitored/note":

@@ -1,7 +1,9 @@
 /**
- * Avaya NOC UI — single-card Trunk Group Status
+ * Avaya NOC UI — Trunk (OSSI) + CDR tab (mock UI for now)
  * OSSI via /CM/api · trunk_data.json + monitored_trunks.json
  */
+
+import { initCdrUi, onCdrTabShow } from "./cdr-ui.js";
 
 const API = "api";
 
@@ -88,9 +90,11 @@ function applyUiMode() {
   const fields = ["inp-host", "inp-port", "inp-user", "inp-pass"];
   const connectPanel = $("connect-panel");
 
+  // Always show module tabs so CDR mock UI is reviewable without CM login
+  if (tabs) tabs.hidden = false;
+
   if (state.connected) {
-    tabs.hidden = false;
-    panel.classList.remove("hidden");
+    if (panel && panel.dataset.panel === "trunk") panel.classList.remove("hidden");
     card.classList.remove("dimmed");
     btnRef.disabled = false;
     btnDisc.disabled = false;
@@ -103,14 +107,8 @@ function applyUiMode() {
     $("connect-hint").textContent =
       "Logged in. Keep this page open for auto refresh (60s). Close tab disconnects OSSI. Idle max 30 min.";
   } else {
-    if (state.trunkItems.length || state.monitored.length) {
-      tabs.hidden = false;
-      panel.classList.remove("hidden");
-      card.classList.add("dimmed");
-    } else {
-      tabs.hidden = true;
-      panel.classList.add("hidden");
-    }
+    // Trunk panel: dim if visible; keep structure when user is on Trunk tab
+    if (card) card.classList.add("dimmed");
     btnRef.disabled = true;
     btnDisc.disabled = true;
     btnConn.disabled = false;
@@ -119,6 +117,8 @@ function applyUiMode() {
       if (el) el.disabled = false;
     });
     if (connectPanel) connectPanel.classList.remove("is-logged-in");
+    $("connect-hint").textContent =
+      "Login for live Trunk OSSI. CDR tab works with mock data (no CM CDR yet).";
   }
 }
 
@@ -798,6 +798,13 @@ function bindTabs() {
       document.querySelectorAll("[data-panel]").forEach((p) => {
         p.classList.toggle("hidden", p.dataset.panel !== name);
       });
+      if (name === "cdr") {
+        try {
+          onCdrTabShow();
+        } catch {
+          /* ignore */
+        }
+      }
     });
   });
 }
@@ -806,6 +813,11 @@ async function init() {
   bindTabs();
   tickClock();
   setInterval(tickClock, 1000);
+  try {
+    initCdrUi();
+  } catch (e) {
+    console.warn("CDR UI init:", e);
+  }
 
   $("btn-connect").addEventListener("click", connect);
   $("btn-disconnect").addEventListener("click", disconnect);

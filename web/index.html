@@ -37,12 +37,13 @@
       <div class="error-line" id="error-line" hidden></div>
     </section>
 
-    <!-- Tabs under login — only meaningful after login -->
-    <nav class="tabs" id="main-tabs" role="tablist" aria-label="NOC modules" hidden>
+    <!-- Tabs under login — Trunk needs session; CDR UI works with mock data for review -->
+    <nav class="tabs" id="main-tabs" role="tablist" aria-label="NOC modules">
       <button type="button" class="tab active" data-tab="trunk" role="tab" aria-selected="true">Trunk</button>
-      <button type="button" class="tab disabled" data-tab="station" disabled title="稍後開放" role="tab">Station <span class="soon">soon</span></button>
-      <button type="button" class="tab disabled" data-tab="vdn" disabled title="稍後開放" role="tab">VDN <span class="soon">soon</span></button>
-      <button type="button" class="tab disabled" data-tab="alarm" disabled title="稍後開放" role="tab">Alarm <span class="soon">soon</span></button>
+      <button type="button" class="tab" data-tab="cdr" role="tab" aria-selected="false">CDR</button>
+      <button type="button" class="tab disabled" data-tab="station" disabled title="Coming soon" role="tab">Station <span class="soon">soon</span></button>
+      <button type="button" class="tab disabled" data-tab="vdn" disabled title="Coming soon" role="tab">VDN <span class="soon">soon</span></button>
+      <button type="button" class="tab disabled" data-tab="alarm" disabled title="Coming soon" role="tab">Alarm <span class="soon">soon</span></button>
     </nav>
 
     <!-- TRUNK TAB: single card -->
@@ -126,18 +127,136 @@
       </section>
     </main>
 
+    <!-- CDR TAB: UI preview with mock data (real CM CDR later) -->
+    <main class="main hidden" id="panel-cdr" data-panel="cdr">
+      <div class="cdr-banner" id="cdr-mock-banner">
+        <strong>UI preview · Mock data</strong>
+        — Not connected to CM CDR yet. Charts use simulated calls for layout / trunk sizing review.
+      </div>
+
+      <!-- Search -->
+      <section class="card cdr-card">
+        <div class="panel-head">
+          <div>
+            <h2>CDR Search</h2>
+            <p class="hint">Search call records (mock). Later: scan daily text logs from CDR logger :9000.</p>
+          </div>
+          <div class="card-actions">
+            <button type="button" class="btn" id="btn-cdr-export">Export CSV</button>
+            <button type="button" class="btn btn-primary" id="btn-cdr-search">Search</button>
+          </div>
+        </div>
+        <div class="cdr-search-grid">
+          <label>From <input type="date" id="cdr-from" /></label>
+          <label>To <input type="date" id="cdr-to" /></label>
+          <label>Calling <input type="text" id="cdr-calling" placeholder="e.g. 2123" /></label>
+          <label>Called <input type="text" id="cdr-called" placeholder="e.g. 8529…" /></label>
+          <label>Trunk / TG <input type="text" id="cdr-trunk" placeholder="e.g. 1 or TG1" /></label>
+          <label>Direction
+            <select id="cdr-dir">
+              <option value="">All</option>
+              <option value="in">Inbound</option>
+              <option value="out">Outbound</option>
+            </select>
+          </label>
+          <label>Min duration (sec) <input type="number" id="cdr-min-dur" min="0" value="0" /></label>
+        </div>
+        <p class="hint" id="cdr-search-meta">—</p>
+        <div class="table-wrap cdr-table-wrap">
+          <table class="data-table" id="cdr-result-table">
+            <thead>
+              <tr>
+                <th>End time</th>
+                <th>Dir</th>
+                <th>Calling</th>
+                <th>Called</th>
+                <th>TG</th>
+                <th>Duration</th>
+                <th>Cond</th>
+              </tr>
+            </thead>
+            <tbody id="cdr-result-tbody">
+              <tr class="empty"><td colspan="7">Run Search to list mock records.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Daily hourly -->
+      <section class="card cdr-card">
+        <div class="panel-head">
+          <div>
+            <h2>Daily · Hourly number of calls</h2>
+            <p class="hint">Calls ending in each hour on the selected day (0–23). Peak hour helps size trunks.</p>
+          </div>
+          <div class="card-actions">
+            <label class="cdr-inline-label">Day <input type="date" id="cdr-day" /></label>
+          </div>
+        </div>
+        <div class="cdr-kpi-row" id="cdr-daily-kpi"></div>
+        <div class="hour-chart" id="cdr-daily-chart" aria-label="Daily hourly chart"></div>
+        <div class="hour-axis">
+          <span>0</span><span>6</span><span>12</span><span>18</span><span>23</span>
+        </div>
+      </section>
+
+      <!-- Monthly hourly -->
+      <section class="card cdr-card">
+        <div class="panel-head">
+          <div>
+            <h2>Monthly · Hourly number of calls</h2>
+            <p class="hint">Total calls per clock-hour across the selected month (profile of busy hours).</p>
+          </div>
+          <div class="card-actions">
+            <label class="cdr-inline-label">Month <input type="month" id="cdr-month" /></label>
+          </div>
+        </div>
+        <div class="cdr-kpi-row" id="cdr-monthly-kpi"></div>
+        <div class="hour-chart" id="cdr-monthly-chart" aria-label="Monthly hourly chart"></div>
+        <div class="hour-axis">
+          <span>0</span><span>6</span><span>12</span><span>18</span><span>23</span>
+        </div>
+      </section>
+
+      <!-- Trunk sizing helper -->
+      <section class="card cdr-card">
+        <div class="panel-head">
+          <div>
+            <h2>Trunk size check <span class="badge-mock">estimate</span></h2>
+            <p class="hint">
+              Rough busy-hour load vs channels. Uses mock peak hour + average duration.
+              Formula: offered erlang ≈ (calls_in_busy_hour × avg_talk_sec) / 3600.
+              Compare to trunk members (Total channels).
+            </p>
+          </div>
+        </div>
+        <div class="cdr-size-grid">
+          <label>Trunk members (channels)
+            <input type="number" id="cdr-trunk-size" min="1" value="23" />
+          </label>
+          <label>Target busy-hour util %
+            <input type="number" id="cdr-target-util" min="30" max="95" value="70" />
+          </label>
+          <button type="button" class="btn btn-primary" id="btn-cdr-size">Recalculate</button>
+        </div>
+        <div class="cdr-size-result" id="cdr-size-result">
+          <!-- filled by JS -->
+        </div>
+      </section>
+    </main>
+
     <main class="main hidden" id="panel-station" data-panel="station">
-      <div class="placeholder">Station — 稍後開放</div>
+      <div class="placeholder">Station — coming soon</div>
     </main>
     <main class="main hidden" id="panel-vdn" data-panel="vdn">
-      <div class="placeholder">VDN — 稍後開放</div>
+      <div class="placeholder">VDN — coming soon</div>
     </main>
     <main class="main hidden" id="panel-alarm" data-panel="alarm">
-      <div class="placeholder">Alarm — 稍後開放</div>
+      <div class="placeholder">Alarm — coming soon</div>
     </main>
 
     <footer class="footer">
-      Data via <strong>avaya-ossi</strong> · Read-only OSSI · No SAT scraping · No CDR · 關頁即斷 session
+      Data via <strong>avaya-ossi</strong> · Trunk: OSSI RO · CDR tab: mock UI (live logger later) · Close page disconnects OSSI
     </footer>
   </div>
 

@@ -81,10 +81,13 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 2. **檢查 / 自動裝 .NET 8 Hosting Bundle**（缺先問再裝；winget 或官網下載）  
 3. **檢查 / 自動裝 Python 3.12 + PATH**（缺先問再裝）  
 4. **問 LOCAL ROOT path**（預設 = 呢個 package 目錄）  
-5. **IIS Nested（預設）**：`/CM` + `/CM/api` 掛喺現有 site（例如 :8888），**唔搶** 根路徑其他 Web  
+5. **IIS Nested / 寄生（預設，所有機一樣）**  
+   - 你輸入 **現有 IIS port**（已有其他 Web 都得）  
+   - 只加 `/CM` + `/CM/api` 指去你填嘅 ROOT  
+   - **永遠唔改** 該 site 嘅 ROOT path / 首頁  
 6. 建 site venv + 裝內置 `vendor\avaya-ossi`  
-7. 註冊 bridge 開機 Task + 即刻起一次  
-8. 印出 URL：`http://127.0.0.1:8888/CM/`  
+7. 註冊 bridge 開機 Task  
+8. URL：`http://127.0.0.1:<port>/CM/`  
 
 可選：`-SkipDotNetInstall` / `-SkipPythonInstall`  
 

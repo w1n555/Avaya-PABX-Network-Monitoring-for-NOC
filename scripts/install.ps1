@@ -329,7 +329,13 @@ function Read-UserPath([string]$defaultPath) {
 function Read-Port([int]$defaultPort) {
     if ($SitePort -gt 0) { return $SitePort }
     if ($NonInteractive) { return $defaultPort }
-    $ans = Read-Host "IIS site port [Enter = $defaultPort]"
+    Write-Host ""
+    Write-Host "Which IIS PORT already hosts your main web service?"
+    Write-Host "  We will ONLY add nested apps under that site (e.g. /CM + /CM/api)."
+    Write-Host "  We will NOT change that site's root physical path or homepage."
+    Write-Host "  Default: $defaultPort"
+    Write-Host ""
+    $ans = Read-Host "Existing IIS site port [Enter = $defaultPort]"
     if ([string]::IsNullOrWhiteSpace($ans)) { return $defaultPort }
     $n = 0
     if (-not [int]::TryParse($ans, [ref]$n) -or $n -lt 1 -or $n -gt 65535) {
@@ -526,12 +532,22 @@ function Remove-DedicatedCmNocSiteIfConflicting([int]$port) {
     }
 }
 
+function Get-SiteRootPhysicalPath([string]$siteName) {
+    $appcmd = Get-AppCmd
+    $p = & $appcmd list vdir "/vdir.name:${siteName}/" /text:physicalPath 2>$null
+    if ($p) { return "$p".Trim() }
+    return $null
+}
+
 function Set-IisNested([string]$root, [int]$port, [string]$alias) {
-    # Nested: do NOT take over the whole port.
-    # Parent site (e.g. on :8888 -> C:\inetpub\wwwroot) keeps root service.
-    # Adds:
-    #   /CM     -> <root>
-    #   /CM/api -> <root>\api
+    # ============================================================
+    # PARASITE MODE (default for all machines)
+    # - NEVER change the parent site root physical path
+    # - NEVER replace http://host:port/ homepage
+    # - ONLY add applications under the user path folder name:
+    #     /CM     -> <user RootPath>
+    #     /CM/api -> <user RootPath>\api
+    # ============================================================
     $appcmd = Get-AppCmd
     $apiPath = Join-Path $root "api"
     if (-not (Test-Path $apiPath)) { throw "api folder missing: $apiPath" }
@@ -551,36 +567,44 @@ function Set-IisNested([string]$root, [int]$port, [string]$alias) {
     }
     if (-not $parent) {
         throw @"
-Could not find an existing IIS site on port $port (or parent folder).
-Your main web service should already listen on that port.
-Fix: open IIS Manager, note the Site name that uses port $port, then re-run:
+Could not find an existing IIS site on port $port (or parent folder of your ROOT).
+Nested mode needs an existing site — we only attach /CM under it.
+
+Fix: IIS Manager -> note Site name that uses port $port, then:
   .\install.ps1 -ParentSiteName `"ThatSiteName`" -SitePort $port
-Or use dedicated mode only if you want a separate port:
+
+Only if you want a SEPARATE full site on a FREE port (not shared):
   .\install.ps1 -IisMode Dedicated -SitePort 8890
 "@
     }
 
-    Write-Info "Using parent IIS site: $parent (port $port)"
-    Write-Info "Will mount /$alias and /$alias/api  (does not replace site root)"
+    # SAFETY: snapshot parent root path BEFORE we touch anything — must be unchanged after
+    $parentRootBefore = Get-SiteRootPhysicalPath -siteName $parent
+    Write-Info "Parent site: $parent (port $port)"
+    Write-Info "Parent ROOT path (will NOT be changed): $parentRootBefore"
+    Write-Info "Parasite apps only: /$alias -> $root ; /$alias/api -> $apiPath"
+
+    # Hard rule: never set vdir for parent site root
+    # (we only touch ${parent}/$alias and ${parent}/$alias/api)
 
     $apps = @(& $appcmd list app /text:APP.NAME 2>$null)
     $uiApp = "${parent}/$alias"
     $apiApp = "${parent}/$alias/api"
 
     if ($apps -notcontains $uiApp) {
-        Write-Info "Creating application /$alias -> $root"
+        Write-Info "Creating nested application /$alias -> $root"
         & $appcmd add app /site.name:"$parent" /path:"/$alias" /physicalPath:"$root" /applicationPool:"$AppPoolName" | Out-Null
     } else {
-        Write-Info "Updating application /$alias path"
+        Write-Info "Updating nested application /$alias path only"
         & $appcmd set app /app.name:"$uiApp" /applicationPool:"$AppPoolName" | Out-Null
         & $appcmd set vdir /vdir.name:"${uiApp}/" /physicalPath:"$root" | Out-Null
     }
 
     if ($apps -notcontains $apiApp) {
-        Write-Info "Creating application /$alias/api -> $apiPath"
+        Write-Info "Creating nested application /$alias/api -> $apiPath"
         & $appcmd add app /site.name:"$parent" /path:"/$alias/api" /physicalPath:"$apiPath" /applicationPool:"$AppPoolName" | Out-Null
     } else {
-        Write-Info "Updating application /$alias/api path"
+        Write-Info "Updating nested application /$alias/api path only"
         & $appcmd set app /app.name:"$apiApp" /applicationPool:"$AppPoolName" | Out-Null
         & $appcmd set vdir /vdir.name:"${apiApp}/" /physicalPath:"$apiPath" | Out-Null
     }
@@ -589,16 +613,27 @@ Or use dedicated mode only if you want a separate port:
     & $appcmd start site /site.name:"$parent" 2>$null | Out-Null
     & $appcmd start apppool /apppool.name:"$AppPoolName" 2>$null | Out-Null
 
+    $parentRootAfter = Get-SiteRootPhysicalPath -siteName $parent
+    if ($parentRootBefore -and $parentRootAfter -and ($parentRootBefore.TrimEnd('\') -ne $parentRootAfter.TrimEnd('\'))) {
+        throw "SAFETY STOP: parent site root path changed unexpectedly from '$parentRootBefore' to '$parentRootAfter'. Please fix IIS manually."
+    }
+    if ($parentRootAfter -and ($parentRootAfter.TrimEnd('\') -ieq $root.TrimEnd('\'))) {
+        throw "SAFETY STOP: parent site root equals app folder. Install aborted to avoid hijacking site root. Put app in a subfolder (e.g. ...\wwwroot\CM)."
+    }
+
     $uiPath = & $appcmd list vdir "/vdir.name:${uiApp}/" /text:physicalPath 2>$null
     $apiV = & $appcmd list vdir "/vdir.name:${apiApp}/" /text:physicalPath 2>$null
     Write-Info "Verified /$alias path: $uiPath"
     Write-Info "Verified /$alias/api path: $apiV"
-    Write-Ok "IIS nested apps on site '$parent': /$alias + /$alias/api (root site on :$port untouched)"
+    Write-Info "Verified parent ROOT still: $parentRootAfter"
+    Write-Ok "Parasite OK on '$parent': http://127.0.0.1:${port}/$alias/  (site root homepage unchanged)"
     return "/$alias"
 }
 
 function Set-IisDedicated([string]$root, [int]$port) {
-    # Only when user explicitly wants a whole-port site
+    # ONLY with explicit -IisMode Dedicated — owns a whole port (not for shared servers)
+    Write-Warn "Dedicated mode: will create/use a FULL site on port $port (not parasite)."
+    Write-Warn "If port already has another product, use Nested mode instead."
     $appcmd = Get-AppCmd
     $apiPath = Join-Path $root "api"
     if (-not (Test-Path $apiPath)) { throw "api folder missing: $apiPath" }
@@ -607,7 +642,7 @@ function Set-IisDedicated([string]$root, [int]$port) {
 
     $other = Find-SiteOnPort -port $port
     if ($other -and $other -ne $SiteName) {
-        throw "Port $port is already used by site '$other'. Pick another -SitePort or use -IisMode Nested."
+        throw "Port $port is already used by site '$other'. Pick a FREE -SitePort or use default Nested mode (parasite under existing site)."
     }
 
     $sites = @(& $appcmd list site /text:SITE.NAME 2>$null)

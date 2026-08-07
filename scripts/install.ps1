@@ -598,9 +598,27 @@ function Test-ExistingInstall([string]$root) {
     return $false
 }
 
+function Invoke-Git {
+    # Run git without PowerShell treating stderr (CRLF warnings) as terminating errors
+    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$GitArgs)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $output = & git @GitArgs 2>&1
+        $code = $LASTEXITCODE
+        foreach ($line in @($output)) {
+            $t = "$line"
+            if ($t -match '^(fatal|error):') { Write-Warn $t }
+            elseif ($t.Trim()) { Write-Host "  $t" }
+        }
+        return $code
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+}
+
 function Update-CodeFromGit([string]$root) {
     # Default: AUTO upgrade when possible. One command for new + old machines.
-    # -SkipUpdate only if user wants to freeze code on disk.
     if ($SkipUpdate) {
         Write-Info "SkipUpdate set - leaving files as-is on disk"
         return $false
@@ -616,17 +634,15 @@ function Update-CodeFromGit([string]$root) {
         } else {
             Write-Info "Fresh install (no git) - using files on disk."
         }
-        return $existing  # still force republish/restart path for existing
+        return $existing
     }
 
-    $git = Get-Command git -ErrorAction SilentlyContinue
-    if (-not $git) {
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
         Write-Warn "git not found - skip pull. Install Git for Windows for auto code update."
         return $existing
     }
 
-    Write-Info "Git repo detected - auto-updating code from GitHub (git fetch + pull)..."
-    # Preserve local monitoring list
+    Write-Info "Git repo detected - auto-updating code from GitHub..."
     $dataDir = Join-Path $root "data"
     $backup = Join-Path $env:TEMP ("cm-noc-data-backup-" + [guid]::NewGuid().ToString("N"))
     if (Test-Path $dataDir) {
@@ -637,32 +653,41 @@ function Update-CodeFromGit([string]$root) {
 
     Push-Location $root
     try {
-        # stop API lock before file updates when possible
         $appcmd = Get-AppCmd
         try { & $appcmd stop apppool /apppool.name:"$AppPoolName" 2>$null | Out-Null } catch {}
         Stop-BridgeOnPort 18765
 
-        & git fetch --all --prune 2>&1 | Out-Host
+        # Drop local build junk that blocks clean pull (never needed in git)
+        foreach ($junk in @("api_publish_tmp", "api\CmApi.dll.new", "api\CmApi.exe.new")) {
+            $jp = Join-Path $root $junk
+            if (Test-Path $jp) {
+                Remove-Item $jp -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        [void](Invoke-Git fetch --all --prune)
         $branch = (& git rev-parse --abbrev-ref HEAD 2>$null)
         if (-not $branch) { $branch = "main" }
-        # Prefer fast-forward; if dirty, stash data-related only is hard - stash all local non-data changes
-        $status = & git status --porcelain 2>$null
-        if ($status) {
-            Write-Warn "Local changes detected - stashing before pull (data\ backup kept separately)"
-            & git stash push -u -m "cm-noc-install-auto-stash" 2>&1 | Out-Host
+
+        # Prefer autostash pull - avoids hard fail on local dirty tree / CRLF noise
+        Write-Info "Pulling origin/$branch (autostash)..."
+        $code = Invoke-Git -c "core.autocrlf=true" pull --ff-only --autostash origin $branch
+        if ($code -ne 0) {
+            Write-Warn "ff-only+autostash failed (exit $code) - trying plain pull --autostash"
+            $code = Invoke-Git -c "core.autocrlf=true" pull --autostash origin $branch
         }
-        & git pull --ff-only origin $branch 2>&1 | Out-Host
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warn "ff-only pull failed - trying merge pull"
-            & git pull origin $branch 2>&1 | Out-Host
+        if ($code -ne 0) {
+            Write-Warn "git pull exit $code - continuing with files on disk (still reconfigure IIS/API)"
+        } else {
+            $head = & git log -1 --oneline 2>$null
+            Write-Ok "Code updated: $head"
         }
-        $head = & git log -1 --oneline 2>$null
-        Write-Ok "Code updated: $head"
+    } catch {
+        Write-Warn "Git update had an issue: $($_.Exception.Message) - continuing with on-disk files"
     } finally {
         Pop-Location
     }
 
-    # Restore monitored_trunks if pull wiped or reset data
     if (Test-Path $backup) {
         $monSrc = Join-Path $backup "monitored_trunks.json"
         $monDst = Join-Path $dataDir "monitored_trunks.json"
@@ -777,5 +802,6 @@ try {
 }
 catch {
     Write-Err $_.Exception.Message
+    if ($_.ScriptStackTrace) { Write-Host $_.ScriptStackTrace -ForegroundColor DarkGray }
     exit 1
 }

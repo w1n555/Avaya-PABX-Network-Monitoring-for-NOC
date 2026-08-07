@@ -7,6 +7,9 @@
 **/bin/
 **/obj/
 api/logs/
+api_publish_tmp/
+api/*.new
+api/CmApi.dll.new
 
 # Python
 __pycache__/

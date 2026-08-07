@@ -102,6 +102,20 @@ app.MapPost("/session/disconnect", async (OssiBridgeClient bridge) =>
     }
 });
 
+// Browser open keep-alive; if no heartbeat ~90s, bridge logs off OSSI
+app.MapPost("/session/heartbeat", async (OssiBridgeClient bridge) =>
+{
+    try
+    {
+        var el = await bridge.PostAsync("session/heartbeat", new { });
+        return Results.Json(el);
+    }
+    catch (Exception ex)
+    {
+        return Results.Json(new { ok = false, error = ex.Message }, statusCode: 502);
+    }
+});
+
 app.MapGet("/session/status", async (OssiBridgeClient bridge) =>
 {
     try

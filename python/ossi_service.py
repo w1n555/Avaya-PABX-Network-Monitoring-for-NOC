@@ -75,6 +75,10 @@ class _Paths:
 
 PATHS = _Paths()
 AUTO_REFRESH_SEC = 60
+# If no UI heartbeat / page activity for this long → logoff OSSI (browser closed)
+UI_GONE_SEC = 90
+# Watchdog tick (check UI gone more often than full trunk refresh)
+UI_WATCH_SEC = 15
 
 _lock = threading.RLock()
 _session: OssiSession | None = None
@@ -85,6 +89,8 @@ _username = ""
 _last_error: str | None = None
 _tg_catalog: dict[int, dict[str, Any]] = {}
 _stop = threading.Event()
+_last_ui_seen = 0.0  # time.monotonic(); 0 = no UI since process start
+_last_refresh_at = 0.0
 
 
 def _now_iso() -> str:
@@ -158,6 +164,18 @@ def ensure_seed_files() -> None:
 # ---------------------------------------------------------------------------
 
 
+def touch_ui() -> None:
+    """Browser is open / polled — keep OSSI session alive for refresh."""
+    global _last_ui_seen
+    _last_ui_seen = time.monotonic()
+
+
+def ui_is_present() -> bool:
+    if _last_ui_seen <= 0:
+        return False
+    return (time.monotonic() - _last_ui_seen) <= UI_GONE_SEC
+
+
 def disconnect_unlocked() -> None:
     global _session, _cfg, _connected, _last_error
     if _session is not None:
@@ -224,6 +242,8 @@ def connect_unlocked(body: dict[str, Any]) -> dict[str, Any]:
     else:
         _tg_catalog = {}
 
+    touch_ui()  # Login counts as UI present
+
     # first collect
     data = refresh_unlocked()
     return {
@@ -233,11 +253,13 @@ def connect_unlocked(body: dict[str, Any]) -> dict[str, Any]:
         "connected": True,
         "catalogSize": len(_tg_catalog),
         "trunkData": data,
+        "uiTimeoutSec": UI_GONE_SEC,
+        "sessionIdleLogoffMin": 30,
     }
 
 
 def refresh_unlocked() -> dict[str, Any]:
-    global _last_error, _tg_catalog
+    global _last_error, _tg_catalog, _last_refresh_at
 
     if not _connected or _session is None:
         data = write_trunk_data([], error="Not connected")
@@ -331,10 +353,14 @@ def refresh_unlocked() -> dict[str, Any]:
 
     err = "; ".join(errors) if errors else None
     _last_error = err
+    _last_refresh_at = time.monotonic()
     return write_trunk_data(items, error=err)
 
 
 def session_public() -> dict[str, Any]:
+    ui_age = None
+    if _last_ui_seen > 0:
+        ui_age = round(time.monotonic() - _last_ui_seen, 1)
     return {
         "connected": _connected,
         "host": _host or None,
@@ -342,22 +368,48 @@ def session_public() -> dict[str, Any]:
         "lastError": _last_error,
         "monitored": load_monitored(),
         "catalogSize": len(_tg_catalog),
+        "uiPresent": ui_is_present(),
+        "uiAgeSec": ui_age,
+        "uiGoneTimeoutSec": UI_GONE_SEC,
+        "sessionIdleLogoffMin": 30,
     }
 
 
 # ---------------------------------------------------------------------------
-# Auto refresh thread
+# Auto refresh thread — only while UI is open; logoff when page gone
 # ---------------------------------------------------------------------------
 
 
 def _auto_loop() -> None:
-    while not _stop.wait(AUTO_REFRESH_SEC):
+    """
+    - Every UI_WATCH_SEC: if connected but no UI heartbeat → disconnect (page closed)
+    - Every AUTO_REFRESH_SEC while UI present: status trunk poll
+    - If no UI: do NOT refresh (so CM/OSSI idle can apply; we also force disconnect)
+    """
+    global _last_error
+    while not _stop.is_set():
+        if _stop.wait(UI_WATCH_SEC):
+            break
         with _lock:
-            if _connected and _session is not None:
+            if not _connected or _session is None:
+                continue
+            # Page closed / no heartbeat → logoff OSSI
+            if not ui_is_present():
+                try:
+                    disconnect_unlocked()
+                    write_trunk_data([], error=None)
+                    _last_error = "UI closed or silent — OSSI logged off"
+                except Exception as exc:
+                    _last_error = str(exc)
+                continue
+            # UI open: full trunk refresh on interval
+            due = (_last_refresh_at <= 0) or (
+                (time.monotonic() - _last_refresh_at) >= AUTO_REFRESH_SEC
+            )
+            if due:
                 try:
                     refresh_unlocked()
                 except Exception as exc:
-                    global _last_error
                     _last_error = str(exc)
 
 
@@ -452,8 +504,18 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {"ok": True, **save_monitored(load_monitored())})
                 return
             if path in ("/trunk-data", "/trunk_data"):
+                with _lock:
+                    # Reading trunk data from UI counts as presence
+                    if _connected:
+                        touch_ui()
                 data = _read_json(PATHS.trunk_data, {"items": [], "connected": False})
                 self._send(200, {"ok": True, "data": data})
+                return
+            if path == "/session":
+                with _lock:
+                    if _connected:
+                        touch_ui()
+                    self._send(200, {"ok": True, **session_public()})
                 return
             self._send(404, {"ok": False, "error": "not found"})
         except Exception as exc:
@@ -461,22 +523,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path.rstrip("/") or "/"
-        # debug headers/body length for Login 502 diagnosis (no passwords logged)
-        try:
-            cl = self.headers.get("Content-Length")
-            te = self.headers.get("Transfer-Encoding")
-            sys.stderr.write(f"POST {path} Content-Length={cl} Transfer-Encoding={te}\n")
-        except Exception:
-            pass
         body = self._read_json()
         try:
             if path == "/session/connect":
-                sys.stderr.write(
-                    f"connect keys={list(body.keys())} "
-                    f"host={bool(body.get('host') or body.get('Host'))} "
-                    f"user={bool(body.get('username') or body.get('Username'))} "
-                    f"pass={bool(body.get('password') or body.get('Password'))}\n"
-                )
                 with _lock:
                     result = connect_unlocked(body)
                 self._send(200, result)
@@ -487,8 +536,15 @@ class Handler(BaseHTTPRequestHandler):
                     write_trunk_data([], error=None)
                 self._send(200, {"ok": True, "connected": False})
                 return
+            if path in ("/session/heartbeat", "/heartbeat"):
+                with _lock:
+                    touch_ui()
+                    st = session_public()
+                self._send(200, {"ok": True, **st})
+                return
             if path == "/refresh":
                 with _lock:
+                    touch_ui()
                     data = refresh_unlocked()
                 self._send(200, {"ok": True, "data": data})
                 return

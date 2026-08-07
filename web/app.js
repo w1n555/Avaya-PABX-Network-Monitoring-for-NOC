@@ -10,7 +10,9 @@ const $ = (id) => document.getElementById(id);
 const state = {
   connected: false,
   timer: null,
+  heartbeatTimer: null,
   monitored: [],
+  disconnecting: false,
 };
 
 function apiUrl(path) {
@@ -194,13 +196,16 @@ async function connect() {
     $("meta-host").textContent = res.host || body.host;
     $("meta-session").textContent = "Monitoring (OSSI)";
     $("meta-session").style.color = "var(--ok)";
-    setStatus("已登入。正在監控 monitored trunks（Auto 60s + bridge 背景刷新）。");
+    setStatus(
+      "已登入。開住呢頁先會 refresh（60s）。熄頁 / 關 tab 會斷 OSSI；無心跳約 90 秒亦會 logoff。Session idle 上限 30 分鐘。"
+    );
     await loadMonitored();
     if (res.trunkData) renderTrunkTable(res.trunkData);
     else await loadTrunkData();
     // Always enable auto monitor after successful login
     $("chk-auto").checked = true;
     scheduleAuto();
+    startHeartbeat();
   } catch (e) {
     state.connected = false;
     setError(String(e.message || e));
@@ -210,18 +215,59 @@ async function connect() {
   }
 }
 
+function stopHeartbeat() {
+  if (state.heartbeatTimer) {
+    clearInterval(state.heartbeatTimer);
+    state.heartbeatTimer = null;
+  }
+}
+
+function startHeartbeat() {
+  stopHeartbeat();
+  // Keep OSSI alive only while this page is open
+  state.heartbeatTimer = setInterval(() => {
+    if (!state.connected) return;
+    api("session/heartbeat", { method: "POST", body: "{}" }).catch(() => {});
+  }, 30_000);
+  // immediate
+  api("session/heartbeat", { method: "POST", body: "{}" }).catch(() => {});
+}
+
+/** Best-effort logoff when user closes tab/window (no background OSSI). */
+function disconnectOnPageClose() {
+  if (!state.connected || state.disconnecting) return;
+  state.disconnecting = true;
+  state.connected = false;
+  stopHeartbeat();
+  clearAuto();
+  try {
+    const url = apiUrl("session/disconnect");
+    const blob = new Blob(["{}"], { type: "application/json" });
+    if (navigator.sendBeacon) {
+      navigator.sendBeacon(url, blob);
+    } else {
+      fetch(url, { method: "POST", body: "{}", headers: { "Content-Type": "application/json" }, keepalive: true });
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
 async function disconnect() {
+  state.disconnecting = true;
+  stopHeartbeat();
   try {
     await api("session/disconnect", { method: "POST", body: "{}" });
   } catch {
     /* ignore */
   }
   state.connected = false;
+  state.disconnecting = false;
   $("btn-disconnect").disabled = true;
   $("btn-refresh-now").disabled = true;
   $("meta-session").textContent = "Disconnected";
   $("meta-session").style.color = "";
-  setStatus("Disconnected.");
+  setStatus("已 Logout — OSSI session 已斷。");
   clearAuto();
 }
 
@@ -315,6 +361,10 @@ async function init() {
     if (state.connected) scheduleAuto();
     else clearAuto();
   });
+
+  // Close tab / navigate away → disconnect OSSI (do not keep polling CM)
+  window.addEventListener("pagehide", disconnectOnPageClose);
+  window.addEventListener("beforeunload", disconnectOnPageClose);
 
   try {
     await loadMonitored();

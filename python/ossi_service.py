@@ -35,22 +35,18 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-# Ensure avaya_ossi is importable (site venv preferred; vendor path as fallback)
+# Portable site root = parent of this python/ folder (any install path)
+_SITE_ROOT = Path(__file__).resolve().parent.parent
+
+
 def _bootstrap_path() -> None:
-    here = Path(__file__).resolve().parent  # .../python
-    root = here.parent  # site root
-    candidates = [
-        root / "vendor" / "avaya-ossi" / "src",
-        Path(r"C:\Users\W1NGGG\source\AVAYA-OSSI-2026\src"),  # dev machine only
-    ]
-    for p in candidates:
-        if p.is_dir() and str(p) not in sys.path:
-            sys.path.insert(0, str(p))
-            break
+    """Prefer site venv imports; fall back to bundled vendor package only."""
+    vendored = _SITE_ROOT / "vendor" / "avaya-ossi" / "src"
+    if vendored.is_dir() and str(vendored) not in sys.path:
+        sys.path.insert(0, str(vendored))
 
 
 _bootstrap_path()
-
 
 from avaya_ossi import OssiSession, SessionConfig  # noqa: E402
 from trunk_parse import (  # noqa: E402
@@ -61,11 +57,12 @@ from trunk_parse import (  # noqa: E402
 )
 
 # ---------------------------------------------------------------------------
-# Paths / state
+# Paths / state (defaults under install root; --data-dir can override)
 # ---------------------------------------------------------------------------
 
+
 class _Paths:
-    data_dir: Path = Path(r"C:\inetpub\wwwroot\CM\data")
+    data_dir: Path = _SITE_ROOT / "data"
 
     @property
     def monitored(self) -> Path:

@@ -1,4 +1,4 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
   One-click deploy Avaya NOC dashboard to IIS C:\inetpub\wwwroot\CM
@@ -447,6 +447,6 @@ Write-Host (" Health : {0}" -f ($(if ($healthOk) { "OK" } else { "FAILED" }))) -
 Write-Host (" UI     : {0}" -f ($(if ($uiOk) { "OK" } else { "FAILED" }))) -ForegroundColor ($(if ($uiOk) { "Green" } else { "Red" }))
 Write-Host "=================================================" -ForegroundColor Yellow
 Write-Host ""
-Write-Host "Next: open $uiUrl then Connect (172.29.88.12 / monitor / password)" -ForegroundColor Cyan
+Write-Host "Next: open $uiUrl then Connect (your-CM-host / RO-user / password)" -ForegroundColor Cyan
 
 if ($healthOk -and $uiOk) { exit 0 } else { exit 2 }

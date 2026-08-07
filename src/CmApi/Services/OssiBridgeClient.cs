@@ -83,9 +83,8 @@ public sealed class OssiBridgeClient
         {
             list.Add(Path.Combine(local, "Programs", "Python", ver, "python.exe"));
             list.Add(Path.Combine(pf, ver, "python.exe"));
-            list.Add(Path.Combine(@"C:\", ver.Replace("Python", "Python"), "python.exe"));
         }
-        // C:\Python3xx common silent-install layout
+        // Common AllUsers silent-install layouts
         list.Add(@"C:\Python313\python.exe");
         list.Add(@"C:\Python312\python.exe");
         list.Add(@"C:\Python311\python.exe");

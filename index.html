@@ -7,127 +7,101 @@
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-  <header class="header">
-    <div class="header-left">
-      <h1>Avaya PABX Network Monitoring for NOC</h1>
-      <div class="header-meta">
-        <span><span class="label">CM</span> <span class="value" id="cm-host">—</span></span>
-        <span><span class="label">Status</span> <span class="value" id="conn-status">Disconnected</span></span>
-        <span><span class="label">Last success</span> <span class="value ok" id="last-success">—</span></span>
-        <span><span class="label">Last attempt</span> <span class="value" id="last-attempt">—</span></span>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-title">Avaya PABX Network Monitoring</div>
+        <div class="brand-sub">NOC · OSSI (avaya-ossi) · Read-only</div>
       </div>
+      <div class="top-meta">
+        <div class="meta-item"><span class="k">CM</span><span class="v" id="meta-host">—</span></div>
+        <div class="meta-item"><span class="k">Session</span><span class="v" id="meta-session">Disconnected</span></div>
+        <div class="meta-item"><span class="k">Last update</span><span class="v" id="meta-updated">—</span></div>
+        <div class="meta-item clock" id="live-clock">--:--:--</div>
+      </div>
+    </header>
+
+    <nav class="tabs" role="tablist" aria-label="NOC modules">
+      <button type="button" class="tab active" data-tab="trunk" role="tab" aria-selected="true">Trunk</button>
+      <button type="button" class="tab disabled" data-tab="station" disabled title="Coming soon" role="tab">Station <span class="soon">soon</span></button>
+      <button type="button" class="tab disabled" data-tab="vdn" disabled title="Coming soon" role="tab">VDN <span class="soon">soon</span></button>
+      <button type="button" class="tab disabled" data-tab="alarm" disabled title="Coming soon" role="tab">Alarm <span class="soon">soon</span></button>
+    </nav>
+
+    <section class="connect-panel">
+      <div class="connect-fields">
+        <label>Host <input id="inp-host" value="172.29.88.12" autocomplete="off" /></label>
+        <label>Port <input id="inp-port" value="5022" inputmode="numeric" /></label>
+        <label>User <input id="inp-user" value="monitor" autocomplete="username" /></label>
+        <label>Password <input id="inp-pass" type="password" autocomplete="current-password" /></label>
+        <button type="button" class="btn btn-primary" id="btn-connect">Connect (OSSI)</button>
+        <button type="button" class="btn" id="btn-disconnect" disabled>Disconnect</button>
+        <button type="button" class="btn" id="btn-refresh-now" disabled>Refresh now</button>
+        <label class="chk"><input type="checkbox" id="chk-auto" checked /> Auto 60s</label>
+      </div>
+      <div class="status-line" id="status-line" hidden></div>
       <div class="error-line" id="error-line" hidden></div>
-      <div class="busy-line" id="busy-line" hidden>⏳ Waiting for CM SAT… (each click is a live SSH command — can take 5–30s)</div>
-    </div>
-    <div class="header-right">
-      <div class="live-clock" id="live-clock">--:--:--</div>
-      <span class="badge-live" id="live-badge"><span class="dot"></span><span id="live-badge-text">Idle</span></span>
-    </div>
-  </header>
-
-  <main class="main">
-    <!-- Connect bar (credentials never stored to disk by app) -->
-    <section class="connect-bar" id="connect-bar">
-      <label>Host <input id="inp-host" value="172.29.88.12" autocomplete="off" /></label>
-      <label>Port <input id="inp-port" value="5022" style="width:4.5rem" /></label>
-      <label>User <input id="inp-user" value="monitor" autocomplete="username" /></label>
-      <label>Password <input id="inp-pass" type="password" autocomplete="current-password" /></label>
-      <button type="button" class="btn btn-primary" id="btn-connect">Connect</button>
-      <button type="button" class="btn" id="btn-disconnect" disabled>Disconnect</button>
-      <label class="chk"><input type="checkbox" id="chk-auto" checked /> Auto 30s</label>
     </section>
 
-    <!-- INDEX -->
-    <section id="view-index">
-      <div class="panel-toolbar">
-        <h2>Trunk Groups</h2>
-        <div class="panel-actions">
-          <div class="search-box">
-            <input type="search" id="trunk-filter" placeholder="Filter TG# / name / type…" />
+    <!-- TRUNK TAB -->
+    <main class="main" id="panel-trunk" data-panel="trunk">
+      <section class="admin-panel">
+        <h2>Monitored trunk groups</h2>
+        <p class="hint">Add TG numbers to poll via OSSI <code>status trunk N</code> (read-only). List is stored in <code>data/monitored_trunks.json</code>.</p>
+        <div class="admin-row">
+          <input type="number" id="inp-tg" min="1" max="9999" placeholder="Trunk group #" />
+          <button type="button" class="btn btn-primary" id="btn-add-tg">Add</button>
+        </div>
+        <ul class="chip-list" id="monitored-list"></ul>
+      </section>
+
+      <section class="data-panel">
+        <div class="panel-head">
+          <h2>Trunk status</h2>
+          <div class="legend">
+            <span class="lg green"></span>&lt;70%
+            <span class="lg yellow"></span>70–90%
+            <span class="lg red"></span>&gt;90% or Idle=0
           </div>
-          <button type="button" class="btn btn-primary" id="btn-refresh">Refresh</button>
-          <button type="button" class="btn" id="btn-export-index">Export CSV</button>
         </div>
-      </div>
-      <div class="stats" id="trunk-stats"></div>
-      <div class="table-wrap">
-        <table class="data-table" id="trunk-table">
-          <thead>
-            <tr>
-              <th data-sort="tg">TG#</th>
-              <th data-sort="name">Name</th>
-              <th data-sort="type">Type</th>
-              <th data-sort="total">Total</th>
-              <th data-sort="inUse">In-Use</th>
-              <th data-sort="usagePct">Usage%</th>
-              <th data-sort="oos">OOS</th>
-            </tr>
-          </thead>
-          <tbody id="trunk-tbody"></tbody>
-        </table>
-      </div>
-    </section>
+        <div class="table-wrap">
+          <table class="data-table" id="trunk-table">
+            <thead>
+              <tr>
+                <th>Trunk Group</th>
+                <th>Total</th>
+                <th>Idle</th>
+                <th>Busy / Active</th>
+                <th>Out-of-Service</th>
+                <th>Utilization</th>
+                <th>Status</th>
+                <th>Last Update</th>
+              </tr>
+            </thead>
+            <tbody id="trunk-tbody">
+              <tr class="empty"><td colspan="8">Connect to CM to load data.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
 
-    <!-- DETAIL -->
-    <section id="view-detail" hidden>
-      <div class="panel-toolbar">
-        <h2 id="detail-title">Trunk Detail</h2>
-        <div class="panel-actions">
-          <button type="button" class="btn" id="btn-back">← Back</button>
-          <button type="button" class="btn btn-primary" id="btn-refresh-detail">Refresh</button>
-          <button type="button" class="btn" id="btn-export-detail">Export CSV</button>
-        </div>
-      </div>
-      <div class="config-box">
-        <h3>Trunk Config (read-only)</h3>
-        <pre id="detail-config" class="config-pre">—</pre>
-      </div>
-      <div class="stats" id="detail-stats"></div>
-      <div class="table-wrap">
-        <table class="data-table" id="channel-table">
-          <thead>
-            <tr>
-              <th>Member</th>
-              <th>Port</th>
-              <th>Service State</th>
-              <th>Mtce Busy</th>
-              <th>Connected Ports</th>
-              <th>Caller</th>
-              <th>Called</th>
-              <th>Duration</th>
-              <th>Extension</th>
-            </tr>
-          </thead>
-          <tbody id="channel-tbody"></tbody>
-        </table>
-      </div>
-      <p class="hint">Caller / Called / Duration / Extension：視 CM <code>status trunk</code> 即時畫面；idle 或無欄位時顯示 —。無 CDR。</p>
-    </section>
+    <!-- PLACEHOLDER TABS -->
+    <main class="main hidden" id="panel-station" data-panel="station">
+      <div class="placeholder">Station tab — reserved for future expansion.</div>
+    </main>
+    <main class="main hidden" id="panel-vdn" data-panel="vdn">
+      <div class="placeholder">VDN tab — reserved for future expansion.</div>
+    </main>
+    <main class="main hidden" id="panel-alarm" data-panel="alarm">
+      <div class="placeholder">Alarm tab — reserved for future expansion.</div>
+    </main>
 
-    <!-- Live API / SAT I/O debug (memory only, not file log) -->
-    <section class="io-panel" id="io-panel">
-      <div class="panel-toolbar">
-        <h2>Live API / SAT I/O (debug)</h2>
-        <div class="panel-actions">
-          <label class="chk"><input type="checkbox" id="chk-io" checked /> Show</label>
-          <button type="button" class="btn" id="btn-refresh-io">Refresh I/O</button>
-          <button type="button" class="btn" id="btn-clear-io">Clear local</button>
-        </div>
-      </div>
-      <p class="hint">唔會寫 disk log。顯示最近 API 請求同後端轉去 CM 嘅 SAT command / 輸出預覽 / 耗時。</p>
-      <div class="io-cols">
-        <div>
-          <h3>Browser → API</h3>
-          <pre id="api-io-log" class="io-pre">—</pre>
-        </div>
-        <div>
-          <h3>API → CM SAT</h3>
-          <pre id="sat-io-log" class="io-pre">—</pre>
-        </div>
-      </div>
-    </section>
-  </main>
-
-  <script type="module" src="app.js"></script>
+    <footer class="footer">
+      Data via <strong>AVAYA-OSSI-2026</strong> (avaya-ossi) · No SAT screen scraping · No CDR · Local path
+      <code>C:\inetpub\wwwroot\CM</code>
+    </footer>
+  </div>
+  <script src="app.js" type="module"></script>
 </body>
 </html>

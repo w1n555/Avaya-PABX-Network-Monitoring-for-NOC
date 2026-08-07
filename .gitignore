@@ -1,19 +1,23 @@
-bin/
-obj/
-.vs/
-*.user
-*.suo
-deploy/
-publish/
-# Published ASP.NET output under IIS site (regenerate with one-click-deploy.ps1)
-/api/
-**/appsettings.*.local.json
+# Secrets / local
 .env
-.DS_Store
+.env.*
+*.local
+
+# .NET
+**/bin/
+**/obj/
+api/logs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Runtime logs / temp
+data/*.log
+data/*.tmp
 *.log
-node_modules/
 
-
-*.bak
-web.config.bak
-
+# OS
+.DS_Store
+Thumbs.db

@@ -70,28 +70,30 @@ C:\inetpub\wwwroot\CM\
 
 **目標：** 下載 → 解壓 → `install.ps1` → 開網頁 Login  
 
-### 用戶自己先裝（一次）
+### 用戶自己先裝
 
-1. **IIS**（Windows 功能）  
-2. **.NET 8 Hosting Bundle**（跑 `/api`）  
-3. **Python 3.11+**（勾 Add to PATH）
+1. **IIS**（Windows 功能）— 腳本只 detect，唔代裝  
 
-### 然後一鍵
+### 然後一鍵（Admin）
 
 ```powershell
-# 解壓 ZIP 到例如 C:\inetpub\wwwroot\CM 後，Admin PowerShell：
+# 解壓 ZIP 到例如 C:\inetpub\wwwroot\CM 後：
 cd C:\inetpub\wwwroot\CM\scripts
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
 腳本會：
 
-1. **Detect IIS**（未裝就提示，唔硬裝）  
-2. **問 LOCAL ROOT path**（預設 = 呢個 package 目錄）  
-3. **IIS site + `/api` 指去同一個 path**  
-4. 建 site venv + 裝內置 `vendor\avaya-ossi`  
-5. 註冊 bridge 開機 Task + 即刻起一次  
-6. 印出瀏覽 URL  
+1. **Detect IIS**（未裝就提示）  
+2. **檢查 / 自動裝 .NET 8 Hosting Bundle**（缺先問再裝；winget 或官網下載）  
+3. **檢查 / 自動裝 Python 3.12 + PATH**（缺先問再裝）  
+4. **問 LOCAL ROOT path**（預設 = 呢個 package 目錄）  
+5. **IIS site + `/api` 指去同一個 path**  
+6. 建 site venv + 裝內置 `vendor\avaya-ossi`  
+7. 註冊 bridge 開機 Task + 即刻起一次  
+8. 印出瀏覽 URL  
+
+可選：`-SkipDotNetInstall` / `-SkipPythonInstall`  
 
 ### 日常
 

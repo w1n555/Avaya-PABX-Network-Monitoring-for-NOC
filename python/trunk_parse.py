@@ -192,3 +192,51 @@ def status_color(idle: int, util: float) -> str:
     if util >= 70:
         return "yellow"
     return "green"
+
+
+def parse_channels(ossi_text: str) -> list[dict[str, str]]:
+    """
+    Parse `status trunk N` into channel rows.
+    Connected field is port/raw only (no station reverse-lookup).
+    """
+    rows: list[dict[str, str]] = []
+    # Example: 0001/0008 001V108 in-service/active no 002V201
+    # or tab-separated OSSI d-lines
+    pat = re.compile(
+        r"(?P<mem>\d{4}/\d{4})\s*"
+        r"(?P<port>\d{3}V\d+|\S+?)?\s+"
+        r"(?P<state>in-service/\S+|OOS/\S+|\S+)\s+"
+        r"(?P<busy>yes|no)\s*"
+        r"(?P<conn>\S.*)?$",
+        re.I,
+    )
+    for payload in _data_rows(ossi_text):
+        line = payload.strip()
+        if not re.search(r"\d{4}/\d{4}", line):
+            continue
+        # normalize tabs
+        line_n = re.sub(r"[\t]+", " ", line)
+        m = pat.search(line_n)
+        if not m:
+            m2 = re.match(
+                r"^(?P<mem>\d{4}/\d{4})(?P<port>\d{3}V\d+)?\s+(?P<state>\S+)\s+(?P<busy>yes|no)\s*(?P<conn>.*)$",
+                line_n,
+                re.I,
+            )
+            if not m2:
+                continue
+            m = m2
+        conn = (m.groupdict().get("conn") or "").strip()
+        # strip trailing noise
+        if conn.lower() in ("", "no", "yes"):
+            conn = "" if conn.lower() in ("no", "yes", "") else conn
+        rows.append(
+            {
+                "member": m.group("mem"),
+                "port": (m.group("port") or "").strip(),
+                "state": m.group("state").strip(),
+                "busy": m.group("busy").strip().lower(),
+                "connected": conn,  # port/raw only
+            }
+        )
+    return rows

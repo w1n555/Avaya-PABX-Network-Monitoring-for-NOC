@@ -25,6 +25,8 @@ public sealed class OssiBridgeClient
     private readonly string _pythonExe;
     private readonly string? _ossiSrc;
     private readonly string _logDir;
+    private readonly string _bridgeListenHost;
+    private readonly int _bridgeListenPort;
     private readonly SemaphoreSlim _startLock = new(1, 1);
 
     public OssiBridgeClient(IConfiguration config, ILogger<OssiBridgeClient> log)
@@ -61,13 +63,19 @@ public sealed class OssiBridgeClient
         else
             _pythonExe = FindPythonWithAvayaOssi();
 
+        var bridgeUri = new Uri(baseUrl.TrimEnd('/') + "/");
+        _bridgeListenHost = string.IsNullOrWhiteSpace(bridgeUri.Host) ? "127.0.0.1" : bridgeUri.Host;
+        _bridgeListenPort = bridgeUri.IsDefaultPort ? 18765 : bridgeUri.Port;
+
         _http = new HttpClient
         {
-            BaseAddress = new Uri(baseUrl.TrimEnd('/') + "/"),
+            BaseAddress = bridgeUri,
             Timeout = TimeSpan.FromMinutes(3),
         };
 
-        _log.LogInformation("OssiBridge python={Python} scriptDir={Dir}", _pythonExe, _pythonDir);
+        _log.LogInformation(
+            "OssiBridge python={Python} scriptDir={Dir} listen={Host}:{Port}",
+            _pythonExe, _pythonDir, _bridgeListenHost, _bridgeListenPort);
     }
 
     private List<string> PythonCandidates()
@@ -205,7 +213,7 @@ public sealed class OssiBridgeClient
             var errTail = ReadLogTail(Path.Combine(_logDir, "bridge.stderr.log"), 1200);
             var hint = startEx?.Message ?? "";
             throw new InvalidOperationException(
-                "OSSI bridge did not start on 127.0.0.1:18765. " +
+                $"OSSI bridge did not start on {_bridgeListenHost}:{_bridgeListenPort}. " +
                 "Login needs the bridge auto-running. " +
                 "Once as Admin run: scripts\\install-bridge-autostart.ps1 " +
                 "or ensure site venv python works. " +
@@ -262,9 +270,9 @@ public sealed class OssiBridgeClient
         };
         psi.ArgumentList.Add(script);
         psi.ArgumentList.Add("--host");
-        psi.ArgumentList.Add("127.0.0.1");
+        psi.ArgumentList.Add(_bridgeListenHost);
         psi.ArgumentList.Add("--port");
-        psi.ArgumentList.Add("18765");
+        psi.ArgumentList.Add(_bridgeListenPort.ToString());
         psi.ArgumentList.Add("--data-dir");
         psi.ArgumentList.Add(_dataDir);
 

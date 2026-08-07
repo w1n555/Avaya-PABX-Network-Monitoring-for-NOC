@@ -26,3 +26,8 @@ data/*.tmp
 # OS
 .DS_Store
 Thumbs.db
+
+data_live/
+api/*.old_*
+api_publish_tmp/
+

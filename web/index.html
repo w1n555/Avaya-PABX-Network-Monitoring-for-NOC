@@ -15,91 +15,128 @@
       </div>
       <div class="top-meta">
         <div class="meta-item"><span class="k">CM</span><span class="v" id="meta-host">—</span></div>
-        <div class="meta-item"><span class="k">Session</span><span class="v" id="meta-session">Disconnected</span></div>
+        <div class="meta-item"><span class="k">Session</span><span class="v" id="meta-session">已斷線</span></div>
         <div class="meta-item"><span class="k">Last update</span><span class="v" id="meta-updated">—</span></div>
         <div class="meta-item clock" id="live-clock">--:--:--</div>
       </div>
     </header>
 
-    <nav class="tabs" role="tablist" aria-label="NOC modules">
-      <button type="button" class="tab active" data-tab="trunk" role="tab" aria-selected="true">Trunk</button>
-      <button type="button" class="tab disabled" data-tab="station" disabled title="Coming soon" role="tab">Station <span class="soon">soon</span></button>
-      <button type="button" class="tab disabled" data-tab="vdn" disabled title="Coming soon" role="tab">VDN <span class="soon">soon</span></button>
-      <button type="button" class="tab disabled" data-tab="alarm" disabled title="Coming soon" role="tab">Alarm <span class="soon">soon</span></button>
-    </nav>
-
-    <section class="connect-panel">
+    <!-- Always visible: Login -->
+    <section class="connect-panel" id="connect-panel">
       <div class="connect-fields">
-        <label>Host <input id="inp-host" value="" placeholder="CM IP or hostname" autocomplete="off" /></label>
+        <label>Host <input id="inp-host" value="" placeholder="CM IP / hostname" autocomplete="off" /></label>
         <label>Port <input id="inp-port" value="5022" inputmode="numeric" /></label>
         <label>User <input id="inp-user" value="" placeholder="RO login e.g. monitor" autocomplete="username" /></label>
         <label>Password <input id="inp-pass" type="password" autocomplete="current-password" /></label>
         <button type="button" class="btn btn-primary" id="btn-connect">Login</button>
         <button type="button" class="btn" id="btn-disconnect" disabled>Logout</button>
-        <button type="button" class="btn" id="btn-refresh-now" disabled>Refresh now</button>
-        <label class="chk"><input type="checkbox" id="chk-auto" checked /> Auto monitor 60s</label>
       </div>
-      <p class="hint connect-hint">填 Host / Password → 撳 <strong>Login</strong>。系統會<strong>自動</strong>開 OSSI bridge、連 CM、開始監控（唔使手動開 bridge）。</p>
+      <p class="hint connect-hint" id="connect-hint">填 Host / Password → 撳 <strong>Login</strong>。系統會自動開 OSSI bridge、連 CM、開始監控。</p>
       <div class="status-line" id="status-line" hidden></div>
       <div class="error-line" id="error-line" hidden></div>
     </section>
 
-    <!-- TRUNK TAB -->
-    <main class="main" id="panel-trunk" data-panel="trunk">
-      <section class="admin-panel">
-        <h2>Monitored trunk groups</h2>
-        <p class="hint">Add TG numbers to poll via OSSI <code>status trunk N</code> (read-only). List is stored in <code>data/monitored_trunks.json</code>.</p>
-        <div class="admin-row">
-          <input type="number" id="inp-tg" min="1" max="9999" placeholder="Trunk group #" />
-          <button type="button" class="btn btn-primary" id="btn-add-tg">Add</button>
-        </div>
-        <ul class="chip-list" id="monitored-list"></ul>
-      </section>
+    <!-- Tabs under login — only meaningful after login -->
+    <nav class="tabs" id="main-tabs" role="tablist" aria-label="NOC modules" hidden>
+      <button type="button" class="tab active" data-tab="trunk" role="tab" aria-selected="true">Trunk</button>
+      <button type="button" class="tab disabled" data-tab="station" disabled title="稍後開放" role="tab">Station <span class="soon">soon</span></button>
+      <button type="button" class="tab disabled" data-tab="vdn" disabled title="稍後開放" role="tab">VDN <span class="soon">soon</span></button>
+      <button type="button" class="tab disabled" data-tab="alarm" disabled title="稍後開放" role="tab">Alarm <span class="soon">soon</span></button>
+    </nav>
 
-      <section class="data-panel">
+    <!-- TRUNK TAB: single card -->
+    <main class="main hidden" id="panel-trunk" data-panel="trunk">
+      <section class="card trunk-card" id="trunk-card">
         <div class="panel-head">
-          <h2>Trunk status</h2>
-          <div class="legend">
-            <span class="lg green"></span>&lt;70%
-            <span class="lg yellow"></span>70–90%
-            <span class="lg red"></span>&gt;90% or Idle=0
+          <div>
+            <h2>Trunk Group Status</h2>
+            <p class="hint">監控清單 · OSSI <code>status trunk N</code>（唯讀）。拖曳 ⋮⋮ 可改排序；撳 TG 列睇 channel 詳情。</p>
+          </div>
+          <div class="card-actions">
+            <label class="chk"><input type="checkbox" id="chk-auto" checked /> Auto 60s</label>
+            <button type="button" class="btn btn-primary" id="btn-refresh-now" disabled>Refresh</button>
+            <div class="legend">
+              <span class="lg green"></span>&lt;70%
+              <span class="lg yellow"></span>70–90%
+              <span class="lg red"></span>&gt;90% / Idle=0
+            </div>
           </div>
         </div>
-        <div class="table-wrap">
-          <table class="data-table" id="trunk-table">
-            <thead>
-              <tr>
-                <th>Trunk Group</th>
-                <th>Total</th>
-                <th>Idle</th>
-                <th>Busy / Active</th>
-                <th>Out-of-Service</th>
-                <th>Utilization</th>
-                <th>Status</th>
-                <th>Last Update</th>
-              </tr>
-            </thead>
-            <tbody id="trunk-tbody">
-              <tr class="empty"><td colspan="8">Connect to CM to load data.</td></tr>
-            </tbody>
-          </table>
+
+        <div class="admin-row add-row">
+          <input type="number" id="inp-tg" min="1" max="9999" placeholder="TG #" />
+          <input type="text" id="inp-tg-note" maxlength="200" placeholder="Note（可選）" />
+          <button type="button" class="btn btn-primary" id="btn-add-tg">Add</button>
+        </div>
+
+        <!-- List view -->
+        <div id="trunk-list-view">
+          <div class="table-wrap">
+            <table class="data-table" id="trunk-table">
+              <thead>
+                <tr>
+                  <th class="col-drag"></th>
+                  <th>TG</th>
+                  <th>Note</th>
+                  <th>Name / Type</th>
+                  <th>Total</th>
+                  <th>Idle</th>
+                  <th>Busy</th>
+                  <th>OOS</th>
+                  <th>Util</th>
+                  <th>Status</th>
+                  <th>Updated</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="trunk-tbody">
+                <tr class="empty"><td colspan="12">Login 後會顯示監控中嘅 Trunk Group。</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Detail view (channel rows from status trunk N) -->
+        <div id="trunk-detail-view" class="detail-view" hidden>
+          <div class="detail-head">
+            <button type="button" class="btn" id="btn-detail-back">← 返回清單</button>
+            <h3 id="detail-title">TG —</h3>
+            <span class="detail-meta" id="detail-meta"></span>
+            <button type="button" class="btn" id="btn-detail-refresh">Refresh 此 TG</button>
+          </div>
+          <p class="hint detail-hint">Connected 欄係 port／raw（唔做 station 反查）。</p>
+          <div class="table-wrap">
+            <table class="data-table detail-table" id="detail-table">
+              <thead>
+                <tr>
+                  <th>Member</th>
+                  <th>Port</th>
+                  <th>State</th>
+                  <th>Busy</th>
+                  <th>Connected <span class="th-sub">(raw)</span></th>
+                </tr>
+              </thead>
+              <tbody id="detail-tbody">
+                <tr class="empty"><td colspan="5">Loading…</td></tr>
+              </tbody>
+            </table>
+          </div>
         </div>
       </section>
     </main>
 
-    <!-- PLACEHOLDER TABS -->
     <main class="main hidden" id="panel-station" data-panel="station">
-      <div class="placeholder">Station tab — reserved for future expansion.</div>
+      <div class="placeholder">Station — 稍後開放</div>
     </main>
     <main class="main hidden" id="panel-vdn" data-panel="vdn">
-      <div class="placeholder">VDN tab — reserved for future expansion.</div>
+      <div class="placeholder">VDN — 稍後開放</div>
     </main>
     <main class="main hidden" id="panel-alarm" data-panel="alarm">
-      <div class="placeholder">Alarm tab — reserved for future expansion.</div>
+      <div class="placeholder">Alarm — 稍後開放</div>
     </main>
 
     <footer class="footer">
-      Data via <strong>avaya-ossi</strong> (bundled) · Read-only OSSI · No SAT scraping · No CDR
+      Data via <strong>avaya-ossi</strong> · Read-only OSSI · No SAT scraping · No CDR · 關頁即斷 session
     </footer>
   </div>
   <script src="app.js" type="module"></script>

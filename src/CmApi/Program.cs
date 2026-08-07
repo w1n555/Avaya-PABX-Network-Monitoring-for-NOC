@@ -181,7 +181,7 @@ app.MapPost("/monitored/add", async (TgRequest req, OssiBridgeClient bridge) =>
         return Results.BadRequest(new { ok = false, error = "tg must be >= 1" });
     try
     {
-        var el = await bridge.PostAsync("monitored/add", new { tg = req.Tg });
+        var el = await bridge.PostAsync("monitored/add", new { tg = req.Tg, note = req.Note ?? "" });
         return Results.Json(el);
     }
     catch (Exception ex)
@@ -203,16 +203,67 @@ app.MapPost("/monitored/remove", async (TgRequest req, OssiBridgeClient bridge) 
     }
 });
 
-app.MapPut("/monitored", async (MonitoredPutRequest req, OssiBridgeClient bridge) =>
+app.MapPost("/monitored/note", async (NoteRequest req, OssiBridgeClient bridge) =>
 {
+    if (req.Tg < 1)
+        return Results.BadRequest(new { ok = false, error = "tg must be >= 1" });
     try
     {
-        var el = await bridge.PutAsync("monitored", new { trunks = req.Trunks ?? new List<int>() });
+        var el = await bridge.PostAsync("monitored/note", new { tg = req.Tg, note = req.Note ?? "" });
         return Results.Json(el);
     }
     catch (Exception ex)
     {
         return Results.Json(new { ok = false, error = ex.Message }, statusCode: 502);
+    }
+});
+
+app.MapPut("/monitored", async (MonitoredPutRequest req, OssiBridgeClient bridge) =>
+{
+    try
+    {
+        object body;
+        if (req.Items is { Count: > 0 })
+        {
+            body = new
+            {
+                items = req.Items.Select(i => new { tg = i.Tg, order = i.Order, note = i.Note ?? "" }),
+                refreshStatus = req.RefreshStatus,
+            };
+        }
+        else
+        {
+            body = new
+            {
+                trunks = req.Trunks ?? new List<int>(),
+                refreshStatus = req.RefreshStatus,
+            };
+        }
+        var el = await bridge.PutAsync("monitored", body);
+        return Results.Json(el);
+    }
+    catch (Exception ex)
+    {
+        return Results.Json(new { ok = false, error = ex.Message }, statusCode: 502);
+    }
+});
+
+// Channel-level detail from live `status trunk N` (Connected = port/raw only)
+app.MapGet("/trunks/{tg:int}/detail", async (int tg, OssiBridgeClient bridge) =>
+{
+    if (tg < 1)
+        return Results.BadRequest(new { ok = false, error = "tg must be >= 1" });
+    try
+    {
+        var el = await bridge.GetAsync($"trunks/{tg}/detail");
+        return Results.Json(el);
+    }
+    catch (Exception ex)
+    {
+        var msg = ex.Message ?? "";
+        // Bridge returns 401 when OSSI session not connected
+        var code = msg.Contains("Not connected", StringComparison.OrdinalIgnoreCase) ? 401 : 502;
+        return Results.Json(new { ok = false, error = msg }, statusCode: code);
     }
 });
 

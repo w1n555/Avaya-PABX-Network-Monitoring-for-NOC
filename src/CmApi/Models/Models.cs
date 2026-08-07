@@ -22,9 +22,30 @@ public sealed class ConnectResponse
 public sealed class TgRequest
 {
     public int Tg { get; set; }
+    public string? Note { get; set; }
+}
+
+public sealed class MonitoredItemDto
+{
+    public int Tg { get; set; }
+    public int Order { get; set; }
+    public string Note { get; set; } = "";
 }
 
 public sealed class MonitoredPutRequest
 {
-    public List<int> Trunks { get; set; } = new();
+    /// <summary>Legacy: ordered TG numbers only.</summary>
+    public List<int>? Trunks { get; set; }
+
+    /// <summary>Preferred: items with order + note.</summary>
+    public List<MonitoredItemDto>? Items { get; set; }
+
+    /// <summary>When true, re-poll status trunk after saving order.</summary>
+    public bool RefreshStatus { get; set; }
+}
+
+public sealed class NoteRequest
+{
+    public int Tg { get; set; }
+    public string Note { get; set; } = "";
 }

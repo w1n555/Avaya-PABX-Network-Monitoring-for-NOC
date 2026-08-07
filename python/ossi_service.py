@@ -51,6 +51,7 @@ _bootstrap_path()
 from avaya_ossi import OssiSession, SessionConfig  # noqa: E402
 from trunk_parse import (  # noqa: E402
     parse_channel_counts,
+    parse_channels,
     parse_trunk_groups,
     status_color,
     utilization_pct,
@@ -113,31 +114,118 @@ def _write_json(path: Path, obj: Any) -> None:
     tmp.replace(path)
 
 
+def load_monitored_items() -> list[dict[str, Any]]:
+    """
+    Preferred shape:
+      { "items": [ {"tg":1,"order":0,"note":"..."}, ... ], "updatedAt": "..." }
+    Legacy:
+      { "trunks": [1,2,3] }
+    """
+    raw = _read_json(PATHS.monitored, {"items": [], "updatedAt": None})
+    items: list[dict[str, Any]] = []
+    seen: set[int] = set()
+
+    if isinstance(raw, dict) and isinstance(raw.get("items"), list) and raw["items"]:
+        for i, it in enumerate(raw["items"]):
+            if not isinstance(it, dict):
+                continue
+            try:
+                tg = int(it.get("tg") or 0)
+            except (TypeError, ValueError):
+                continue
+            if tg < 1 or tg in seen:
+                continue
+            seen.add(tg)
+            try:
+                order = int(it.get("order", i))
+            except (TypeError, ValueError):
+                order = i
+            note = str(it.get("note") or "")
+            items.append({"tg": tg, "order": order, "note": note})
+    else:
+        trunks = raw.get("trunks") if isinstance(raw, dict) else raw
+        for i, x in enumerate(trunks or []):
+            try:
+                tg = int(x)
+            except (TypeError, ValueError):
+                continue
+            if tg < 1 or tg in seen:
+                continue
+            seen.add(tg)
+            items.append({"tg": tg, "order": i, "note": ""})
+
+    items.sort(key=lambda x: (x["order"], x["tg"]))
+    for i, it in enumerate(items):
+        it["order"] = i
+    return items
+
+
 def load_monitored() -> list[int]:
-    raw = _read_json(
-        PATHS.monitored,
-        {"trunks": [], "updatedAt": None},
-    )
-    trunks = raw.get("trunks") if isinstance(raw, dict) else raw
-    out: list[int] = []
-    for x in trunks or []:
+    """TG numbers in display order (for OSSI poll)."""
+    return [it["tg"] for it in load_monitored_items()]
+
+
+def save_monitored_items(items: list[dict[str, Any]]) -> dict[str, Any]:
+    clean: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    # sort by order then reindex
+    tmp = []
+    for it in items:
         try:
-            n = int(x)
-            if n >= 1 and n not in out:
-                out.append(n)
+            tg = int(it.get("tg") or 0)
         except (TypeError, ValueError):
             continue
-    return sorted(out)
-
-
-def save_monitored(trunks: list[int]) -> dict[str, Any]:
-    clean = sorted({int(t) for t in trunks if int(t) >= 1})
-    obj = {"trunks": clean, "updatedAt": _now_iso()}
+        if tg < 1 or tg in seen:
+            continue
+        seen.add(tg)
+        try:
+            order = int(it.get("order", len(tmp)))
+        except (TypeError, ValueError):
+            order = len(tmp)
+        note = str(it.get("note") or "")[:200]
+        tmp.append({"tg": tg, "order": order, "note": note})
+    tmp.sort(key=lambda x: (x["order"], x["tg"]))
+    for i, it in enumerate(tmp):
+        clean.append({"tg": it["tg"], "order": i, "note": it["note"]})
+    obj = {
+        "items": clean,
+        "trunks": [c["tg"] for c in clean],  # legacy compat
+        "updatedAt": _now_iso(),
+    }
     _write_json(PATHS.monitored, obj)
     return obj
 
 
+def save_monitored(trunks: list[int]) -> dict[str, Any]:
+    """Legacy helper: replace list, keep notes where possible."""
+    prev = {it["tg"]: it for it in load_monitored_items()}
+    items = []
+    for i, t in enumerate(trunks):
+        try:
+            tg = int(t)
+        except (TypeError, ValueError):
+            continue
+        if tg < 1:
+            continue
+        items.append(
+            {
+                "tg": tg,
+                "order": i,
+                "note": prev.get(tg, {}).get("note", ""),
+            }
+        )
+    return save_monitored_items(items)
+
+
 def write_trunk_data(items: list[dict[str, Any]], *, error: str | None = None) -> dict[str, Any]:
+    # Attach notes/order from monitored config (local cache metadata)
+    meta = {it["tg"]: it for it in load_monitored_items()}
+    for it in items:
+        m = meta.get(it.get("tg"))
+        if m:
+            it["note"] = m.get("note", "")
+            it["order"] = m.get("order", 0)
+    items = sorted(items, key=lambda x: (x.get("order", 0), x.get("tg", 0)))
     obj = {
         "lastUpdate": _now_iso(),
         "host": _host,
@@ -154,7 +242,10 @@ def write_trunk_data(items: list[dict[str, Any]], *, error: str | None = None) -
 def ensure_seed_files() -> None:
     PATHS.data_dir.mkdir(parents=True, exist_ok=True)
     if not PATHS.monitored.is_file():
-        save_monitored([1])  # default sample TG 1 — admin can change
+        save_monitored_items([{"tg": 1, "order": 0, "note": ""}])
+    else:
+        # normalize legacy file on boot
+        save_monitored_items(load_monitored_items())
     if not PATHS.trunk_data.is_file():
         write_trunk_data([], error=None)
 
@@ -501,22 +592,52 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(200, {"ok": True, **session_public()})
                 return
             if path == "/monitored":
-                self._send(200, {"ok": True, **save_monitored(load_monitored())})
+                obj = save_monitored_items(load_monitored_items())
+                self._send(200, {"ok": True, **obj})
                 return
             if path in ("/trunk-data", "/trunk_data"):
                 with _lock:
-                    # Reading trunk data from UI counts as presence
                     if _connected:
                         touch_ui()
                 data = _read_json(PATHS.trunk_data, {"items": [], "connected": False})
                 self._send(200, {"ok": True, "data": data})
                 return
-            if path == "/session":
-                with _lock:
-                    if _connected:
+            # GET /trunks/123/detail
+            if path.startswith("/trunks/") and path.endswith("/detail"):
+                parts = path.strip("/").split("/")
+                # trunks / {tg} / detail
+                if len(parts) == 3 and parts[0] == "trunks" and parts[2] == "detail":
+                    try:
+                        tg = int(parts[1])
+                    except ValueError:
+                        self._send(400, {"ok": False, "error": "invalid tg"})
+                        return
+                    with _lock:
                         touch_ui()
-                    self._send(200, {"ok": True, **session_public()})
-                return
+                        if not _connected or _session is None:
+                            self._send(401, {"ok": False, "error": "Not connected"})
+                            return
+                        st = _session.run(f"status trunk {tg}", max_more_pages=12)
+                        channels = parse_channels(st.text) if st.ok else []
+                        counts = parse_channel_counts(st.text) if st.ok else {}
+                        meta = _tg_catalog.get(tg, {})
+                        mon = next((m for m in load_monitored_items() if m["tg"] == tg), {})
+                    self._send(
+                        200,
+                        {
+                            "ok": bool(st.ok),
+                            "tg": tg,
+                            "name": mon.get("note") and meta.get("name") or meta.get("name") or f"TG {tg}",
+                            "note": mon.get("note", ""),
+                            "type": meta.get("type") or "",
+                            "tac": meta.get("tac") or "",
+                            "counts": counts,
+                            "channels": channels,
+                            "error": None if st.ok else (st.error or "status failed"),
+                            "connectedHint": "Connected column is port/raw from status trunk (not station name).",
+                        },
+                    )
+                    return
             self._send(404, {"ok": False, "error": "not found"})
         except Exception as exc:
             self._send(500, {"ok": False, "error": str(exc)})
@@ -549,26 +670,39 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {"ok": True, "data": data})
                 return
             if path == "/monitored/add":
-                tg = int(body.get("tg") or 0)
+                tg = int(body.get("tg") or body.get("Tg") or 0)
+                note = str(body.get("note") or "")
                 if tg < 1:
                     self._send(400, {"ok": False, "error": "tg required"})
                     return
                 with _lock:
-                    cur = load_monitored()
-                    if tg not in cur:
-                        cur.append(tg)
-                    obj = save_monitored(cur)
+                    items = load_monitored_items()
+                    if not any(i["tg"] == tg for i in items):
+                        items.append({"tg": tg, "order": len(items), "note": note})
+                    obj = save_monitored_items(items)
                     if _connected:
                         refresh_unlocked()
                 self._send(200, {"ok": True, **obj})
                 return
             if path == "/monitored/remove":
-                tg = int(body.get("tg") or 0)
+                tg = int(body.get("tg") or body.get("Tg") or 0)
                 with _lock:
-                    cur = [t for t in load_monitored() if t != tg]
-                    obj = save_monitored(cur)
+                    items = [i for i in load_monitored_items() if i["tg"] != tg]
+                    obj = save_monitored_items(items)
                     if _connected:
                         refresh_unlocked()
+                self._send(200, {"ok": True, **obj})
+                return
+            if path == "/monitored/note":
+                tg = int(body.get("tg") or body.get("Tg") or 0)
+                note = str(body.get("note") or body.get("Note") or "")[:200]
+                with _lock:
+                    items = load_monitored_items()
+                    for it in items:
+                        if it["tg"] == tg:
+                            it["note"] = note
+                            break
+                    obj = save_monitored_items(items)
                 self._send(200, {"ok": True, **obj})
                 return
             self._send(404, {"ok": False, "error": "not found"})
@@ -580,17 +714,24 @@ class Handler(BaseHTTPRequestHandler):
         body = self._read_json()
         try:
             if path == "/monitored":
-                trunks = body.get("trunks") or []
                 with _lock:
-                    obj = save_monitored([int(x) for x in trunks])
-                    if _connected:
-                        refresh_unlocked()
+                    if isinstance(body.get("items"), list):
+                        obj = save_monitored_items(body["items"])
+                    else:
+                        trunks = body.get("trunks") or []
+                        obj = save_monitored([int(x) for x in trunks])
+                    if _connected and body.get("refresh", True):
+                        # optional: skip heavy refresh when only reordering
+                        if body.get("refresh") is not False:
+                            pass
+                        # only refresh status if explicitly requested
+                        if body.get("refreshStatus"):
+                            refresh_unlocked()
                 self._send(200, {"ok": True, **obj})
                 return
             self._send(404, {"ok": False, "error": "not found"})
         except Exception as exc:
             self._send(500, {"ok": False, "error": str(exc)})
-
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="OSSI bridge for CM NOC")

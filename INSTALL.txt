@@ -10,15 +10,21 @@ Your goal (supported):
        powershell -ExecutionPolicy Bypass -File .\install.ps1
 
   4. Confirm ROOT path when asked (default = package folder)
-  5. Open the URL printed (e.g. http://127.0.0.1:8888/)
+  5. Open the URL printed (typical nested install):
+       http://127.0.0.1:8888/CM/
+       API: http://127.0.0.1:8888/CM/api/health
+     (site root http://127.0.0.1:8888/ can stay YOUR other web service)
   6. Enter YOUR CM Host + Password → Login → monitoring starts
 
 What install.ps1 does:
   - Detects IIS (if missing, tells you to install IIS first — does NOT auto-install IIS)
   - Checks / installs .NET 8 Hosting Bundle if missing (winget or download)
   - Checks / installs Python 3.12 if missing (winget or python.org, with PATH)
-  - Asks LOCAL ROOT path
-  - Points IIS site + /api to that path
+  - Asks LOCAL ROOT path (e.g. ...\wwwroot\CM)
+  - Default IIS mode Nested:
+      /CM     -> that folder
+      /CM/api -> that folder\api
+    Does NOT take over port root (other apps on :8888 stay)
   - Creates Python venv + installs bundled avaya-ossi (vendor\)
   - Writes appsettings for that path
   - Registers OSSI bridge auto-start at Windows logon

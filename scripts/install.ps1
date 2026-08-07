@@ -32,6 +32,12 @@
 param(
     [string]$RootPath = "",
     [int]$SitePort = 0,
+    # Nested under existing site (default): URL like http://host:port/CM/ and /CM/api
+    # Dedicated: create a new site that owns the whole port (only if you really want that)
+    [ValidateSet("Nested", "Dedicated")]
+    [string]$IisMode = "Nested",
+    [string]$ParentSiteName = "",
+    [string]$AppAlias = "",
     [string]$SiteName = "CM-NOC",
     [string]$AppPoolName = "CmApiNoManaged",
     [switch]$SkipPublish,
@@ -447,81 +453,20 @@ function Ensure-ApiPublish([string]$root, [switch]$Force) {
     Write-Ok "Published to $out"
 }
 
-function Clear-PortBinding([int]$port, [string]$keepSite) {
-    # Remove http binding on this port from OTHER sites so CM-NOC owns the port
+function Ensure-AppPool {
     $appcmd = Get-AppCmd
-    $names = @(& $appcmd list site /text:SITE.NAME 2>$null)
-    foreach ($n in $names) {
-        if (-not $n -or $n -eq $keepSite) { continue }
-        $binds = & $appcmd list site "/site.name:$n" /text:bindings 2>$null
-        if ("$binds" -match [regex]::Escape(":${port}:")) {
-            Write-Warn "Port $port was used by site '$n' - removing that binding so $keepSite can use it"
-            try {
-                & $appcmd set site "/site.name:$n" "/-bindings.[protocol='http',bindingInformation='*:${port}:']" 2>$null | Out-Null
-            } catch {
-                try {
-                    & $appcmd set site "/site.name:$n" "/-bindings.[protocol='http',bindingInformation='http/*:${port}:']" 2>$null | Out-Null
-                } catch {
-                    Write-Warn "Could not clear binding on $n : $_"
-                }
-            }
-        }
-    }
-}
-
-function Set-IisSite([string]$root, [int]$port) {
-    $appcmd = Get-AppCmd
-    $apiPath = Join-Path $root "api"
-    if (-not (Test-Path $apiPath)) { throw "api folder missing: $apiPath" }
-
     $pools = @(& $appcmd list apppool /text:APPPOOL.NAME 2>$null)
     if ($pools -notcontains $AppPoolName) {
-        Write-Info "Creating app pool $AppPoolName"
+        Write-Info "Creating app pool $AppPoolName (No Managed Code)"
         & $appcmd add apppool /name:"$AppPoolName" /managedRuntimeVersion:"" /managedPipelineMode:Integrated | Out-Null
     } else {
         Write-Info "App pool exists: $AppPoolName"
-        & $appcmd set apppool /apppool.name:"$AppPoolName" /managedRuntimeVersion:"" | Out-Null
     }
-    # No Managed Code is required for ANCM
     & $appcmd set apppool /apppool.name:"$AppPoolName" /managedRuntimeVersion:"" | Out-Null
     & $appcmd start apppool /apppool.name:"$AppPoolName" 2>$null | Out-Null
+}
 
-    Clear-PortBinding -port $port -keepSite $SiteName
-
-    $sites = @(& $appcmd list site /text:SITE.NAME 2>$null)
-    $bindingInfo = "*:${port}:"
-    if ($sites -notcontains $SiteName) {
-        Write-Info "Creating site $SiteName on port $port -> $root"
-        & $appcmd add site /name:"$SiteName" "/bindings:http/$bindingInfo" /physicalPath:"$root" | Out-Null
-    } else {
-        Write-Info "Updating site $SiteName path + binding"
-        & $appcmd set vdir /vdir.name:"${SiteName}/" /physicalPath:"$root" | Out-Null
-    }
-
-    # Ensure binding exists (idempotent: remove then add)
-    try {
-        & $appcmd set site "/site.name:$SiteName" "/-bindings.[protocol='http',bindingInformation='$bindingInfo']" 2>$null | Out-Null
-    } catch {}
-    try {
-        & $appcmd set site "/site.name:$SiteName" "/+bindings.[protocol='http',bindingInformation='$bindingInfo']" 2>$null | Out-Null
-    } catch {
-        Write-Warn "Binding add: $_"
-    }
-
-    & $appcmd set app /app.name:"${SiteName}/" /applicationPool:"$AppPoolName" | Out-Null
-    & $appcmd set vdir /vdir.name:"${SiteName}/" /physicalPath:"$root" | Out-Null
-
-    $apps = @(& $appcmd list app /text:APP.NAME 2>$null)
-    $apiApp = "${SiteName}/api"
-    if ($apps -notcontains $apiApp) {
-        Write-Info "Creating application /api -> $apiPath"
-        & $appcmd add app /site.name:"$SiteName" /path:/api /physicalPath:"$apiPath" /applicationPool:"$AppPoolName" | Out-Null
-    } else {
-        Write-Info "Updating /api path"
-        & $appcmd set app /app.name:"$apiApp" /applicationPool:"$AppPoolName" | Out-Null
-        & $appcmd set vdir /vdir.name:"${SiteName}/api/" /physicalPath:"$apiPath" | Out-Null
-    }
-
+function Write-ApiWebConfig([string]$apiPath) {
     $wc = Join-Path $apiPath "web.config"
     $webConfig = @"
 <?xml version="1.0" encoding="utf-8"?>
@@ -537,19 +482,168 @@ function Set-IisSite([string]$root, [int]$port) {
 </configuration>
 "@
     Set-Content -Path $wc -Value $webConfig -Encoding UTF8
+}
 
-    & $appcmd start site /site.name:"$SiteName" 2>$null | Out-Null
+function Find-SiteOnPort([int]$port) {
+    $appcmd = Get-AppCmd
+    foreach ($n in @(& $appcmd list site /text:SITE.NAME 2>$null)) {
+        if (-not $n) { continue }
+        $binds = & $appcmd list site "/site.name:$n" /text:bindings 2>$null
+        if ("$binds" -match [regex]::Escape(":${port}:")) { return $n }
+    }
+    return $null
+}
+
+function Find-SiteByPhysicalPath([string]$path) {
+    $appcmd = Get-AppCmd
+    $norm = $path.TrimEnd('\')
+    foreach ($line in @(& $appcmd list vdir 2>$null)) {
+        # VDIR "Default Web Site/" (physicalPath:C:\inetpub\wwwroot)
+        if ($line -match 'VDIR\s+"([^"]+)"\s+\(physicalPath:([^)]+)\)') {
+            $vdir = $Matches[1]
+            $pp = $Matches[2].TrimEnd('\')
+            if ($pp -ieq $norm -and $vdir -match '^([^/]+)/$') {
+                return $Matches[1]
+            }
+        }
+    }
+    return $null
+}
+
+function Remove-DedicatedCmNocSiteIfConflicting([int]$port) {
+    # Older install.ps1 created a dedicated "CM-NOC" site on the same port as other apps — remove it
+    $appcmd = Get-AppCmd
+    $sites = @(& $appcmd list site /text:SITE.NAME 2>$null)
+    if ($sites -notcontains "CM-NOC") { return }
+    $binds = & $appcmd list site "/site.name:CM-NOC" /text:bindings 2>$null
+    if ("$binds" -match [regex]::Escape(":${port}:")) {
+        Write-Warn "Removing old dedicated site 'CM-NOC' on port $port (it conflicts with your main web service)"
+        try {
+            & $appcmd delete site /site.name:"CM-NOC" 2>$null | Out-Null
+        } catch {
+            Write-Warn "Could not delete CM-NOC site: $_"
+        }
+    }
+}
+
+function Set-IisNested([string]$root, [int]$port, [string]$alias) {
+    # Nested: do NOT take over the whole port.
+    # Parent site (e.g. on :8888 -> C:\inetpub\wwwroot) keeps root service.
+    # Adds:
+    #   /CM     -> <root>
+    #   /CM/api -> <root>\api
+    $appcmd = Get-AppCmd
+    $apiPath = Join-Path $root "api"
+    if (-not (Test-Path $apiPath)) { throw "api folder missing: $apiPath" }
+    if (-not $alias) { $alias = Split-Path $root -Leaf }  # e.g. CM
+    if ($alias.StartsWith("/")) { $alias = $alias.TrimStart("/") }
+
+    Ensure-AppPool
+    Remove-DedicatedCmNocSiteIfConflicting -port $port
+
+    $parent = $ParentSiteName
+    if (-not $parent) {
+        $parent = Find-SiteOnPort -port $port
+    }
+    if (-not $parent) {
+        $parentPath = Split-Path $root -Parent
+        $parent = Find-SiteByPhysicalPath -path $parentPath
+    }
+    if (-not $parent) {
+        throw @"
+Could not find an existing IIS site on port $port (or parent folder).
+Your main web service should already listen on that port.
+Fix: open IIS Manager, note the Site name that uses port $port, then re-run:
+  .\install.ps1 -ParentSiteName `"ThatSiteName`" -SitePort $port
+Or use dedicated mode only if you want a separate port:
+  .\install.ps1 -IisMode Dedicated -SitePort 8890
+"@
+    }
+
+    Write-Info "Using parent IIS site: $parent (port $port)"
+    Write-Info "Will mount /$alias and /$alias/api  (does not replace site root)"
+
+    $apps = @(& $appcmd list app /text:APP.NAME 2>$null)
+    $uiApp = "${parent}/$alias"
+    $apiApp = "${parent}/$alias/api"
+
+    if ($apps -notcontains $uiApp) {
+        Write-Info "Creating application /$alias -> $root"
+        & $appcmd add app /site.name:"$parent" /path:"/$alias" /physicalPath:"$root" /applicationPool:"$AppPoolName" | Out-Null
+    } else {
+        Write-Info "Updating application /$alias path"
+        & $appcmd set app /app.name:"$uiApp" /applicationPool:"$AppPoolName" | Out-Null
+        & $appcmd set vdir /vdir.name:"${uiApp}/" /physicalPath:"$root" | Out-Null
+    }
+
+    if ($apps -notcontains $apiApp) {
+        Write-Info "Creating application /$alias/api -> $apiPath"
+        & $appcmd add app /site.name:"$parent" /path:"/$alias/api" /physicalPath:"$apiPath" /applicationPool:"$AppPoolName" | Out-Null
+    } else {
+        Write-Info "Updating application /$alias/api path"
+        & $appcmd set app /app.name:"$apiApp" /applicationPool:"$AppPoolName" | Out-Null
+        & $appcmd set vdir /vdir.name:"${apiApp}/" /physicalPath:"$apiPath" | Out-Null
+    }
+
+    Write-ApiWebConfig -apiPath $apiPath
+    & $appcmd start site /site.name:"$parent" 2>$null | Out-Null
     & $appcmd start apppool /apppool.name:"$AppPoolName" 2>$null | Out-Null
 
-    # Verify physical paths
-    $sitePath = & $appcmd list vdir "/vdir.name:${SiteName}/" /text:physicalPath 2>$null
-    $apiVdir = & $appcmd list vdir "/vdir.name:${SiteName}/api/" /text:physicalPath 2>$null
-    Write-Info "Verified site path: $sitePath"
-    Write-Info "Verified /api path: $apiVdir"
-    if ("$sitePath" -and ("$sitePath".TrimEnd('\') -ne $root.TrimEnd('\'))) {
-        Write-Warn "Site path mismatch! Expected $root"
+    $uiPath = & $appcmd list vdir "/vdir.name:${uiApp}/" /text:physicalPath 2>$null
+    $apiV = & $appcmd list vdir "/vdir.name:${apiApp}/" /text:physicalPath 2>$null
+    Write-Info "Verified /$alias path: $uiPath"
+    Write-Info "Verified /$alias/api path: $apiV"
+    Write-Ok "IIS nested apps on site '$parent': /$alias + /$alias/api (root site on :$port untouched)"
+    return "/$alias"
+}
+
+function Set-IisDedicated([string]$root, [int]$port) {
+    # Only when user explicitly wants a whole-port site
+    $appcmd = Get-AppCmd
+    $apiPath = Join-Path $root "api"
+    if (-not (Test-Path $apiPath)) { throw "api folder missing: $apiPath" }
+
+    Ensure-AppPool
+
+    $other = Find-SiteOnPort -port $port
+    if ($other -and $other -ne $SiteName) {
+        throw "Port $port is already used by site '$other'. Pick another -SitePort or use -IisMode Nested."
     }
-    Write-Ok "IIS site $SiteName -> $root  (port $port), /api -> $apiPath"
+
+    $sites = @(& $appcmd list site /text:SITE.NAME 2>$null)
+    $bindingInfo = "*:${port}:"
+    if ($sites -notcontains $SiteName) {
+        Write-Info "Creating dedicated site $SiteName on port $port -> $root"
+        & $appcmd add site /name:"$SiteName" "/bindings:http/$bindingInfo" /physicalPath:"$root" | Out-Null
+    } else {
+        & $appcmd set vdir /vdir.name:"${SiteName}/" /physicalPath:"$root" | Out-Null
+    }
+    try {
+        & $appcmd set site "/site.name:$SiteName" "/+bindings.[protocol='http',bindingInformation='$bindingInfo']" 2>$null | Out-Null
+    } catch {}
+
+    & $appcmd set app /app.name:"${SiteName}/" /applicationPool:"$AppPoolName" | Out-Null
+    $apps = @(& $appcmd list app /text:APP.NAME 2>$null)
+    $apiApp = "${SiteName}/api"
+    if ($apps -notcontains $apiApp) {
+        & $appcmd add app /site.name:"$SiteName" /path:/api /physicalPath:"$apiPath" /applicationPool:"$AppPoolName" | Out-Null
+    } else {
+        & $appcmd set vdir /vdir.name:"${apiApp}/" /physicalPath:"$apiPath" | Out-Null
+        & $appcmd set app /app.name:"$apiApp" /applicationPool:"$AppPoolName" | Out-Null
+    }
+    Write-ApiWebConfig -apiPath $apiPath
+    & $appcmd start site /site.name:"$SiteName" 2>$null | Out-Null
+    Write-Ok "Dedicated IIS site $SiteName -> $root (port $port), /api -> $apiPath"
+    return ""
+}
+
+function Set-IisSite([string]$root, [int]$port) {
+    if ($IisMode -eq "Dedicated") {
+        return Set-IisDedicated -root $root -port $port
+    }
+    $alias = $AppAlias
+    if (-not $alias) { $alias = Split-Path $root -Leaf }
+    return Set-IisNested -root $root -port $port -alias $alias
 }
 
 function Set-Acls([string]$root) {
@@ -859,20 +953,25 @@ try {
     # Always Force publish on re-run so one command upgrades C# too
     Ensure-ApiPublish -root $root -Force
     Set-JsonAppSettings -root $root -pythonExe $venvPy
-    Set-IisSite -root $root -port $port
+    $urlPrefix = Set-IisSite -root $root -port $port
+    if ($null -eq $urlPrefix) { $urlPrefix = "" }
     Set-Acls -root $root
     Install-BridgeTask -root $root -venvPy $venvPy
     Start-BridgeNow -root $root -venvPy $venvPy -ForceRestart
     Restart-AppPool
 
     Start-Sleep -Seconds 2
-    $url = "http://127.0.0.1:${port}/"
-    $apiHealth = "http://127.0.0.1:${port}/api/health"
+    # Nested default: http://127.0.0.1:8888/CM/  and  .../CM/api/health
+    $baseUrl = "http://127.0.0.1:${port}$urlPrefix"
+    if (-not $baseUrl.EndsWith("/")) { $baseUrl += "/" }
+    $apiHealth = "http://127.0.0.1:${port}$urlPrefix/api/health".Replace("//api", "/api")
+    # Fix accidental double slash
+    $apiHealth = $apiHealth -replace '(?<!:)/{2,}', '/'
     try {
         $h = Invoke-WebRequest $apiHealth -UseBasicParsing -TimeoutSec 15
         Write-Ok "API health: $($h.Content)"
     } catch {
-        Write-Warn "API not answering yet (recycle app pool if needed): $_"
+        Write-Warn "API not answering yet at $apiHealth : $_"
     }
 
     Write-Host ""
@@ -884,15 +983,19 @@ try {
     }
     Write-Host "============================================================" -ForegroundColor Green
     Write-Host ""
-    Write-Host "  1. Open browser:  $url"
+    Write-Host "  Dashboard:  $baseUrl"
+    Write-Host "  API:        ${baseUrl}api/health"
+    Write-Host "  (Your other site on http://127.0.0.1:${port}/ is left alone)"
+    Write-Host ""
+    Write-Host "  1. Open Dashboard URL above"
     Write-Host "  2. Enter your CM Host + Password"
     Write-Host "  3. Click Login  ->  monitoring starts"
     Write-Host ""
-    Write-Host "  Root:  $root"
-    Write-Host "  Site:  $SiteName  port $port"
+    Write-Host "  Root folder:  $root"
+    Write-Host "  IIS mode:     $IisMode  (Nested = /CM under existing site)"
     Write-Host "  Bridge auto-starts at Windows logon (task CM-NOC-OSSI-Bridge)"
     Write-Host ""
-    Write-Host "Later: run the SAME command again to upgrade (auto git pull if clone)."
+    Write-Host "Later upgrade: same command"
     Write-Host "  powershell -ExecutionPolicy Bypass -File .\install.ps1"
     Write-Host ""
 }

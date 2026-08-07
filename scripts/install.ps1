@@ -447,6 +447,28 @@ function Ensure-ApiPublish([string]$root, [switch]$Force) {
     Write-Ok "Published to $out"
 }
 
+function Clear-PortBinding([int]$port, [string]$keepSite) {
+    # Remove http binding on this port from OTHER sites so CM-NOC owns the port
+    $appcmd = Get-AppCmd
+    $names = @(& $appcmd list site /text:SITE.NAME 2>$null)
+    foreach ($n in $names) {
+        if (-not $n -or $n -eq $keepSite) { continue }
+        $binds = & $appcmd list site "/site.name:$n" /text:bindings 2>$null
+        if ("$binds" -match [regex]::Escape(":${port}:")) {
+            Write-Warn "Port $port was used by site '$n' - removing that binding so $keepSite can use it"
+            try {
+                & $appcmd set site "/site.name:$n" "/-bindings.[protocol='http',bindingInformation='*:${port}:']" 2>$null | Out-Null
+            } catch {
+                try {
+                    & $appcmd set site "/site.name:$n" "/-bindings.[protocol='http',bindingInformation='http/*:${port}:']" 2>$null | Out-Null
+                } catch {
+                    Write-Warn "Could not clear binding on $n : $_"
+                }
+            }
+        }
+    }
+}
+
 function Set-IisSite([string]$root, [int]$port) {
     $appcmd = Get-AppCmd
     $apiPath = Join-Path $root "api"
@@ -460,26 +482,34 @@ function Set-IisSite([string]$root, [int]$port) {
         Write-Info "App pool exists: $AppPoolName"
         & $appcmd set apppool /apppool.name:"$AppPoolName" /managedRuntimeVersion:"" | Out-Null
     }
+    # No Managed Code is required for ANCM
+    & $appcmd set apppool /apppool.name:"$AppPoolName" /managedRuntimeVersion:"" | Out-Null
     & $appcmd start apppool /apppool.name:"$AppPoolName" 2>$null | Out-Null
 
+    Clear-PortBinding -port $port -keepSite $SiteName
+
     $sites = @(& $appcmd list site /text:SITE.NAME 2>$null)
-    $binding = "http/*:${port}:"
+    $bindingInfo = "*:${port}:"
     if ($sites -notcontains $SiteName) {
         Write-Info "Creating site $SiteName on port $port -> $root"
-        & $appcmd add site /name:"$SiteName" /bindings:"$binding" /physicalPath:"$root" | Out-Null
+        & $appcmd add site /name:"$SiteName" "/bindings:http/$bindingInfo" /physicalPath:"$root" | Out-Null
     } else {
         Write-Info "Updating site $SiteName path + binding"
         & $appcmd set vdir /vdir.name:"${SiteName}/" /physicalPath:"$root" | Out-Null
-        $cur = & $appcmd list site /site.name:"$SiteName" /text:bindings 2>$null
-        if ("$cur" -notmatch ":${port}:") {
-            try {
-                & $appcmd set site /site.name:"$SiteName" "/+bindings.[protocol='http',bindingInformation='*:${port}:']" | Out-Null
-            } catch {
-                Write-Warn "Binding may already exist: $_"
-            }
-        }
     }
+
+    # Ensure binding exists (idempotent: remove then add)
+    try {
+        & $appcmd set site "/site.name:$SiteName" "/-bindings.[protocol='http',bindingInformation='$bindingInfo']" 2>$null | Out-Null
+    } catch {}
+    try {
+        & $appcmd set site "/site.name:$SiteName" "/+bindings.[protocol='http',bindingInformation='$bindingInfo']" 2>$null | Out-Null
+    } catch {
+        Write-Warn "Binding add: $_"
+    }
+
     & $appcmd set app /app.name:"${SiteName}/" /applicationPool:"$AppPoolName" | Out-Null
+    & $appcmd set vdir /vdir.name:"${SiteName}/" /physicalPath:"$root" | Out-Null
 
     $apps = @(& $appcmd list app /text:APP.NAME 2>$null)
     $apiApp = "${SiteName}/api"
@@ -493,8 +523,7 @@ function Set-IisSite([string]$root, [int]$port) {
     }
 
     $wc = Join-Path $apiPath "web.config"
-    if (-not (Test-Path $wc)) {
-        $webConfig = @"
+    $webConfig = @"
 <?xml version="1.0" encoding="utf-8"?>
 <configuration>
   <location path="." inheritInChildApplications="false">
@@ -507,10 +536,19 @@ function Set-IisSite([string]$root, [int]$port) {
   </location>
 </configuration>
 "@
-        Set-Content -Path $wc -Value $webConfig -Encoding UTF8
-    }
+    Set-Content -Path $wc -Value $webConfig -Encoding UTF8
 
     & $appcmd start site /site.name:"$SiteName" 2>$null | Out-Null
+    & $appcmd start apppool /apppool.name:"$AppPoolName" 2>$null | Out-Null
+
+    # Verify physical paths
+    $sitePath = & $appcmd list vdir "/vdir.name:${SiteName}/" /text:physicalPath 2>$null
+    $apiVdir = & $appcmd list vdir "/vdir.name:${SiteName}/api/" /text:physicalPath 2>$null
+    Write-Info "Verified site path: $sitePath"
+    Write-Info "Verified /api path: $apiVdir"
+    if ("$sitePath" -and ("$sitePath".TrimEnd('\') -ne $root.TrimEnd('\'))) {
+        Write-Warn "Site path mismatch! Expected $root"
+    }
     Write-Ok "IIS site $SiteName -> $root  (port $port), /api -> $apiPath"
 }
 

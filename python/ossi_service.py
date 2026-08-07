@@ -35,10 +35,22 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-# Ensure avaya_ossi is importable (editable install or sibling path)
-_REPO_OSSI = Path(r"C:\Users\W1NGGG\source\AVAYA-OSSI-2026\src")
-if _REPO_OSSI.is_dir() and str(_REPO_OSSI) not in sys.path:
-    sys.path.insert(0, str(_REPO_OSSI))
+# Ensure avaya_ossi is importable (site venv preferred; vendor path as fallback)
+def _bootstrap_path() -> None:
+    here = Path(__file__).resolve().parent  # .../python
+    root = here.parent  # site root
+    candidates = [
+        root / "vendor" / "avaya-ossi" / "src",
+        Path(r"C:\Users\W1NGGG\source\AVAYA-OSSI-2026\src"),  # dev machine only
+    ]
+    for p in candidates:
+        if p.is_dir() and str(p) not in sys.path:
+            sys.path.insert(0, str(p))
+            break
+
+
+_bootstrap_path()
+
 
 from avaya_ossi import OssiSession, SessionConfig  # noqa: E402
 from trunk_parse import (  # noqa: E402

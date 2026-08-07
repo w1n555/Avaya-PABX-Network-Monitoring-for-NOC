@@ -31,13 +31,26 @@ public sealed class OssiBridgeClient
     {
         _log = log;
         var baseUrl = config["OssiBridge:BaseUrl"] ?? DefaultBase;
-        var siteRoot = config["OssiBridge:SiteRoot"]
-                       ?? Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, ".."));
-        _dataDir = config["OssiBridge:DataDir"]
-                   ?? Path.Combine(siteRoot, "data");
+        // Prefer config from install.ps1; else derive from api\ publish folder → parent site root
+        var siteRoot = config["OssiBridge:SiteRoot"];
+        if (string.IsNullOrWhiteSpace(siteRoot))
+            siteRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, ".."));
+        siteRoot = siteRoot.Trim();
+
+        _dataDir = string.IsNullOrWhiteSpace(config["OssiBridge:DataDir"])
+            ? Path.Combine(siteRoot, "data")
+            : config["OssiBridge:DataDir"]!.Trim();
         _pythonDir = Path.Combine(siteRoot, "python");
-        _ossiSrc = config["OssiBridge:OssiSrc"]
-                   ?? @"C:\Users\W1NGGG\source\AVAYA-OSSI-2026\src";
+
+        var ossiSrcCfg = config["OssiBridge:OssiSrc"];
+        if (!string.IsNullOrWhiteSpace(ossiSrcCfg) && Directory.Exists(ossiSrcCfg))
+            _ossiSrc = ossiSrcCfg.Trim();
+        else
+        {
+            var vendored = Path.Combine(siteRoot, "vendor", "avaya-ossi", "src");
+            _ossiSrc = Directory.Exists(vendored) ? vendored : null;
+        }
+
         _logDir = Path.Combine(_dataDir, "logs");
         Directory.CreateDirectory(_dataDir);
         Directory.CreateDirectory(_logDir);

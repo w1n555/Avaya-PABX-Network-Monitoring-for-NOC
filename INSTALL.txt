@@ -1,0 +1,33 @@
+Avaya NOC — easy install (ZIP → IIS → Login)
+============================================
+
+Your goal (supported):
+  1. Install IIS yourself (+ .NET 8 Hosting Bundle recommended)
+  2. Install Python 3.11+ (optional check: python --version)
+  3. Extract this package to a folder (example: C:\inetpub\wwwroot\CM)
+  4. Run ONE script as Administrator:
+
+       powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
+
+  5. When asked, confirm ROOT path (default = this package folder)
+  6. Open the URL printed (e.g. http://127.0.0.1:8888/)
+  7. Enter CM Host + Password → Login → monitoring starts
+
+What install.ps1 does:
+  - Detects IIS (if missing, tells you to install IIS first)
+  - Asks LOCAL ROOT path
+  - Points IIS site + /api to that path
+  - Creates Python venv + installs bundled avaya-ossi (vendor\)
+  - Writes appsettings for that path
+  - Registers OSSI bridge auto-start at Windows logon
+  - Starts bridge once
+
+You do NOT need a separate OSSI repo clone.
+You do NOT need to start the bridge manually every day.
+
+Requirements (user installs once):
+  - Windows IIS
+  - .NET 8 Hosting Bundle (for /api)
+  - Python 3.11+ on PATH (for OSSI bridge)
+
+Admin rights required only for install.ps1.

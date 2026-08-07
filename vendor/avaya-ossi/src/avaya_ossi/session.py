@@ -1,0 +1,470 @@
+"""Long-lived read-only OSSI session.
+
+Session policy
+--------------
+- Keep one SSH + ossit session open across commands.
+- Do **not** login on every command.
+- Each action refreshes an idle timer (default 30 minutes).
+- After idle timeout → logoff and drop (frees CM login slot).
+- On transport / OSSI error → reconnect and retry once.
+"""
+
+from __future__ import annotations
+
+import re
+import threading
+import time
+from dataclasses import dataclass
+
+import paramiko
+from paramiko.channel import Channel
+
+from avaya_ossi.config import SessionConfig
+from avaya_ossi.io import (
+    channel_alive,
+    looks_like_prompt,
+    ossi_has_error,
+    recv_for,
+    send_line,
+    strip_ansi,
+)
+from avaya_ossi.safety import assert_readonly_command
+
+
+@dataclass(slots=True)
+class CommandResult:
+    """Outcome of one :meth:`OssiSession.run` call."""
+
+    command: str
+    raw: str
+    elapsed_seconds: float
+    used_existing_session: bool
+    did_login: bool
+    retried_after_error: bool
+    more_pages: int
+    error: str | None = None
+    truncated_pages: bool = False
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None and not ossi_has_error(self.raw)
+
+    @property
+    def text(self) -> str:
+        """ANSI-stripped raw OSSI exchange."""
+        return strip_ansi(self.raw)
+
+
+class OssiSession:
+    """
+    Thread-safe long-lived OSSI session.
+
+    - Reuse SSH+ossit across commands (no login each time).
+    - Idle timer (default 30 min) refreshed on each action → auto logoff.
+    - On error → reconnect + retry once.
+    """
+
+    def __init__(self, cfg: SessionConfig) -> None:
+        self.cfg = cfg
+        self._lock = threading.RLock()
+        self._client: paramiko.SSHClient | None = None
+        self._chan: Channel | None = None
+        self._last_activity = 0.0
+        self._connected_at = 0.0
+        self._login_count = 0
+        self._command_count = 0
+        self._stop = threading.Event()
+        self._watchdog = threading.Thread(
+            target=self._idle_watchdog,
+            name="ossi-idle-watchdog",
+            daemon=True,
+        )
+        self._watchdog.start()
+
+    @property
+    def is_connected(self) -> bool:
+        with self._lock:
+            return channel_alive(self._client, self._chan)
+
+    @property
+    def seconds_since_activity(self) -> float | None:
+        with self._lock:
+            if not channel_alive(self._client, self._chan) or self._last_activity <= 0:
+                return None
+            return time.monotonic() - self._last_activity
+
+    @property
+    def seconds_until_idle_logoff(self) -> float | None:
+        with self._lock:
+            if not channel_alive(self._client, self._chan) or self._last_activity <= 0:
+                return None
+            left = self.cfg.idle_logoff_seconds - (time.monotonic() - self._last_activity)
+            return max(0.0, left)
+
+    def status(self) -> dict[str, object]:
+        with self._lock:
+            idle_left: float | None = None
+            since: float | None = None
+            alive = channel_alive(self._client, self._chan)
+            if alive and self._last_activity > 0:
+                since = time.monotonic() - self._last_activity
+                idle_left = max(
+                    0.0, self.cfg.idle_logoff_seconds - since
+                )
+            return {
+                "connected": alive,
+                "host": f"{self.cfg.host}:{self.cfg.port}",
+                "username": self.cfg.username,
+                "idle_logoff_seconds": self.cfg.idle_logoff_seconds,
+                "seconds_since_activity": since,
+                "seconds_until_idle_logoff": idle_left,
+                "login_count": self._login_count,
+                "command_count": self._command_count,
+            }
+
+    def close(self) -> None:
+        self._stop.set()
+        with self._lock:
+            self._logoff_and_drop_unlocked(reason="close")
+        if self._watchdog.is_alive():
+            self._watchdog.join(timeout=2.0)
+
+    def __enter__(self) -> OssiSession:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def run(
+        self,
+        command: str,
+        *,
+        retry_on_error: bool = True,
+        max_more_pages: int | None = None,
+    ) -> CommandResult:
+        """
+        Run one RO OSSI command.
+
+        max_more_pages: override cfg cap for this call (e.g. sample first pages
+        of a huge list station). When cap hit, sends ``n`` to stop more?[y].
+        """
+        cmd = assert_readonly_command(command)
+        with self._lock:
+            return self._run_unlocked(
+                cmd,
+                retry_on_error=retry_on_error,
+                max_more_pages=max_more_pages,
+            )
+
+    def touch(self) -> None:
+        with self._lock:
+            if channel_alive(self._client, self._chan):
+                self._last_activity = time.monotonic()
+
+    def force_logoff(self) -> None:
+        with self._lock:
+            self._logoff_and_drop_unlocked(reason="force_logoff")
+
+    def _touch_unlocked(self) -> None:
+        self._last_activity = time.monotonic()
+
+    def _idle_watchdog(self) -> None:
+        while not self._stop.wait(self.cfg.idle_check_interval):
+            with self._lock:
+                if not channel_alive(self._client, self._chan):
+                    continue
+                idle = time.monotonic() - self._last_activity
+                if idle >= self.cfg.idle_logoff_seconds:
+                    self._logoff_and_drop_unlocked(
+                        reason=f"idle>{self.cfg.idle_logoff_seconds:.0f}s"
+                    )
+
+    def _ensure_session_unlocked(self) -> tuple[bool, bool]:
+        if channel_alive(self._client, self._chan):
+            idle = time.monotonic() - self._last_activity
+            if idle >= self.cfg.idle_logoff_seconds:
+                self._logoff_and_drop_unlocked(reason="idle_on_ensure")
+            else:
+                return True, False
+        self._connect_unlocked()
+        return False, True
+
+    def _connect_unlocked(self) -> None:
+        self._drop_unlocked()
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        cfg = self.cfg
+
+        def _auth_handler(
+            title: str, instructions: str, prompt_list: list[tuple[str, bool]]
+        ) -> list[str]:
+            del title, instructions
+            return [cfg.password for _ in prompt_list]
+
+        try:
+            try:
+                client.connect(
+                    hostname=cfg.host,
+                    port=cfg.port,
+                    username=cfg.username,
+                    password=cfg.password,
+                    look_for_keys=False,
+                    allow_agent=False,
+                    timeout=cfg.connect_timeout,
+                    banner_timeout=cfg.banner_timeout,
+                    auth_timeout=cfg.connect_timeout,
+                )
+            except paramiko.AuthenticationException:
+                transport = paramiko.Transport((cfg.host, cfg.port))
+                transport.banner_timeout = cfg.banner_timeout
+                transport.start_client(timeout=cfg.connect_timeout)
+                transport.auth_interactive(cfg.username, _auth_handler)
+                client._transport = transport  # noqa: SLF001
+
+            chan = client.invoke_shell(term="vt100", width=160, height=50)
+        except Exception:
+            try:
+                client.close()
+            except Exception:
+                pass
+            raise
+
+        time.sleep(0.5)
+        banner = recv_for(chan, timeout=8.0, idle=0.8)
+        self._enter_ossi_unlocked(chan, banner)
+        self._client = client
+        self._chan = chan
+        self._login_count += 1
+        self._connected_at = time.monotonic()
+        self._touch_unlocked()
+
+    def _enter_ossi_unlocked(self, chan: Channel, login_banner: str) -> None:
+        cfg = self.cfg
+        log_parts: list[str] = [login_banner] if login_banner else []
+        buf = recv_for(chan, timeout=2.0, idle=0.5)
+        if buf:
+            log_parts.append(buf)
+        combined = "\n".join(log_parts)
+
+        if looks_like_prompt(combined, "Pin", "PIN", "Access Code", "access code") and cfg.pin:
+            send_line(chan, cfg.pin)
+            time.sleep(0.3)
+            buf = recv_for(chan, timeout=6.0, idle=0.7)
+            log_parts.append(buf)
+            combined = "\n".join(log_parts)
+
+        if not looks_like_prompt(combined, "Terminal Type", "terminal type", "[513]"):
+            send_line(chan, "sat")
+            time.sleep(0.4)
+            buf = recv_for(chan, timeout=8.0, idle=0.8)
+            log_parts.append(buf)
+
+        terms = [cfg.ossi_term]
+        terms.append("ossi" if cfg.ossi_term == "ossit" else "ossit")
+
+        entered = False
+        for term in terms:
+            send_line(chan, term)
+            time.sleep(0.5)
+            buf = recv_for(chan, timeout=10.0, idle=1.0)
+            log_parts.append(buf)
+            visible = strip_ansi(buf)
+            if looks_like_prompt(visible, "INVALID TERMINAL"):
+                continue
+            if re.search(r"(?m)^t\s*$", visible) or (
+                not looks_like_prompt(visible, "Terminal Type") and visible.strip()
+            ):
+                entered = True
+                break
+
+        if not entered:
+            raise RuntimeError(
+                "Could not enter OSSI terminal.\n" + strip_ansi("\n".join(log_parts))
+            )
+
+    def _run_command_unlocked(
+        self, command: str, *, max_more_pages: int
+    ) -> tuple[str, int, bool]:
+        chan = self._chan
+        if chan is None:
+            raise RuntimeError("No channel")
+
+        _ = recv_for(chan, timeout=0.5, idle=0.3)
+        send_line(chan, f"c{command}")
+        time.sleep(0.15)
+        send_line(chan, "t")
+
+        chunks: list[str] = []
+        deadline = time.monotonic() + self.cfg.read_timeout
+        idle = 1.2
+        last = time.monotonic()
+        more_pages = 0
+        answered_upto = 0
+        truncated = False
+        chan.settimeout(0.35)
+
+        while time.monotonic() < deadline:
+            if chan.recv_ready():
+                try:
+                    data = chan.recv(65535).decode("utf-8", errors="replace")
+                except Exception as exc:
+                    raise RuntimeError(f"recv failed: {exc}") from exc
+                if data:
+                    chunks.append(data)
+                    last = time.monotonic()
+                    joined = strip_ansi("".join(chunks))
+                    prompts = list(re.finditer(r"more\?\s*\[y\]", joined, re.I))
+                    while len(prompts) > answered_upto:
+                        if more_pages >= max_more_pages:
+                            # stop pagination to protect Main CM / huge inventories
+                            send_line(chan, "n")
+                            answered_upto = len(prompts)
+                            truncated = True
+                            time.sleep(0.3)
+                            last = time.monotonic()
+                            break
+                        send_line(chan, "y")
+                        answered_upto += 1
+                        more_pages += 1
+                        time.sleep(0.25)
+                        last = time.monotonic()
+                    if re.search(r"(?m)^t\s*$", joined) and not re.search(
+                        r"more\?\s*\[y\]\s*$", joined, re.I
+                    ):
+                        time.sleep(0.25)
+                        if not chan.recv_ready():
+                            break
+            elif chunks and (time.monotonic() - last) >= idle:
+                break
+            else:
+                time.sleep(0.05)
+
+        raw = "".join(chunks)
+        if not raw.strip():
+            raise RuntimeError("Empty OSSI response (session may be dead)")
+        return raw, more_pages, truncated
+
+    def _run_unlocked(
+        self,
+        command: str,
+        *,
+        retry_on_error: bool,
+        max_more_pages: int | None,
+    ) -> CommandResult:
+        used_existing = False
+        did_login = False
+        retried = False
+        t0 = time.perf_counter()
+        page_cap = (
+            max_more_pages if max_more_pages is not None else self.cfg.max_more_pages
+        )
+
+        try:
+            used_existing, did_login = self._ensure_session_unlocked()
+            raw, more, trunc = self._run_command_unlocked(
+                command, max_more_pages=page_cap
+            )
+            if retry_on_error and ossi_has_error(raw) and not trunc:
+                retried = True
+                self._logoff_and_drop_unlocked(reason="ossi_error_retry")
+                _, did_login = self._ensure_session_unlocked()
+                did_login = True
+                raw, more, trunc = self._run_command_unlocked(
+                    command, max_more_pages=page_cap
+                )
+            self._touch_unlocked()
+            self._command_count += 1
+            err = None
+            if ossi_has_error(raw):
+                err = "OSSI returned e-line error"
+            return CommandResult(
+                command=command,
+                raw=raw,
+                elapsed_seconds=time.perf_counter() - t0,
+                used_existing_session=used_existing and not retried,
+                did_login=did_login,
+                retried_after_error=retried,
+                more_pages=more,
+                error=err,
+                truncated_pages=trunc,
+            )
+        except Exception as exc:
+            if not retry_on_error:
+                return CommandResult(
+                    command=command,
+                    raw="",
+                    elapsed_seconds=time.perf_counter() - t0,
+                    used_existing_session=used_existing,
+                    did_login=did_login,
+                    retried_after_error=False,
+                    more_pages=0,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            retried = True
+            try:
+                self._logoff_and_drop_unlocked(reason="exception_retry")
+                _, did_login = self._ensure_session_unlocked()
+                did_login = True
+                raw, more, trunc = self._run_command_unlocked(
+                    command, max_more_pages=page_cap
+                )
+                self._touch_unlocked()
+                self._command_count += 1
+                err = "OSSI returned e-line error" if ossi_has_error(raw) else None
+                return CommandResult(
+                    command=command,
+                    raw=raw,
+                    elapsed_seconds=time.perf_counter() - t0,
+                    used_existing_session=False,
+                    did_login=True,
+                    retried_after_error=True,
+                    more_pages=more,
+                    error=err,
+                    truncated_pages=trunc,
+                )
+            except Exception as exc2:
+                self._drop_unlocked()
+                return CommandResult(
+                    command=command,
+                    raw="",
+                    elapsed_seconds=time.perf_counter() - t0,
+                    used_existing_session=False,
+                    did_login=did_login,
+                    retried_after_error=True,
+                    more_pages=0,
+                    error=f"{type(exc2).__name__}: {exc2} (after retry; first={exc})",
+                )
+
+    def _logoff_and_drop_unlocked(self, *, reason: str) -> None:
+        chan = self._chan
+        if chan is not None and not chan.closed:
+            try:
+                send_line(chan, "clogoff")
+                time.sleep(0.2)
+                send_line(chan, "t")
+                time.sleep(0.3)
+                buf = recv_for(chan, timeout=3.0, idle=0.5)
+                if looks_like_prompt(buf, "Logoff", "logoff", "Proceed"):
+                    send_line(chan, "y")
+                    _ = recv_for(chan, timeout=2.0, idle=0.4)
+            except Exception:
+                pass
+        self._drop_unlocked()
+        _ = reason
+
+    def _drop_unlocked(self) -> None:
+        if self._chan is not None:
+            try:
+                self._chan.close()
+            except Exception:
+                pass
+            self._chan = None
+        if self._client is not None:
+            try:
+                tr = self._client.get_transport()
+                if tr is not None:
+                    tr.close()
+                self._client.close()
+            except Exception:
+                pass
+            self._client = None

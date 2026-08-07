@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "avaya-ossi"
+version = "0.1.0"
+description = "Standalone read-only Avaya Communication Manager OSSI client (long-lived session)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary — internal/private use unless otherwise licensed" }
+keywords = ["avaya", "cm", "ossi", "sat", "pbx", "read-only"]
+dependencies = [
+  "paramiko>=3.4.0",
+  "python-dotenv>=1.0.0",
+]
+
+[project.urls]
+Documentation = "README.md"
+
+[project.scripts]
+avaya-ossi = "avaya_ossi.cli:main"
+avaya-ossi-oneshot = "avaya_ossi.oneshot:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+avaya_ossi = ["py.typed"]

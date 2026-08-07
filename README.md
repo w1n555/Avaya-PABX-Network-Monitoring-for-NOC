@@ -66,37 +66,38 @@ C:\inetpub\wwwroot\CM\
 
 ---
 
-## Deploy (IIS)
+## Deploy（最易食：一鍵）
 
-1. Install **.NET 8 Hosting Bundle**, IIS site pointing at `C:\inetpub\wwwroot\CM` (e.g. port 8888).
-2. Application **`/CM/api`** → physical path `C:\inetpub\wwwroot\CM\api`, app pool **No Managed Code**.
-3. Install OSSI package:
+**目標：** 下載 → 解壓 → `install.ps1` → 開網頁 Login  
+
+### 用戶自己先裝（一次）
+
+1. **IIS**（Windows 功能）  
+2. **.NET 8 Hosting Bundle**（跑 `/api`）  
+3. **Python 3.11+**（勾 Add to PATH）
+
+### 然後一鍵
 
 ```powershell
-pip install -e C:\Users\W1NGGG\source\AVAYA-OSSI-2026
+# 解壓 ZIP 到例如 C:\inetpub\wwwroot\CM 後，Admin PowerShell：
+cd C:\inetpub\wwwroot\CM\scripts
+powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-4. Publish API:
+腳本會：
 
-```powershell
-cd C:\inetpub\wwwroot\CM\src\CmApi
-dotnet publish -c Release -o C:\inetpub\wwwroot\CM\api
-```
+1. **Detect IIS**（未裝就提示，唔硬裝）  
+2. **問 LOCAL ROOT path**（預設 = 呢個 package 目錄）  
+3. **IIS site + `/api` 指去同一個 path**  
+4. 建 site venv + 裝內置 `vendor\avaya-ossi`  
+5. 註冊 bridge 開機 Task + 即刻起一次  
+6. 印出瀏覽 URL  
 
-5. **一次過（建議，Admin）** 安裝開機自動 bridge：
-```powershell
-powershell -ExecutionPolicy Bypass -File C:\inetpub\wwwroot\CM\scripts\install-bridge-autostart.ps1
-```
-之後開網頁 **只需要** 填 Host / Password → **Login** → 自動開始 monitor。
+### 日常
 
-6. 日常：`http://127.0.0.1:8888/CM/` → Login
+開網頁 → 填 **CM Host / Password** → **Login** → 自動 monitor  
 
-**自動開 bridge 嘅方式（由上到下）：**
-1. 登入 Windows 時 Scheduled Task `CM-NOC-OSSI-Bridge`（最穩）
-2. IIS API 啟動 / Login 時 `EnsureBridgeRunning` 試 `Process.Start` 網站 venv  
-3. 若 IIS 無權開 process，會試 `schtasks /Run` 同一 Task  
-
-唔使每次手動跑 bridge。
+唔使每次手動開 bridge。詳見 `INSTALL.txt`。
 
 Or run `scripts\one-click-deploy.ps1` as Administrator (updated for OSSI).
 

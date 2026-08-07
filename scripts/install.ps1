@@ -353,6 +353,16 @@ function Find-DotNet {
 }
 
 function Set-JsonAppSettings([string]$root, [string]$pythonExe) {
+    # Guard: PowerShell may pass Object[] if earlier function leaked stdout
+    if ($pythonExe -is [Array]) {
+        $pythonExe = ($pythonExe | Where-Object { $_ -and "$_" -match 'python\.exe$' } | Select-Object -Last 1)
+    }
+    $pythonExe = "$pythonExe".Trim()
+    if (-not $pythonExe -or -not (Test-Path $pythonExe)) {
+        $fallback = Join-Path $root "python\.venv\Scripts\python.exe"
+        if (Test-Path $fallback) { $pythonExe = $fallback }
+        else { throw "Invalid Python path for appsettings: '$pythonExe'" }
+    }
     $payload = @{
         Logging = @{
             LogLevel = @{
@@ -421,10 +431,13 @@ function Ensure-PythonVenv([string]$root, [string]$basePython) {
         Write-Info "Refreshing avaya-ossi in site venv..."
         & $venvPy -m pip install -e $vendor -q
     }
-    & $venvPy -c "import avaya_ossi; print(avaya_ossi.__version__)"
+    # IMPORTANT: capture/discard output — in PowerShell, uncaptured stdout becomes function return value
+    $null = & $venvPy -c "import avaya_ossi; print(avaya_ossi.__version__)" 2>&1
     if ($LASTEXITCODE -ne 0) { throw "avaya_ossi import failed in site venv" }
+    if (-not (Test-Path $venvPy)) { throw "venv python missing: $venvPy" }
     Write-Ok "Python OSSI ready: $venvPy"
-    return $venvPy
+    # Return only the path string (never mixed with pip/version output)
+    return ,$venvPy
 }
 
 function Ensure-ApiPublish([string]$root, [switch]$Force) {

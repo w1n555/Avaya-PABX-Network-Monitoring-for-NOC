@@ -101,19 +101,17 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 唔使每次手動開 bridge。詳見 `INSTALL.txt`。
 
-### 舊機已有舊版，一鍵升級
-
-同一 path 再跑 `install.ps1`（Admin）：
+### 新裝 / 舊機升級 — 同一句（自動 detect）
 
 ```powershell
 cd C:\inetpub\wwwroot\CM\scripts
-powershell -ExecutionPolicy Bypass -File .\install.ps1 -Update
+powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-會：`git pull`（若係 git clone）+ 保留 `data\monitored_trunks.json` + 重 publish API + 重配 IIS + 重啟 bridge。  
-
-純 ZIP 無 `.git`：先解壓覆蓋（保留 `data\`）再跑 `install.ps1`。
-
+- 有 `.git` → **自動 `git pull`**  
+- 已有 `api` / venv / data → 當 **upgrade**（重 publish、重配 IIS、重啟 bridge）  
+- **保留** `data\monitored_trunks.json`  
+- **唔使** 加 `-Update`
 Or run `scripts\one-click-deploy.ps1` as Administrator (updated for OSSI).
 
 ---

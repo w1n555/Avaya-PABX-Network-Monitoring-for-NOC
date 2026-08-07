@@ -34,27 +34,24 @@ Requirements:
 Optional flags:
   -SkipDotNetInstall   do not auto-install Hosting Bundle
   -SkipPythonInstall   do not auto-install Python
-  -Update              force git pull + full upgrade
-  -SkipUpdate          never git pull
+  -SkipUpdate          do not git pull (freeze code on disk)
   -NonInteractive -RootPath "C:\path" -SitePort 8888
 
 ------------------------------------------------------------
-Already running OLD version on this machine? (one-click upgrade)
+ONE command for new install AND upgrade (auto-detect)
 ------------------------------------------------------------
-Same script, same root path:
+Always the same:
 
   cd C:\inetpub\wwwroot\CM\scripts
-  powershell -ExecutionPolicy Bypass -File .\install.ps1 -Update
+  powershell -ExecutionPolicy Bypass -File .\install.ps1
 
-What happens:
-  - git pull latest (if folder is a git clone)
+Script detects:
+  - git clone?  -> auto git pull from GitHub
+  - existing api/venv/data?  -> full upgrade path
   - keeps data\monitored_trunks.json
-  - refreshes python venv + vendor avaya-ossi
-  - republishes api\
-  - rewires IIS to the same path
-  - restarts bridge + recycles app pool
+  - republish api, rewire IIS, restart bridge
 
-If you only used ZIP (no .git folder):
-  1) Download new ZIP and overwrite files (keep data\ folder)
-  2) Run install.ps1 again
-Or clone with git once for future one-click pulls.
+No need for -Update flag.
+
+ZIP-only (no .git): re-run install.ps1 after replacing files,
+or convert to git clone once for auto pull next time.

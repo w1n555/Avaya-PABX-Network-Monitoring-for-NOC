@@ -14,17 +14,16 @@
     8) Re-publish API, recycle pool, restart bridge
     9) Prints browser URL
 
-  On a machine that already has the OLD repo running:
-    re-run this same script on the SAME root path = upgrade in one click
-    (git pull + reconfig IIS + refresh venv + republish + restart bridge)
-    data\monitored_trunks.json is kept.
+  ONE command for both first install AND upgrade (auto-detect):
+    powershell -ExecutionPolicy Bypass -File .\install.ps1
+
+  If folder is a git clone -> auto git pull + republish + restart services.
+  If already configured -> safe re-run (idempotent upgrade).
+  data\monitored_trunks.json is kept.
 
 .EXAMPLE
   cd C:\inetpub\wwwroot\CM\scripts
   powershell -ExecutionPolicy Bypass -File .\install.ps1
-
-  # Old install - one-click upgrade:
-  .\install.ps1 -RootPath "C:\inetpub\wwwroot\CM" -Update -NonInteractive
 
   .\install.ps1 -RootPath "C:\inetpub\wwwroot\CM" -SitePort 8888 -NonInteractive
 #>
@@ -38,7 +37,6 @@ param(
     [switch]$SkipPublish,
     [switch]$SkipDotNetInstall,
     [switch]$SkipPythonInstall,
-    [switch]$Update,
     [switch]$SkipUpdate,
     [switch]$NonInteractive
 )
@@ -591,44 +589,43 @@ function Test-GitRepo([string]$root) {
     return (Test-Path (Join-Path $root ".git"))
 }
 
+function Test-ExistingInstall([string]$root) {
+    # Heuristics: already deployed before
+    if (Test-Path (Join-Path $root "api\CmApi.dll")) { return $true }
+    if (Test-Path (Join-Path $root "python\.venv\Scripts\python.exe")) { return $true }
+    if (Test-Path (Join-Path $root "data\monitored_trunks.json")) { return $true }
+    if (Test-GitRepo $root) { return $true }
+    return $false
+}
+
 function Update-CodeFromGit([string]$root) {
+    # Default: AUTO upgrade when possible. One command for new + old machines.
+    # -SkipUpdate only if user wants to freeze code on disk.
     if ($SkipUpdate) {
         Write-Info "SkipUpdate set - leaving files as-is on disk"
         return $false
     }
 
     $isGit = Test-GitRepo $root
-    $doUpdate = $false
-    if ($Update) {
-        $doUpdate = $true
-    } elseif ($isGit) {
-        if ($NonInteractive) {
-            $doUpdate = $true
-        } else {
-            $ans = Read-Host "This folder looks like an existing install (git). Pull latest from GitHub + upgrade? [Y/n]"
-            if ($ans -notmatch '^[nN]') { $doUpdate = $true }
-        }
-    }
-
-    if (-not $doUpdate) {
-        Write-Info "Using existing files on disk (no git pull)"
-        return $false
-    }
+    $existing = Test-ExistingInstall $root
 
     if (-not $isGit) {
-        Write-Warn "Not a git clone - cannot auto-pull code."
-        Write-Warn "For one-click upgrades later, use git clone once, or overwrite folder from ZIP then re-run install.ps1"
-        Write-Host "  git clone https://github.com/w1n555/Avaya-PABX-Network-Monitoring-for-NOC.git `"$root`""
-        return $false
+        if ($existing) {
+            Write-Info "Existing install detected (no .git) - will reconfigure IIS/venv/API using files already on disk."
+            Write-Info "To auto-pull code next time, use a git clone once."
+        } else {
+            Write-Info "Fresh install (no git) - using files on disk."
+        }
+        return $existing  # still force republish/restart path for existing
     }
 
     $git = Get-Command git -ErrorAction SilentlyContinue
     if (-not $git) {
-        Write-Warn "git not found - skip pull. Install Git for Windows for one-click upgrades."
-        return $false
+        Write-Warn "git not found - skip pull. Install Git for Windows for auto code update."
+        return $existing
     }
 
-    Write-Info "Updating code from GitHub (git fetch + pull)..."
+    Write-Info "Git repo detected - auto-updating code from GitHub (git fetch + pull)..."
     # Preserve local monitoring list
     $dataDir = Join-Path $root "data"
     $backup = Join-Path $env:TEMP ("cm-noc-data-backup-" + [guid]::NewGuid().ToString("N"))
@@ -715,8 +712,9 @@ try {
     $root = Read-UserPath -defaultPath $defaultRoot
     $port = Read-Port -defaultPort 8888
 
-    # One-click upgrade path for machines that already have an old copy
-    $didUpdate = Update-CodeFromGit -root $root
+    # Auto-detect: git pull if clone; existing install => full refresh
+    $isUpgrade = Update-CodeFromGit -root $root
+    if (-not $isUpgrade) { $isUpgrade = Test-ExistingInstall $root }
 
     $need = @("index.html", "app.js", "python\ossi_service.py")
     foreach ($rel in $need) {
@@ -737,21 +735,13 @@ try {
     Write-Ok "Python: $basePy"
     $venvPy = Ensure-PythonVenv -root $root -basePython $basePy
 
-    # Always republish on update so new C# code is live (DLL unlock via stopped pool)
-    if ($didUpdate) {
-        Ensure-ApiPublish -root $root -Force
-    } else {
-        Ensure-ApiPublish -root $root
-    }
+    # Always Force publish on re-run so one command upgrades C# too
+    Ensure-ApiPublish -root $root -Force
     Set-JsonAppSettings -root $root -pythonExe $venvPy
     Set-IisSite -root $root -port $port
     Set-Acls -root $root
     Install-BridgeTask -root $root -venvPy $venvPy
-    if ($didUpdate) {
-        Start-BridgeNow -root $root -venvPy $venvPy -ForceRestart
-    } else {
-        Start-BridgeNow -root $root -venvPy $venvPy
-    }
+    Start-BridgeNow -root $root -venvPy $venvPy -ForceRestart
     Restart-AppPool
 
     Start-Sleep -Seconds 2
@@ -766,10 +756,10 @@ try {
 
     Write-Host ""
     Write-Host "============================================================" -ForegroundColor Green
-    if ($didUpdate) {
-        Write-Host "  DONE - UPGRADED existing install (code + IIS + bridge)" -ForegroundColor Green
+    if ($isUpgrade) {
+        Write-Host "  DONE - install/upgrade complete (auto-detected existing setup)" -ForegroundColor Green
     } else {
-        Write-Host "  DONE - install / reconfigure complete" -ForegroundColor Green
+        Write-Host "  DONE - fresh install complete" -ForegroundColor Green
     }
     Write-Host "============================================================" -ForegroundColor Green
     Write-Host ""
@@ -781,8 +771,8 @@ try {
     Write-Host "  Site:  $SiteName  port $port"
     Write-Host "  Bridge auto-starts at Windows logon (task CM-NOC-OSSI-Bridge)"
     Write-Host ""
-    Write-Host "Next time you want latest GitHub code on this machine:"
-    Write-Host "  powershell -ExecutionPolicy Bypass -File .\install.ps1 -RootPath `"$root`" -Update"
+    Write-Host "Later: run the SAME command again to upgrade (auto git pull if clone)."
+    Write-Host "  powershell -ExecutionPolicy Bypass -File .\install.ps1"
     Write-Host ""
 }
 catch {

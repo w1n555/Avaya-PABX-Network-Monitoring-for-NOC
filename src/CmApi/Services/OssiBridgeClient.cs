@@ -254,6 +254,39 @@ public sealed class OssiBridgeClient
         if (!File.Exists(script))
             throw new InvalidOperationException("ossi_service.py not found at " + script);
 
+        var siteRoot = Path.GetFullPath(Path.Combine(_pythonDir, ".."));
+        var bat = Path.Combine(siteRoot, "scripts", "start-ossi-bridge.bat");
+
+        // Prefer durable bat starter (sets PYTHONPATH, start /B — survives IIS worker quirks)
+        if (File.Exists(bat))
+        {
+            try
+            {
+                // bat args: port  dataSubdir(relative to site) — we pass absolute data via env override not supported;
+                // map data_live vs data from _dataDir name
+                var dataLeaf = Path.GetFileName(_dataDir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+                if (string.IsNullOrEmpty(dataLeaf)) dataLeaf = "data";
+                var psiBat = new ProcessStartInfo
+                {
+                    FileName = bat,
+                    Arguments = $"{_bridgeListenPort} {dataLeaf}",
+                    WorkingDirectory = Path.GetDirectoryName(bat)!,
+                    UseShellExecute = true,
+                    WindowStyle = ProcessWindowStyle.Hidden,
+                    CreateNoWindow = true,
+                };
+                Process.Start(psiBat);
+                _log.LogInformation(
+                    "Started OSSI bridge via bat port={Port} data={Data}",
+                    _bridgeListenPort, dataLeaf);
+                return;
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Bat start failed; falling back to direct python");
+            }
+        }
+
         var stdoutLog = Path.Combine(_logDir, "bridge.stdout.log");
         var stderrLog = Path.Combine(_logDir, "bridge.stderr.log");
 
@@ -265,7 +298,6 @@ public sealed class OssiBridgeClient
             CreateNoWindow = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
-            // Don't keep parent wait handles that IIS might care about
             RedirectStandardInput = false,
         };
         psi.ArgumentList.Add(script);
@@ -287,7 +319,6 @@ public sealed class OssiBridgeClient
             if (p == null)
                 throw new InvalidOperationException("Process.Start returned null for " + _pythonExe);
 
-            // Drain pipes to log files so the process never blocks on full buffers
             _ = Task.Run(() => PumpStream(p.StandardOutput, stdoutLog));
             _ = Task.Run(() => PumpStream(p.StandardError, stderrLog));
 

@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Avaya PABX Network Monitoring for NOC</title>
+  <link rel="icon" href="data:," />
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -139,6 +140,30 @@
       Data via <strong>avaya-ossi</strong> · Read-only OSSI · No SAT scraping · No CDR · 關頁即斷 session
     </footer>
   </div>
+
+  <!-- Login / OSSI progress modal -->
+  <div class="modal-backdrop" id="login-modal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="login-modal-title">
+      <div class="modal-head">
+        <h3 id="login-modal-title">OSSI Login 進度</h3>
+        <span class="modal-spinner" id="login-modal-spinner" aria-hidden="true"></span>
+      </div>
+      <p class="modal-sub" id="login-modal-sub">連線中，請稍候…</p>
+      <ol class="progress-steps" id="login-progress-steps">
+        <li data-step="1">檢查 / 啟動 OSSI bridge（本機 Python）</li>
+        <li data-step="2">SSH 連去 CM（port 5022）</li>
+        <li data-step="3">OSSI session login（RO account）</li>
+        <li data-step="4">讀 monitored TG 清單</li>
+        <li data-step="5">OSSI <code>status trunk N</code> 拉 trunk 狀態</li>
+        <li data-step="6">完成 — 開始監察</li>
+      </ol>
+      <p class="modal-detail mono" id="login-modal-detail"></p>
+      <div class="modal-actions">
+        <button type="button" class="btn" id="btn-login-modal-close" hidden>關閉</button>
+      </div>
+    </div>
+  </div>
+
   <script src="app.js" type="module"></script>
 </body>
 </html>

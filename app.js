@@ -369,6 +369,80 @@ async function loadMonitored() {
   renderTrunkTable();
 }
 
+/** Soft load — page must not hang if bridge is down (502). */
+async function loadMonitoredSoft() {
+  try {
+    await loadMonitored();
+  } catch (e) {
+    console.warn("monitored unavailable:", e.message || e);
+  }
+}
+
+/* ---------- Login progress modal (OSSI steps) ---------- */
+function showLoginModal() {
+  const m = $("login-modal");
+  if (!m) return;
+  m.hidden = false;
+  $("btn-login-modal-close").hidden = true;
+  $("login-modal-spinner").className = "modal-spinner";
+  $("login-modal-title").textContent = "OSSI Login 進度";
+  $("login-modal-sub").textContent = "連線中，請稍候…";
+  $("login-modal-detail").textContent = "";
+  m.querySelectorAll(".progress-steps li").forEach((li) => {
+    li.classList.remove("active", "done", "fail");
+  });
+}
+
+function hideLoginModal(delayMs = 0) {
+  const m = $("login-modal");
+  if (!m) return;
+  const go = () => {
+    m.hidden = true;
+  };
+  if (delayMs > 0) setTimeout(go, delayMs);
+  else go();
+}
+
+/**
+ * @param {number} step 1..6
+ * @param {"active"|"done"|"fail"} kind
+ * @param {string} [detail]
+ */
+function setLoginStep(step, kind, detail) {
+  const list = $("login-progress-steps");
+  if (!list) return;
+  list.querySelectorAll("li").forEach((li) => {
+    const n = Number(li.dataset.step);
+    if (n < step) {
+      li.classList.remove("active", "fail");
+      li.classList.add("done");
+    } else if (n === step) {
+      li.classList.remove("done", "active", "fail");
+      li.classList.add(kind === "fail" ? "fail" : kind === "done" ? "done" : "active");
+    } else {
+      li.classList.remove("active", "done", "fail");
+    }
+  });
+  if (detail != null) $("login-modal-detail").textContent = detail;
+  if (kind === "fail") {
+    $("login-modal-spinner").className = "modal-spinner fail";
+    $("login-modal-sub").textContent = "Login 失敗";
+    $("btn-login-modal-close").hidden = false;
+  } else if (kind === "done" && step >= 6) {
+    $("login-modal-spinner").className = "modal-spinner done";
+    $("login-modal-sub").textContent = "已連線 · Monitoring";
+  } else {
+    $("login-modal-sub").textContent = "連線中，請稍候…";
+  }
+}
+
+function failLoginModal(msg) {
+  // mark current active as fail, or last step
+  const active = $("login-progress-steps")?.querySelector("li.active");
+  const step = active ? Number(active.dataset.step) : 2;
+  setLoginStep(step, "fail", msg || "Login failed");
+}
+
 async function openDetail(tg) {
   if (!state.connected) {
     setError("請先 Login 先睇 channel 詳情。");
@@ -436,9 +510,10 @@ function closeDetail() {
 
 async function connect() {
   setError("");
-  setStatus("Login… 自動啟動 OSSI bridge → 連 CM → 開始 monitor…");
+  setStatus("Login…");
   setSessionLabel("Connecting…", false);
   $("btn-connect").disabled = true;
+  showLoginModal();
   try {
     const body = {
       host: $("inp-host").value.trim(),
@@ -449,31 +524,81 @@ async function connect() {
     if (!body.host || !body.username || !body.password) {
       throw new Error("請填 Host、User、Password");
     }
+
+    // 1) Bridge warm-up / auto-start
+    setLoginStep(1, "active", "health?ensure=1 — 檢查本機 OSSI bridge…");
+    try {
+      const h = await api("health?ensure=1");
+      if (h && h.bridgeHealthy) {
+        setLoginStep(1, "done", "OSSI bridge 就緒");
+      } else {
+        setLoginStep(
+          1,
+          "active",
+          "Bridge 未 healthy，Login 時會再試自動啟動… " + (h.bridgeError || "")
+        );
+      }
+    } catch (e) {
+      setLoginStep(1, "active", "API health 未就緒，繼續試 connect… " + (e.message || ""));
+    }
+
+    // 2–3) SSH + OSSI login (single server call)
+    setLoginStep(2, "active", `SSH → ${body.host}:${body.port} …`);
+    setLoginStep(3, "active", `OSSI login as ${body.username}（read-only）…`);
     const res = await api("session/connect", { method: "POST", body: JSON.stringify(body) });
+    setLoginStep(2, "done");
+    setLoginStep(3, "done", "OSSI session 已開");
+
     state.connected = true;
     state.disconnecting = false;
     $("meta-host").textContent = res.host || body.host;
     setSessionLabel("Monitoring (OSSI)", true);
-    setStatus("已登入。開住呢頁先會 refresh（60s）。熄頁 / 關 tab 會斷 OSSI。");
     applyUiMode();
+
+    // 4) monitored list
+    setLoginStep(4, "active", "讀 monitored TG 清單…");
     await loadMonitored();
+    setLoginStep(
+      4,
+      "done",
+      state.monitored.length
+        ? `監控 ${state.monitored.length} 個 TG：${state.monitored.map((x) => x.tg).join(", ")}`
+        : "清單空白 — 可之後 Add TG"
+    );
+
+    // 5) trunk status (already polled on connect if server returned trunkData)
+    setLoginStep(5, "active", "OSSI status trunk N — 拉取 trunk 狀態…");
     if (res.trunkData) {
       const td = res.trunkData;
-      state.trunkItems = (td.items || td.Items || []) ;
+      state.trunkItems = td.items || td.Items || [];
       renderTrunkMeta(td);
       renderTrunkTable();
     } else {
       await loadTrunkData();
     }
+    setLoginStep(
+      5,
+      "done",
+      state.trunkItems.length
+        ? `已更新 ${state.trunkItems.length} 組 trunk 狀態`
+        : "暫無 live 狀態（可撳 Refresh）"
+    );
+
+    // 6) done
+    setLoginStep(6, "done", "Heartbeat 30s · Auto refresh 60s · 關頁會斷 OSSI");
+    setStatus("已登入。開住呢頁先會 refresh（60s）。熄頁 / 關 tab 會斷 OSSI。");
     $("chk-auto").checked = true;
     scheduleAuto();
     startHeartbeat();
+    hideLoginModal(900);
   } catch (e) {
     state.connected = false;
-    setError(String(e.message || e));
+    const msg = String(e.message || e);
+    setError(msg);
     setSessionLabel("已斷線", false);
     setStatus("");
     applyUiMode();
+    failLoginModal(msg);
   } finally {
     $("btn-connect").disabled = false;
   }
@@ -627,6 +752,10 @@ async function init() {
   $("btn-connect").addEventListener("click", connect);
   $("btn-disconnect").addEventListener("click", disconnect);
   $("btn-refresh-now").addEventListener("click", refreshNow);
+  const modalClose = $("btn-login-modal-close");
+  if (modalClose) {
+    modalClose.addEventListener("click", () => hideLoginModal());
+  }
   $("btn-add-tg").addEventListener("click", addTg);
   $("btn-detail-back").addEventListener("click", closeDetail);
   $("btn-detail-refresh").addEventListener("click", () => {
@@ -648,30 +777,38 @@ async function init() {
 
   applyUiMode();
 
+  // Soft init: bridge down must not freeze the page (502 on /monitored)
   try {
-    await loadMonitored();
-    await loadTrunkData();
-    const st = await api("session/status");
-    if (st.connected) {
-      state.connected = true;
-      $("meta-host").textContent = st.host || "—";
-      setSessionLabel("Connected (OSSI)", true);
-      applyUiMode();
-      scheduleAuto();
-      startHeartbeat();
+    await loadMonitoredSoft();
+    try {
+      await loadTrunkData();
+    } catch {
+      /* cache miss OK */
+    }
+    try {
+      const st = await api("session/status");
+      if (st.connected) {
+        state.connected = true;
+        $("meta-host").textContent = st.host || "—";
+        setSessionLabel("Connected (OSSI)", true);
+        applyUiMode();
+        scheduleAuto();
+        startHeartbeat();
+      }
+    } catch {
+      /* session probe optional */
     }
   } catch {
     /* offline bridge */
   }
 
   try {
-    const h = await api("health?ensure=1");
+    // No ensure=1 here — auto-start can block ~10s; Login modal does ensure
+    const h = await api("health");
     if (h && h.bridgeHealthy) {
       setStatus("就緒：填 IP / Password → 撳 Login 即開始 monitor。");
-    } else if (h && h.bridgeError) {
-      setStatus("API 已上。Login 時會再試自動開 bridge。 " + (h.bridgeError || ""));
     } else {
-      setStatus("就緒：填 IP / Password → 撳 Login。");
+      setStatus("API 已上。撳 Login 會自動開 OSSI bridge 並連 CM（會顯示進度）。");
     }
   } catch {
     setStatus("API 未就緒 — 檢查 IIS /CM/api。就緒後只需 Login。");

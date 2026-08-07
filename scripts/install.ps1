@@ -635,11 +635,11 @@ function Start-BridgeNow([string]$root, [string]$venvPy, [switch]$ForceRestart) 
         if ($ok) {
             Write-Ok "OSSI bridge is healthy on 127.0.0.1:18765"
         } else {
-            Write-Warn "Bridge not healthy yet. You can still open the web UI — Login will try auto-start."
-            Write-Warn "Manual: $py `"$script`" --data-dir `"$data`""
+            Write-Warn "Bridge not healthy yet. You can still open the web UI - Login will try auto-start."
+            Write-Warn ("Manual: {0} {1} --data-dir {2}" -f $py, $script, $data)
         }
     } catch {
-        Write-Warn "Bridge start skipped: $($_.Exception.Message)"
+        Write-Warn ("Bridge start skipped: {0}" -f $_.Exception.Message)
     }
 }
 

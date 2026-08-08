@@ -34,3 +34,7 @@ api_publish_tmp/
 
 python/runtime/
 
+
+cdr-link/cdr/*.TXT
+cdr-link/logs/
+

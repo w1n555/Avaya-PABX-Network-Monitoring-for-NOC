@@ -211,45 +211,39 @@ function condLabel(code) {
 }
 
 /**
- * Pick numbers that are easy for operators (not three unrelated codes slashed together).
- * Inbound: Calling From = external, Called To = station/VDN (dialed), In TAC = trunk TAC, Member = in circuit
- * Outbound: Calling From = station, Called To = external dialed, Code used often = out TAC, Member = out circuit
+ * NOC-friendly party / TAC view.
+ * TAC1 = code-used (often out TAC / access code)
+ * TAC2 = in-trk (incoming trunk TAC) — empty on pure outbound when CM leaves it blank
  */
 function partyView(r) {
   const dir = (r.dir || "").toLowerCase();
   const calling = (r.callingNum || r.clgNum || "").trim();
   const dialed = (r.dialedNum || "").trim();
   const clg = (r.clgNum || "").trim();
-  const codeUsed = (r.codeUsed || "").trim();
-  const inTac = (r.inTrk || "").trim();
-  const inMem = (r.inCrt || "").trim();
-  const outMem = (r.outCrt || "").trim();
-  const codeDial = (r.codeDial || "").trim();
+  const tac1 = (r.codeUsed || r.codeDial || "").trim();
+  const tac2 = (r.inTrk || "").trim();
 
   if (dir === "in" || r.cond === "9") {
     return {
       from: calling || clg || "—",
       to: dialed || "—",
-      codeUsed: codeUsed || "—",
-      inTac: inTac || "—",
-      member: inMem || outMem || "—",
+      tac1: tac1 || "—",
+      tac2: tac2 || "—",
     };
   }
   if (dir === "out" || r.cond === "7" || r.cond === "A") {
     return {
       from: clg || calling || "—",
       to: dialed || "—",
-      codeUsed: codeUsed || codeDial || "—",
-      inTac: "—",
-      member: outMem || "—",
+      tac1: tac1 || "—",
+      tac2: tac2 || "—",
     };
   }
   return {
     from: calling || clg || "—",
     to: dialed || "—",
-    codeUsed: codeUsed || "—",
-    inTac: inTac || "—",
-    member: inMem || outMem || "—",
+    tac1: tac1 || "—",
+    tac2: tac2 || "—",
   };
 }
 
@@ -393,9 +387,8 @@ function renderSearchTable(rows) {
         <td>${dir ? `<span class="dir-pill ${dir}">${dir}</span>` : "—"}</td>
         <td class="mono">${escapeHtml(p.from)}</td>
         <td class="mono">${escapeHtml(p.to)}</td>
-        <td class="mono" title="code-used (feature/TAC used — not always trunk)">${escapeHtml(p.codeUsed)}</td>
-        <td class="mono" title="Incoming trunk TAC">${escapeHtml(p.inTac)}</td>
-        <td class="mono" title="Trunk member / circuit">${escapeHtml(p.member)}</td>
+        <td class="mono" title="TAC1 = code-used (out TAC / access)">${escapeHtml(p.tac1)}</td>
+        <td class="mono" title="TAC2 = incoming trunk TAC">${escapeHtml(p.tac2)}</td>
         <td class="mono">${fmtDur(r.durationSec)}</td>
         <td class="mono" title="Avaya condition code">${escapeHtml(condLabel(r.cond))}</td>
       </tr>`;
@@ -546,34 +539,21 @@ function exportCsv() {
     "Dir",
     "Calling From",
     "Called To",
-    "Code used",
-    "In TAC",
-    "Member",
+    "TAC1",
+    "TAC2",
     "Duration sec",
     "Cond",
     "Cond meaning",
-    "CDR date",
-    "CDR time",
   ];
   const lines = [header.join(",")];
   for (const r of rows) {
     const p = partyView(r);
     const cond = String(r.cond || "").trim();
+    const meaning = condLabel(cond).includes("·")
+      ? condLabel(cond).split("·")[1].trim()
+      : "";
     lines.push(
-      [
-        r.recvLocal,
-        r.dir,
-        p.from,
-        p.to,
-        p.codeUsed,
-        p.inTac,
-        p.member,
-        r.durationSec,
-        cond,
-        condLabel(cond).replace(/^.\s*·\s*/, "") === cond ? "" : condLabel(cond).split("·")[1]?.trim() || "",
-        r.date,
-        r.time,
-      ]
+      [r.recvLocal, r.dir, p.from, p.to, p.tac1, p.tac2, r.durationSec, cond, meaning]
         .map((x) => `"${String(x ?? "").replace(/"/g, '""')}"`)
         .join(",")
     );

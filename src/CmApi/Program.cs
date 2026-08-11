@@ -316,21 +316,28 @@ app.MapGet("/cdr/files", (string? from, string? to) =>
 // Scan one day — UI calls per-day for progress %
 app.MapGet("/cdr/scan-day", (string date, string? calling, string? called, string? trunk, string? dir, int? minDur, int? maxMatches) =>
 {
-    // date: yyyy-MM-dd or yyyyMMdd
-    var key = date.Replace("-", "").Trim();
-    if (key.Length != 8 || !key.All(char.IsDigit))
-        return Results.BadRequest(new { ok = false, error = "date must be yyyy-MM-dd or yyyyMMdd" });
-
-    var filter = new CmApi.Services.CdrFilter
+    try
     {
-        Calling = calling,
-        Called = called,
-        Trunk = trunk,
-        Dir = dir,
-        MinDur = minDur ?? 0,
-    };
-    var result = cdrFiles.ScanDay(key, filter, maxMatches ?? 500);
-    return Results.Ok(result);
+        // date: yyyy-MM-dd or yyyyMMdd
+        var key = date.Replace("-", "").Trim();
+        if (key.Length != 8 || !key.All(char.IsDigit))
+            return Results.BadRequest(new { ok = false, error = "date must be yyyy-MM-dd or yyyyMMdd" });
+
+        var filter = new CmApi.Services.CdrFilter
+        {
+            Calling = calling,
+            Called = called,
+            Trunk = trunk,
+            Dir = dir,
+            MinDur = minDur ?? 0,
+        };
+        var result = cdrFiles.ScanDay(key, filter, maxMatches ?? 500);
+        return Results.Ok(result);
+    }
+    catch (Exception ex)
+    {
+        return Results.Json(new { ok = false, error = ex.Message, detail = ex.ToString() }, statusCode: 500);
+    }
 });
 
 app.Run();

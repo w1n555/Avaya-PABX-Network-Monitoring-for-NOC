@@ -205,7 +205,13 @@ class DailyWriter:
                 pass
         path = daily_path(self.log_dir, when)
         new_file = not path.exists() or path.stat().st_size == 0
-        self._fh = open(path, "a", encoding="utf-8", newline="\n")
+        # buffering=1 line-buffered; allow other processes (API search) to read while we append
+        self._fh = open(path, "a", encoding="utf-8", newline="\n", buffering=1)
+        try:
+            # On Windows, ensure share mode is not exclusive (Python open defaults allow read share)
+            pass
+        except Exception:
+            pass
         self._current_day = day
         if new_file:
             self._fh.write(LINE_HEADER + "\n")

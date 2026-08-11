@@ -69,29 +69,43 @@ public sealed class CdrFileService
             };
         }
 
-        foreach (var line in File.ReadLines(path))
+        // Share ReadWrite so live logger can keep appending today's file
+        using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+        using (var reader = new StreamReader(fs, detectEncodingFromByteOrderMarks: true))
         {
-            if (string.IsNullOrWhiteSpace(line) || line.StartsWith('#'))
-                continue;
+            string? line;
+            while ((line = reader.ReadLine()) != null)
+            {
+                if (string.IsNullOrWhiteSpace(line) || line.StartsWith('#'))
+                    continue;
 
-            var rec = ParseLine(line);
-            if (rec == null)
-                continue;
+                CdrRecordDto? rec;
+                try
+                {
+                    rec = ParseLine(line);
+                }
+                catch
+                {
+                    continue;
+                }
+                if (rec == null)
+                    continue;
 
-            totalInFile++;
-            if (rec.ParseOk)
-                parseOk++;
+                totalInFile++;
+                if (rec.ParseOk)
+                    parseOk++;
 
-            // hourly counts use all parseable records (for charts)
-            if (rec.Hour is >= 0 and <= 23)
-                hourly[rec.Hour]++;
+                // hourly counts use all parseable records (for charts)
+                if (rec.Hour is >= 0 and <= 23)
+                    hourly[rec.Hour]++;
 
-            if (!filter.Matches(rec))
-                continue;
+                if (!filter.Matches(rec))
+                    continue;
 
-            matchTotal++;
-            if (matched.Count < maxMatches)
-                matched.Add(rec);
+                matchTotal++;
+                if (matched.Count < maxMatches)
+                    matched.Add(rec);
+            }
         }
 
         return new CdrDayScanResult
@@ -139,22 +153,27 @@ public sealed class CdrFileService
         string calling = parts.Length > 12 ? parts[12].Trim() : "";
         string outCrt = parts.Length > 13 ? parts[13].Trim() : "";
 
-        // Prefer re-parse raw fixed-width if it looks like MMDDYY HHMM…
-        var fromRaw = TryParseRawFixed(raw);
-        if (fromRaw != null)
+        // Prefer logger-split pipe fields when they look valid (date MMDDYY + time HHMM)
+        var pipeOk = Regex.IsMatch(date, @"^\d{6}$") && Regex.IsMatch(time, @"^\d{4}$");
+        if (!pipeOk)
         {
-            date = fromRaw.Value.date;
-            time = fromRaw.Value.time;
-            secDur = fromRaw.Value.secDur;
-            cond = fromRaw.Value.cond;
-            codeUsed = fromRaw.Value.codeUsed;
-            codeDial = fromRaw.Value.codeDial;
-            dialed = fromRaw.Value.dialed;
-            clg = fromRaw.Value.clg;
-            inTrk = fromRaw.Value.inTrk;
-            inCrt = fromRaw.Value.inCrt;
-            calling = fromRaw.Value.calling;
-            outCrt = fromRaw.Value.outCrt;
+            // Fallback: re-parse fixed-width raw from CM customized layout
+            var fromRaw = TryParseRawFixed(raw);
+            if (fromRaw != null)
+            {
+                date = fromRaw.Value.date;
+                time = fromRaw.Value.time;
+                secDur = fromRaw.Value.secDur;
+                cond = fromRaw.Value.cond;
+                codeUsed = fromRaw.Value.codeUsed;
+                codeDial = fromRaw.Value.codeDial;
+                dialed = fromRaw.Value.dialed;
+                clg = fromRaw.Value.clg;
+                inTrk = fromRaw.Value.inTrk;
+                inCrt = fromRaw.Value.inCrt;
+                calling = fromRaw.Value.calling;
+                outCrt = fromRaw.Value.outCrt;
+            }
         }
 
         // Hour from time HHMM or recv_local
@@ -203,8 +222,9 @@ public sealed class CdrFileService
         var s = raw.Replace("\r", "").Replace("\n", "");
         if (s.Length < 90)
             return null;
-        // Must start with 6 digits date
-        if (!Regex.IsMatch(s.AsSpan(0, Math.Min(6, s.Length)), @"^\d{6}"))
+        // Must start with 6 digits date (MMDDYY)
+        var head = s.Length >= 6 ? s.Substring(0, 6) : s;
+        if (!Regex.IsMatch(head, @"^\d{6}$"))
             return null;
 
         try

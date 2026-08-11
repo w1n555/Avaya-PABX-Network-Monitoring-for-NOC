@@ -710,14 +710,21 @@ tr.tg-row.drag-over { outline: 1px dashed var(--accent); background: rgba(59, 13
   vertical-align: middle;
 }
 .countdown-line {
-  margin: 0.35rem 0 0;
-  font-size: 0.88rem;
+  margin: 0;
+  font-size: 0.85rem;
   font-family: var(--mono);
   color: var(--accent-2);
   font-weight: 600;
+  white-space: nowrap;
+  padding: 0.35rem 0.55rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  align-self: center;
 }
 .countdown-line.is-updating {
-  color: var(--warn);
+  color: #fde047;
+  border-color: rgba(234, 179, 8, 0.45);
 }
 .btn-rm.is-loading,
 .btn.is-loading {
@@ -727,6 +734,25 @@ tr.tg-row.drag-over { outline: 1px dashed var(--accent); background: rgba(59, 13
 }
 tr.tg-row.row-updating td:not(.col-drag):not(.col-note) {
   opacity: 0.65;
+}
+/* Updated cell flash green ~2s after that TG finishes status trunk */
+td.col-updated.updated-flash {
+  animation: updatedFlash 2s ease-out;
+  color: #86efac !important;
+  font-weight: 700;
+}
+@keyframes updatedFlash {
+  0% {
+    background: rgba(34, 197, 94, 0.55);
+    box-shadow: 0 0 12px rgba(34, 197, 94, 0.65);
+  }
+  40% {
+    background: rgba(34, 197, 94, 0.28);
+  }
+  100% {
+    background: transparent;
+    box-shadow: none;
+  }
 }
 .size-verdict {
   border-radius: 8px;

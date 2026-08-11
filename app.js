@@ -251,42 +251,51 @@ function renderTrunkTable() {
   bindRowInteractions(tbody);
 }
 
-/** Merge one TG status item into state and repaint table (row-by-row updates). */
+/** Merge one TG status item into state and repaint; flash Updated cell green 2s. */
 function applyOneTrunkItem(item) {
   if (!item || item.tg == null) return;
   const tg = Number(item.tg);
   const idx = state.trunkItems.findIndex((x) => Number(x.tg) === tg);
   if (idx >= 0) state.trunkItems[idx] = { ...state.trunkItems[idx], ...item };
   else state.trunkItems.push(item);
-  // Prefer full list from server when provided
   renderTrunkTable();
+  // Flash after DOM rebuild
+  requestAnimationFrame(() => {
+    const cell = document.querySelector(`td.col-updated[data-updated-tg="${tg}"]`);
+    if (!cell) return;
+    cell.classList.remove("updated-flash");
+    // reflow so animation restarts
+    void cell.offsetWidth;
+    cell.classList.add("updated-flash");
+    setTimeout(() => cell.classList.remove("updated-flash"), 2100);
+  });
 }
 
 function paintCountdown() {
   const el = $("trunk-countdown");
   if (!el) return;
   if (!state.connected) {
-    el.textContent = "Next update: — (login required)";
+    el.textContent = "Next: —";
     el.classList.remove("is-updating");
     return;
   }
   if (!$("chk-auto")?.checked) {
-    el.textContent = "Next update: Auto off";
+    el.textContent = "Next: Auto off";
     el.classList.remove("is-updating");
     return;
   }
   if (state.refreshing) {
-    el.textContent = "Updating now… (per TG)";
+    el.textContent = "Updating…";
     el.classList.add("is-updating");
     return;
   }
   if (!state.nextRefreshAt) {
-    el.textContent = "Next update: —";
+    el.textContent = "Next: —";
     el.classList.remove("is-updating");
     return;
   }
   const sec = Math.max(0, Math.ceil((state.nextRefreshAt - Date.now()) / 1000));
-  el.textContent = `Next update in ${sec}s`;
+  el.textContent = `Next: ${sec}s`;
   el.classList.remove("is-updating");
 }
 
@@ -294,21 +303,24 @@ function startCountdownClock() {
   if (state.countdownTimer) return;
   state.countdownTimer = setInterval(() => {
     paintCountdown();
+    // Auto refresh: no popup; only when countdown hits 0 on Trunk tab
     if (
       state.connected &&
       $("chk-auto")?.checked &&
       !state.refreshing &&
       state.nextRefreshAt > 0 &&
       Date.now() >= state.nextRefreshAt &&
-      state.activeTab === "trunk"
+      state.activeTab === "trunk" &&
+      document.visibilityState === "visible"
     ) {
-      progressiveRefresh({ reason: "auto" });
+      // fire-and-forget; progressiveRefresh guards with state.refreshing
+      progressiveRefresh({ reason: "auto", showModal: false });
     }
   }, 250);
 }
 
 function armNextRefresh(fromNowSec = REFRESH_INTERVAL_SEC) {
-  state.nextRefreshAt = Date.now() + fromNowSec * 1000;
+  state.nextRefreshAt = Date.now() + Math.max(1, fromNowSec) * 1000;
   paintCountdown();
 }
 
@@ -795,8 +807,13 @@ async function disconnect() {
  * Refresh each monitored TG one-by-one via /refresh/one so Updated column
  * advances per row (does not wait for full list).
  */
+/**
+ * @param {{ reason?: string, showModal?: boolean }} opts
+ * showModal default FALSE — only manual Refresh / tab jump pass true.
+ * Auto never uses popup.
+ */
 async function progressiveRefresh(opts = {}) {
-  const showModal = opts.showModal !== false;
+  const showModal = opts.showModal === true;
   const reason = opts.reason || "refresh";
   if (!state.connected || state.refreshing) return;
   if (!state.monitored.length) {
@@ -805,6 +822,8 @@ async function progressiveRefresh(opts = {}) {
   }
 
   state.refreshing = true;
+  // Prevent countdown from re-firing while we run (push next far ahead temporarily)
+  state.nextRefreshAt = Date.now() + 24 * 3600 * 1000;
   paintCountdown();
   setError("");
   const list = state.monitored.map((m) => m.tg);
@@ -816,9 +835,9 @@ async function progressiveRefresh(opts = {}) {
       const tg = list[i];
       const pct = ((i + 0.2) / n) * 100;
       if (showModal) setProgress(pct, `status trunk ${tg}  (${i + 1}/${n})`);
-      setStatus(`Updating TG ${tg}… (${i + 1}/${n})`);
+      if (reason !== "auto") setStatus(`Updating TG ${tg}… (${i + 1}/${n})`);
+      else setStatus(`Auto: TG ${tg} (${i + 1}/${n})`);
 
-      // mark row visually
       const tr = document.querySelector(`tr.tg-row[data-tg="${tg}"]`);
       if (tr) tr.classList.add("row-updating");
 
@@ -836,7 +855,6 @@ async function progressiveRefresh(opts = {}) {
         }
       } catch (e) {
         console.warn("refresh/one", tg, e);
-        // keep previous row; continue others
       } finally {
         const tr2 = document.querySelector(`tr.tg-row[data-tg="${tg}"]`);
         if (tr2) tr2.classList.remove("row-updating");
@@ -872,6 +890,7 @@ async function progressiveRefresh(opts = {}) {
 
 async function refreshNow() {
   setError("");
+  // Manual Refresh only — show popup
   await progressiveRefresh({ reason: "manual", showModal: true });
 }
 
@@ -991,9 +1010,11 @@ function bindTabs() {
           /* ignore */
         }
       }
-      // Jump back to Trunk tab → refresh this page's data now, then 60s countdown
+      // Jump back to Trunk tab → refresh data now (with popup), then 60s countdown
       if (name === "trunk" && state.connected && $("chk-auto")?.checked) {
         progressiveRefresh({ reason: "tab", showModal: true });
+      } else {
+        paintCountdown();
       }
     });
   });
@@ -1029,8 +1050,8 @@ async function init() {
   });
   $("chk-auto").addEventListener("change", () => {
     if (state.connected && $("chk-auto").checked) {
-      // Turn auto on → update now, then 60s
-      progressiveRefresh({ reason: "auto-on", showModal: true });
+      // Turn auto on → silent update now, then 60s (no popup for auto path)
+      progressiveRefresh({ reason: "auto-on", showModal: false });
     } else {
       clearAuto();
     }

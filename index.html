@@ -123,7 +123,7 @@
     <main class="main hidden" id="panel-cdr" data-panel="cdr">
       <div class="cdr-banner" id="cdr-live-banner">
         <strong>Live CDR files</strong>
-        — Source: <code>cdr-link/cdr/YYYYMMDD.txt</code>
+        — Daily logs under <code id="cdr-rel-path">cdr-link/cdr/YYYYMMDD.txt</code>
         · <span id="cdr-status-line">Checking…</span>
       </div>
 
@@ -131,19 +131,19 @@
         <div class="panel-head">
           <div>
             <h2>CDR Search</h2>
-            <p class="hint">Search real daily logs (one file per day). Progress popup while scanning files.</p>
+            <p class="hint">Search daily text logs (one call = one line). Export is Excel-friendly CSV.</p>
           </div>
           <div class="card-actions">
-            <button type="button" class="btn" id="btn-cdr-export">Export CSV</button>
+            <button type="button" class="btn" id="btn-cdr-export">Export CSV (Excel)</button>
             <button type="button" class="btn btn-primary" id="btn-cdr-search">Search</button>
           </div>
         </div>
         <div class="cdr-search-grid">
           <label>From <input type="date" id="cdr-from" /></label>
           <label>To <input type="date" id="cdr-to" /></label>
-          <label>Calling <input type="text" id="cdr-calling" placeholder="e.g. 2123" /></label>
-          <label>Called <input type="text" id="cdr-called" placeholder="dialed number" /></label>
-          <label>Trunk / code <input type="text" id="cdr-trunk" placeholder="e.g. 1401 / TAC" /></label>
+          <label>Calling From <input type="text" id="cdr-calling" placeholder="e.g. 2123 / external" /></label>
+          <label>Called To <input type="text" id="cdr-called" placeholder="dialed / destination" /></label>
+          <label>TAC / trunk code <input type="text" id="cdr-trunk" placeholder="e.g. 1401 or 1413" /></label>
           <label>Direction
             <select id="cdr-dir">
               <option value="">All</option>
@@ -151,7 +151,6 @@
               <option value="out">Outbound</option>
             </select>
           </label>
-          <label>Min duration (sec) <input type="number" id="cdr-min-dur" min="0" value="0" /></label>
         </div>
         <p class="hint" id="cdr-search-meta">—</p>
         <div class="table-wrap cdr-table-wrap">
@@ -159,17 +158,18 @@
             <thead>
               <tr>
                 <th>Recv time</th>
-                <th>CDR time</th>
                 <th>Dir</th>
-                <th>Calling</th>
-                <th>Called</th>
-                <th>Code/Trk</th>
+                <th>Calling From</th>
+                <th>Called To</th>
+                <th title="Feature/access code used (not always TAC)">Code used</th>
+                <th title="Incoming trunk TAC (inbound)">In TAC</th>
+                <th title="Trunk member / circuit id">Member</th>
                 <th>Duration</th>
                 <th>Cond</th>
               </tr>
             </thead>
             <tbody id="cdr-result-tbody">
-              <tr class="empty"><td colspan="8">Set date range and click Search.</td></tr>
+              <tr class="empty"><td colspan="9">Set date range and click Search.</td></tr>
             </tbody>
           </table>
         </div>

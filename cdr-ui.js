@@ -170,7 +170,86 @@ function getFilterFromForm() {
     called: document.getElementById("cdr-called")?.value || "",
     trunk: document.getElementById("cdr-trunk")?.value || "",
     dir: document.getElementById("cdr-dir")?.value || "",
-    minDur: document.getElementById("cdr-min-dur")?.value || "0",
+    minDur: "0",
+  };
+}
+
+/** Avaya CM condition code → short English (common set; non-59-char formats). */
+function condLabel(code) {
+  const c = String(code || "").trim().toUpperCase();
+  const map = {
+    "0": "Intra-switch",
+    "1": "Attendant",
+    "3": "Conference",
+    "4": "Long call",
+    "6": "ISDN/data",
+    "7": "Outgoing",
+    "8": "In→Attn",
+    "9": "Incoming",
+    A: "Outgoing",
+    B: "Adjunct out",
+    C: "Conference",
+    E: "Feature",
+    F: "Forwarded",
+    G: "AAR/ARS",
+    H: "Headset",
+    I: "Incomplete",
+    J: "DID/attendant",
+    K: "Lookahead",
+    L: "Conference",
+    M: "MWI",
+    N: "Network",
+    P: "Personal CO",
+    R: "Ringdown",
+    S: "Serial",
+    T: "Redirected",
+    U: "Unattended",
+  };
+  if (!c) return "—";
+  const name = map[c];
+  return name ? `${c} · ${name}` : c;
+}
+
+/**
+ * Pick numbers that are easy for operators (not three unrelated codes slashed together).
+ * Inbound: Calling From = external, Called To = station/VDN (dialed), In TAC = trunk TAC, Member = in circuit
+ * Outbound: Calling From = station, Called To = external dialed, Code used often = out TAC, Member = out circuit
+ */
+function partyView(r) {
+  const dir = (r.dir || "").toLowerCase();
+  const calling = (r.callingNum || r.clgNum || "").trim();
+  const dialed = (r.dialedNum || "").trim();
+  const clg = (r.clgNum || "").trim();
+  const codeUsed = (r.codeUsed || "").trim();
+  const inTac = (r.inTrk || "").trim();
+  const inMem = (r.inCrt || "").trim();
+  const outMem = (r.outCrt || "").trim();
+  const codeDial = (r.codeDial || "").trim();
+
+  if (dir === "in" || r.cond === "9") {
+    return {
+      from: calling || clg || "—",
+      to: dialed || "—",
+      codeUsed: codeUsed || "—",
+      inTac: inTac || "—",
+      member: inMem || outMem || "—",
+    };
+  }
+  if (dir === "out" || r.cond === "7" || r.cond === "A") {
+    return {
+      from: clg || calling || "—",
+      to: dialed || "—",
+      codeUsed: codeUsed || codeDial || "—",
+      inTac: "—",
+      member: outMem || "—",
+    };
+  }
+  return {
+    from: calling || clg || "—",
+    to: dialed || "—",
+    codeUsed: codeUsed || "—",
+    inTac: inTac || "—",
+    member: inMem || outMem || "—",
   };
 }
 
@@ -302,23 +381,23 @@ function renderSearchTable(rows) {
   const tbody = document.getElementById("cdr-result-tbody");
   if (!tbody) return;
   if (!rows.length) {
-    tbody.innerHTML = `<tr class="empty"><td colspan="8">No matching records.</td></tr>`;
+    tbody.innerHTML = `<tr class="empty"><td colspan="9">No matching records.</td></tr>`;
     return;
   }
   tbody.innerHTML = rows
     .map((r) => {
-      const cdrTime =
-        (r.date || "") + (r.time ? " " + r.time : "");
-      const code = [r.codeUsed, r.inTrk, r.outCrt].filter(Boolean).join(" / ");
+      const p = partyView(r);
+      const dir = (r.dir || "").toLowerCase();
       return `<tr>
         <td class="mono">${escapeHtml(r.recvLocal || "")}</td>
-        <td class="mono">${escapeHtml(cdrTime)}</td>
-        <td>${r.dir ? `<span class="dir-pill ${r.dir}">${r.dir}</span>` : "—"}</td>
-        <td class="mono">${escapeHtml(r.callingNum || r.clgNum || "")}</td>
-        <td class="mono">${escapeHtml(r.dialedNum || "")}</td>
-        <td class="mono">${escapeHtml(code || "—")}</td>
+        <td>${dir ? `<span class="dir-pill ${dir}">${dir}</span>` : "—"}</td>
+        <td class="mono">${escapeHtml(p.from)}</td>
+        <td class="mono">${escapeHtml(p.to)}</td>
+        <td class="mono" title="code-used (feature/TAC used — not always trunk)">${escapeHtml(p.codeUsed)}</td>
+        <td class="mono" title="Incoming trunk TAC">${escapeHtml(p.inTac)}</td>
+        <td class="mono" title="Trunk member / circuit">${escapeHtml(p.member)}</td>
         <td class="mono">${fmtDur(r.durationSec)}</td>
-        <td class="mono">${escapeHtml(r.cond || "")}</td>
+        <td class="mono" title="Avaya condition code">${escapeHtml(condLabel(r.cond))}</td>
       </tr>`;
     })
     .join("");
@@ -461,40 +540,48 @@ function exportCsv() {
     alert("Run Search first.");
     return;
   }
+  // Excel-friendly: UTF-8 BOM + comma CSV; open in Excel → Data/Sort works
   const header = [
-    "recv_local",
-    "date",
-    "time",
-    "dir",
-    "calling",
-    "called",
-    "code_used",
-    "in_trk",
-    "out_crt",
-    "duration_sec",
-    "cond",
+    "Recv time",
+    "Dir",
+    "Calling From",
+    "Called To",
+    "Code used",
+    "In TAC",
+    "Member",
+    "Duration sec",
+    "Cond",
+    "Cond meaning",
+    "CDR date",
+    "CDR time",
   ];
   const lines = [header.join(",")];
   for (const r of rows) {
+    const p = partyView(r);
+    const cond = String(r.cond || "").trim();
     lines.push(
       [
         r.recvLocal,
+        r.dir,
+        p.from,
+        p.to,
+        p.codeUsed,
+        p.inTac,
+        p.member,
+        r.durationSec,
+        cond,
+        condLabel(cond).replace(/^.\s*·\s*/, "") === cond ? "" : condLabel(cond).split("·")[1]?.trim() || "",
         r.date,
         r.time,
-        r.dir,
-        r.callingNum || r.clgNum,
-        r.dialedNum,
-        r.codeUsed,
-        r.inTrk,
-        r.outCrt,
-        r.durationSec,
-        r.cond,
       ]
         .map((x) => `"${String(x ?? "").replace(/"/g, '""')}"`)
         .join(",")
     );
   }
-  const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8" });
+  const bom = "\uFEFF";
+  const blob = new Blob([bom + lines.join("\r\n")], {
+    type: "text/csv;charset=utf-8",
+  });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = `cdr-export-${toDateInputValue(new Date())}.csv`;
@@ -504,12 +591,15 @@ function exportCsv() {
 
 async function refreshCdrStatus() {
   const el = document.getElementById("cdr-status-line");
+  const rel = document.getElementById("cdr-rel-path");
   try {
     const st = await apiGet("cdr/status");
+    // Path is site-relative: <siteRoot>/cdr-link/cdr — not a fixed PC drive letter in logic
+    if (rel) rel.textContent = "cdr-link/cdr/YYYYMMDD.txt";
     if (el) {
       el.textContent = st.dayCount
-        ? `${st.dayCount} day file(s) · latest ${st.latest}.txt · ${st.cdrDir}`
-        : `No .txt files yet · ${st.cdrDir}`;
+        ? `${st.dayCount} day file(s) · latest ${st.latest}.txt`
+        : "No .txt files yet — is CDR logger running?";
     }
     document.getElementById("cdr-live-banner")?.classList.remove("warn");
   } catch (e) {

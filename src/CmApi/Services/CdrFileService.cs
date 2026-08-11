@@ -187,15 +187,15 @@ public sealed class CdrFileService
         if (int.TryParse(secDur, out var dsec))
             durationSec = dsec;
 
-        // Direction heuristic: extension-like calling (3–6 digits) → outbound
-        var dir = InferDirection(calling, dialed, clg);
+        // Prefer CM condition code for direction when present (7/A out, 9 in)
+        var dir = InferDirection(cond, calling, dialed, clg);
 
         var parseOk = date.Length >= 6 && time.Length >= 4;
 
         return new CdrRecordDto
         {
             RecvLocal = recvLocal,
-            Raw = raw.Length > 80 ? raw[..80] : raw,
+            Raw = raw.Length > 120 ? raw[..120] : raw,
             Date = date,
             Time = time,
             Hour = hour,
@@ -257,12 +257,17 @@ public sealed class CdrFileService
         }
     }
 
-    private static string InferDirection(string calling, string dialed, string clg)
+    private static string InferDirection(string cond, string calling, string dialed, string clg)
     {
+        var cc = (cond ?? "").Trim().ToUpperInvariant();
+        // Standard CM condition codes (most formats)
+        if (cc is "9" or "8") return "in";
+        if (cc is "7" or "A" or "B") return "out";
+        if (cc is "0") return "intra";
+
         var c = string.IsNullOrEmpty(calling) ? clg : calling;
         c = c.Trim();
         var d = dialed.Trim();
-        // short numeric = station/extension → often outbound when dialed is longer
         if (Regex.IsMatch(c, @"^\d{3,6}$") && d.Length >= 7)
             return "out";
         if (d.Length is >= 3 and <= 6 && c.Length >= 7)

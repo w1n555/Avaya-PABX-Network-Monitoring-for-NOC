@@ -1,6 +1,6 @@
 /**
- * CDR tab UI — mock data only (real CM CDR logger later).
- * Search · Daily hourly · Monthly hourly · Trunk size estimate
+ * CDR tab — real daily files via /CM/api/cdr/*
+ * Search / Daily / Weekly / Monthly with progress popup (file-by-file %).
  */
 
 function pad2(n) {
@@ -15,18 +15,24 @@ function toMonthInputValue(d) {
   return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}`;
 }
 
+function ymdFromInput(s) {
+  return (s || "").replace(/-/g, "");
+}
+
 function parseLocalDate(s) {
   if (!s) return null;
   const [y, m, d] = s.split("-").map(Number);
-  return new Date(y, m - 1, d, 0, 0, 0, 0);
+  return new Date(y, m - 1, d);
 }
 
-function startOfDay(d) {
-  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+function addDays(d, n) {
+  const x = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  x.setDate(x.getDate() + n);
+  return x;
 }
 
 function fmtDur(sec) {
-  const s = Math.max(0, Math.round(sec));
+  const s = Math.max(0, Math.round(Number(sec) || 0));
   const m = Math.floor(s / 60);
   const r = s % 60;
   return `${m}:${pad2(r)}`;
@@ -40,109 +46,74 @@ function escapeHtml(s) {
     .replace(/"/g, "&quot;");
 }
 
-/** Deterministic pseudo-random 0..1 from seed */
-function prand(seed) {
-  const x = Math.sin(seed * 12.9898 + 78.233) * 43758.5453;
-  return x - Math.floor(x);
+function apiUrl(path) {
+  let dir = window.location.pathname || "/";
+  if (/\.html?$/i.test(dir)) dir = dir.replace(/\/[^/]*$/, "/");
+  else if (!dir.endsWith("/")) dir += "/";
+  return dir + "api/" + String(path).replace(/^\//, "");
 }
 
-/**
- * Build mock CDR rows for last ~35 days.
- * Busy hours: 10–12, 14–17 weekdays; lighter nights/weekends.
- */
-function generateMockCdr(now = new Date()) {
-  const tgs = [1, 2, 3, 11, 12, 13];
-  const rows = [];
-  let id = 1;
-  const day0 = startOfDay(now);
-
-  for (let dayOffset = 34; dayOffset >= 0; dayOffset--) {
-    const day = new Date(day0);
-    day.setDate(day.getDate() - dayOffset);
-    const dow = day.getDay(); // 0 Sun
-    const weekend = dow === 0 || dow === 6;
-
-    for (let hour = 0; hour < 24; hour++) {
-      let base = 2;
-      if (hour >= 9 && hour <= 11) base = weekend ? 8 : 28;
-      else if (hour >= 14 && hour <= 17) base = weekend ? 10 : 32;
-      else if (hour >= 12 && hour <= 13) base = weekend ? 6 : 18;
-      else if (hour >= 18 && hour <= 20) base = weekend ? 12 : 14;
-      else if (hour >= 7 && hour <= 8) base = weekend ? 4 : 12;
-      else if (hour >= 21 || hour <= 6) base = weekend ? 1 : 3;
-
-      const jitter = Math.floor(prand(dayOffset * 100 + hour) * 8) - 2;
-      const n = Math.max(0, base + jitter);
-
-      for (let i = 0; i < n; i++) {
-        const seed = dayOffset * 10000 + hour * 100 + i;
-        const minute = Math.floor(prand(seed + 1) * 60);
-        const second = Math.floor(prand(seed + 2) * 60);
-        const end = new Date(day.getFullYear(), day.getMonth(), day.getDate(), hour, minute, second);
-        const dur = 15 + Math.floor(prand(seed + 3) * 420); // 15s–7min
-        const dir = prand(seed + 4) > 0.42 ? "out" : "in";
-        const tg = tgs[Math.floor(prand(seed + 5) * tgs.length)];
-        const ext = 2000 + Math.floor(prand(seed + 6) * 800);
-        const external =
-          dir === "out"
-            ? `8529${String(10000000 + Math.floor(prand(seed + 7) * 89999999)).slice(0, 8)}`
-            : `8526${String(10000000 + Math.floor(prand(seed + 8) * 89999999)).slice(0, 8)}`;
-
-        rows.push({
-          id: id++,
-          endTime: end.toISOString(),
-          endLocal: end,
-          dir,
-          calling: dir === "out" ? String(ext) : external,
-          called: dir === "out" ? external : String(ext),
-          tg,
-          durationSec: dur,
-          cond: prand(seed + 9) > 0.92 ? "7" : "9", // mock condition codes
-          mock: true,
-        });
-      }
-    }
+async function apiGet(path) {
+  const res = await fetch(apiUrl(path), { credentials: "same-origin" });
+  const text = await res.text();
+  let body = null;
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    body = { raw: text };
   }
-  return rows;
+  if (!res.ok) throw new Error((body && (body.error || body.Error)) || res.statusText);
+  return body;
 }
 
 const CDR = {
-  all: [],
   lastSearch: [],
+  busy: false,
 };
 
-function ensureMock() {
-  if (!CDR.all.length) CDR.all = generateMockCdr();
+/* ---------- progress modal ---------- */
+function showProgress(title, sub) {
+  const m = document.getElementById("progress-modal");
+  if (!m) return;
+  m.hidden = false;
+  document.getElementById("progress-modal-title").textContent = title || "Working…";
+  document.getElementById("progress-modal-sub").textContent = sub || "Please wait…";
+  document.getElementById("progress-modal-detail").textContent = "";
+  document.getElementById("progress-bar-fill").style.width = "0%";
+  document.getElementById("progress-pct").textContent = "0%";
+  document.getElementById("progress-modal-spinner").className = "modal-spinner";
+  document.getElementById("btn-progress-close").hidden = true;
 }
 
-function filterCdr(opts) {
-  ensureMock();
-  const from = opts.from ? startOfDay(parseLocalDate(opts.from)) : null;
-  let to = opts.to ? startOfDay(parseLocalDate(opts.to)) : null;
-  if (to) to = new Date(to.getTime() + 86400000 - 1);
-
-  const calling = (opts.calling || "").trim();
-  const called = (opts.called || "").trim();
-  const trunk = (opts.trunk || "").trim().replace(/^tg/i, "");
-  const dir = opts.dir || "";
-  const minDur = Number(opts.minDur) || 0;
-
-  return CDR.all.filter((r) => {
-    if (from && r.endLocal < from) return false;
-    if (to && r.endLocal > to) return false;
-    if (calling && !String(r.calling).includes(calling)) return false;
-    if (called && !String(r.called).includes(called)) return false;
-    if (trunk && String(r.tg) !== String(trunk)) return false;
-    if (dir && r.dir !== dir) return false;
-    if (r.durationSec < minDur) return false;
-    return true;
-  });
+function setProgress(pct, detail) {
+  const p = Math.max(0, Math.min(100, Math.round(pct)));
+  const fill = document.getElementById("progress-bar-fill");
+  const label = document.getElementById("progress-pct");
+  if (fill) fill.style.width = p + "%";
+  if (label) label.textContent = p + "%";
+  if (detail != null) {
+    const el = document.getElementById("progress-modal-detail");
+    if (el) el.textContent = detail;
+  }
 }
 
-function hourlyCounts(rows) {
-  const h = Array(24).fill(0);
-  for (const r of rows) h[r.endLocal.getHours()]++;
-  return h;
+function hideProgress(delayMs = 0) {
+  const m = document.getElementById("progress-modal");
+  if (!m) return;
+  const go = () => {
+    m.hidden = true;
+  };
+  if (delayMs > 0) setTimeout(go, delayMs);
+  else go();
+}
+
+function finishProgress(ok, message) {
+  document.getElementById("progress-modal-spinner").className = ok
+    ? "modal-spinner done"
+    : "modal-spinner fail";
+  document.getElementById("progress-modal-sub").textContent = message || (ok ? "Done" : "Failed");
+  if (!ok) document.getElementById("btn-progress-close").hidden = false;
+  else hideProgress(500);
 }
 
 function renderHourChart(el, counts) {
@@ -153,7 +124,7 @@ function renderHourChart(el, counts) {
       const pct = Math.round((c / max) * 100);
       const peak = c === max && c > 0;
       return `<div class="hour-bar-wrap" title="${hour}:00 — ${c} calls">
-        <div class="hour-bar ${peak ? "peak" : ""}" style="height:${pct}%"></div>
+        <div class="hour-bar ${peak ? "peak" : ""}" style="height:${Math.max(2, pct)}%"></div>
         <span class="hour-n">${c || ""}</span>
       </div>`;
     })
@@ -172,229 +143,424 @@ function renderKpis(el, items) {
     .join("");
 }
 
-function runSearch() {
-  const opts = {
-    from: document.getElementById("cdr-from")?.value,
-    to: document.getElementById("cdr-to")?.value,
-    calling: document.getElementById("cdr-calling")?.value,
-    called: document.getElementById("cdr-called")?.value,
-    trunk: document.getElementById("cdr-trunk")?.value,
-    dir: document.getElementById("cdr-dir")?.value,
-    minDur: document.getElementById("cdr-min-dur")?.value,
-  };
-  let rows = filterCdr(opts);
-  rows = rows.slice().sort((a, b) => b.endLocal - a.endLocal);
-  CDR.lastSearch = rows;
+function emptyHourly() {
+  return Array(24).fill(0);
+}
 
-  const meta = document.getElementById("cdr-search-meta");
-  const tbody = document.getElementById("cdr-result-tbody");
-  const maxShow = 200;
-  if (meta) {
-    meta.textContent = `Found ${rows.length} mock record(s)${
-      rows.length > maxShow ? ` · showing first ${maxShow}` : ""
-    } · UI preview only`;
+function addHourly(a, b) {
+  for (let i = 0; i < 24; i++) a[i] += b[i] || 0;
+  return a;
+}
+
+function peakOf(counts) {
+  let max = -1;
+  let hour = 0;
+  for (let i = 0; i < 24; i++) {
+    if (counts[i] > max) {
+      max = counts[i];
+      hour = i;
+    }
   }
+  return { hour, count: Math.max(0, max) };
+}
+
+function getFilterFromForm() {
+  return {
+    calling: document.getElementById("cdr-calling")?.value || "",
+    called: document.getElementById("cdr-called")?.value || "",
+    trunk: document.getElementById("cdr-trunk")?.value || "",
+    dir: document.getElementById("cdr-dir")?.value || "",
+    minDur: document.getElementById("cdr-min-dur")?.value || "0",
+  };
+}
+
+function qs(params) {
+  const u = new URLSearchParams();
+  Object.entries(params).forEach(([k, v]) => {
+    if (v !== "" && v != null) u.set(k, v);
+  });
+  return u.toString();
+}
+
+/** Enumerate yyyyMMdd keys for a calendar range (inclusive). */
+function eachDayKey(fromYmd, toYmd) {
+  const out = [];
+  let d = parseLocalDate(
+    `${fromYmd.slice(0, 4)}-${fromYmd.slice(4, 6)}-${fromYmd.slice(6, 8)}`
+  );
+  const end = parseLocalDate(`${toYmd.slice(0, 4)}-${toYmd.slice(4, 6)}-${toYmd.slice(6, 8)}`);
+  if (!d || !end) return out;
+  while (d <= end) {
+    out.push(
+      `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}`
+    );
+    d = addDays(d, 1);
+  }
+  return out;
+}
+
+async function scanDay(ymd, filter, maxMatches = 500) {
+  const dateIso = `${ymd.slice(0, 4)}-${ymd.slice(4, 6)}-${ymd.slice(6, 8)}`;
+  const q = qs({
+    date: dateIso,
+    calling: filter.calling,
+    called: filter.called,
+    trunk: filter.trunk,
+    dir: filter.dir,
+    minDur: filter.minDur,
+    maxMatches,
+  });
+  return apiGet("cdr/scan-day?" + q);
+}
+
+/**
+ * Scan many days with progress callback.
+ * @param {string[]} dayKeys yyyyMMdd
+ * @param {(pct:number, detail:string, dayResult:object)=>void} onProgress
+ */
+async function scanDays(dayKeys, filter, onProgress, maxMatchesPerDay = 500) {
+  const results = [];
+  const n = Math.max(1, dayKeys.length);
+  for (let i = 0; i < dayKeys.length; i++) {
+    const ymd = dayKeys[i];
+    const r = await scanDay(ymd, filter, maxMatchesPerDay);
+    results.push(r);
+    const pct = ((i + 1) / n) * 100;
+    const detail = `Scanning ${ymd}.txt  (${i + 1}/${dayKeys.length})` +
+      (r.fileExists ? ` · ${r.totalInFile || 0} rows` : " · file missing");
+    onProgress(pct, detail, r);
+  }
+  return results;
+}
+
+async function runSearch() {
+  if (CDR.busy) return;
+  CDR.busy = true;
+  const from = document.getElementById("cdr-from")?.value;
+  const to = document.getElementById("cdr-to")?.value;
+  if (!from || !to) {
+    alert("Please set From and To dates.");
+    CDR.busy = false;
+    return;
+  }
+  const filter = getFilterFromForm();
+  const fromKey = ymdFromInput(from);
+  const toKey = ymdFromInput(to);
+
+  showProgress("CDR Search", "Listing daily files…");
+  try {
+    // Prefer only days that exist (faster progress)
+    const files = await apiGet(`cdr/files?from=${from}&to=${to}`);
+    let days = files.days || [];
+    if (!days.length) {
+      // still walk calendar so user sees 100% over empty range
+      days = eachDayKey(fromKey, toKey);
+    }
+    if (!days.length) {
+      finishProgress(false, "No days in range");
+      CDR.busy = false;
+      return;
+    }
+
+    setProgress(0, `0 / ${days.length} files`);
+    const allMatches = [];
+    let totalMatch = 0;
+    let totalRows = 0;
+    let filesHit = 0;
+
+    await scanDays(days, filter, (pct, detail, day) => {
+      setProgress(pct, detail);
+      if (day.fileExists) filesHit++;
+      totalRows += day.totalInFile || 0;
+      totalMatch += day.matchCountTotal ?? day.matchCount ?? 0;
+      for (const m of day.matches || []) allMatches.push(m);
+    }, 300);
+
+    // sort by recv time desc
+    allMatches.sort((a, b) => String(b.recvLocal).localeCompare(String(a.recvLocal)));
+    CDR.lastSearch = allMatches;
+
+    const meta = document.getElementById("cdr-search-meta");
+    const show = allMatches.slice(0, 500);
+    if (meta) {
+      meta.textContent =
+        `Matched ${totalMatch} call(s) in ${filesHit} file(s) · scanned ${totalRows} rows · showing ${show.length}` +
+        (totalMatch > show.length ? " (capped)" : "");
+    }
+    renderSearchTable(show);
+    setProgress(100, "Complete");
+    finishProgress(true, `Found ${totalMatch} record(s)`);
+  } catch (e) {
+    finishProgress(false, String(e.message || e));
+    document.getElementById("btn-progress-close").hidden = false;
+  } finally {
+    CDR.busy = false;
+  }
+}
+
+function renderSearchTable(rows) {
+  const tbody = document.getElementById("cdr-result-tbody");
   if (!tbody) return;
   if (!rows.length) {
-    tbody.innerHTML = `<tr class="empty"><td colspan="7">No mock records match.</td></tr>`;
+    tbody.innerHTML = `<tr class="empty"><td colspan="8">No matching records.</td></tr>`;
     return;
   }
   tbody.innerHTML = rows
-    .slice(0, maxShow)
     .map((r) => {
-      const t = r.endLocal;
-      const ts = `${toDateInputValue(t)} ${pad2(t.getHours())}:${pad2(t.getMinutes())}:${pad2(t.getSeconds())}`;
+      const cdrTime =
+        (r.date || "") + (r.time ? " " + r.time : "");
+      const code = [r.codeUsed, r.inTrk, r.outCrt].filter(Boolean).join(" / ");
       return `<tr>
-        <td class="mono">${ts}</td>
-        <td><span class="dir-pill ${r.dir}">${r.dir}</span></td>
-        <td class="mono">${escapeHtml(r.calling)}</td>
-        <td class="mono">${escapeHtml(r.called)}</td>
-        <td>TG ${r.tg}</td>
+        <td class="mono">${escapeHtml(r.recvLocal || "")}</td>
+        <td class="mono">${escapeHtml(cdrTime)}</td>
+        <td>${r.dir ? `<span class="dir-pill ${r.dir}">${r.dir}</span>` : "—"}</td>
+        <td class="mono">${escapeHtml(r.callingNum || r.clgNum || "")}</td>
+        <td class="mono">${escapeHtml(r.dialedNum || "")}</td>
+        <td class="mono">${escapeHtml(code || "—")}</td>
         <td class="mono">${fmtDur(r.durationSec)}</td>
-        <td class="mono">${escapeHtml(r.cond)}</td>
+        <td class="mono">${escapeHtml(r.cond || "")}</td>
       </tr>`;
     })
     .join("");
 }
 
-function refreshDailyChart() {
-  ensureMock();
-  const dayStr = document.getElementById("cdr-day")?.value;
-  const day = dayStr ? startOfDay(parseLocalDate(dayStr)) : startOfDay(new Date());
-  const next = new Date(day.getTime() + 86400000);
-  const rows = CDR.all.filter((r) => r.endLocal >= day && r.endLocal < next);
-  const counts = hourlyCounts(rows);
-  const peakHour = counts.indexOf(Math.max(...counts));
-  const total = rows.length;
-  const avgDur =
-    total > 0 ? Math.round(rows.reduce((s, r) => s + r.durationSec, 0) / total) : 0;
-
-  renderHourChart(document.getElementById("cdr-daily-chart"), counts);
-  renderKpis(document.getElementById("cdr-daily-kpi"), [
-    { label: "Calls (day)", value: total },
-    { label: "Peak hour", value: `${peakHour}:00 (${counts[peakHour]})` },
-    { label: "Avg duration", value: fmtDur(avgDur) },
-    { label: "Talk minutes", value: Math.round(rows.reduce((s, r) => s + r.durationSec, 0) / 60) },
-  ]);
+async function calcDaily() {
+  if (CDR.busy) return;
+  CDR.busy = true;
+  const day = document.getElementById("cdr-day")?.value;
+  if (!day) {
+    alert("Pick a day");
+    CDR.busy = false;
+    return;
+  }
+  showProgress("Daily hourly", "Scanning day file…");
+  try {
+    const ymd = ymdFromInput(day);
+    setProgress(10, `${ymd}.txt`);
+    const r = await scanDay(ymd, {}, 1);
+    setProgress(100, r.fileExists ? `OK · ${r.totalInFile} rows` : "File not found");
+    const hourly = r.hourly || emptyHourly();
+    const peak = peakOf(hourly);
+    const total = hourly.reduce((a, b) => a + b, 0);
+    renderHourChart(document.getElementById("cdr-daily-chart"), hourly);
+    renderKpis(document.getElementById("cdr-daily-kpi"), [
+      { label: "Calls (day)", value: total },
+      { label: "Peak hour", value: `${peak.hour}:00 (${peak.count})` },
+      { label: "File", value: r.fileExists ? r.fileName || ymd + ".txt" : "missing" },
+      { label: "Parsed OK", value: r.parseOk ?? "—" },
+    ]);
+    finishProgress(true, r.fileExists ? "Daily chart ready" : "No file for that day");
+  } catch (e) {
+    finishProgress(false, String(e.message || e));
+    document.getElementById("btn-progress-close").hidden = false;
+  } finally {
+    CDR.busy = false;
+  }
 }
 
-function refreshMonthlyChart() {
-  ensureMock();
+async function calcWeekly() {
+  if (CDR.busy) return;
+  CDR.busy = true;
+  const startStr = document.getElementById("cdr-week-start")?.value;
+  if (!startStr) {
+    alert("Pick week start date");
+    CDR.busy = false;
+    return;
+  }
+  const start = parseLocalDate(startStr);
+  const days = [];
+  for (let i = 0; i < 7; i++) {
+    const d = addDays(start, i);
+    days.push(`${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}`);
+  }
+  showProgress("Weekly hourly", "Scanning 7 daily files…");
+  try {
+    const hourly = emptyHourly();
+    let total = 0;
+    let filesHit = 0;
+    await scanDays(days, {}, (pct, detail, day) => {
+      setProgress(pct, detail);
+      if (day.fileExists) {
+        filesHit++;
+        addHourly(hourly, day.hourly || emptyHourly());
+        total += (day.hourly || []).reduce((a, b) => a + b, 0);
+      }
+    }, 1);
+    const peak = peakOf(hourly);
+    renderHourChart(document.getElementById("cdr-weekly-chart"), hourly);
+    renderKpis(document.getElementById("cdr-weekly-kpi"), [
+      { label: "Calls (7 days)", value: total },
+      { label: "Peak hour", value: `${peak.hour}:00 (${peak.count})` },
+      { label: "Files found", value: `${filesHit} / 7` },
+      { label: "Avg / day", value: filesHit ? Math.round(total / filesHit) : 0 },
+    ]);
+    setProgress(100, "Complete");
+    finishProgress(true, "Weekly chart ready");
+  } catch (e) {
+    finishProgress(false, String(e.message || e));
+    document.getElementById("btn-progress-close").hidden = false;
+  } finally {
+    CDR.busy = false;
+  }
+}
+
+async function calcMonthly() {
+  if (CDR.busy) return;
+  CDR.busy = true;
   const monthStr = document.getElementById("cdr-month")?.value;
-  let y;
-  let m;
-  if (monthStr) {
-    [y, m] = monthStr.split("-").map(Number);
-  } else {
-    const n = new Date();
-    y = n.getFullYear();
-    m = n.getMonth() + 1;
+  if (!monthStr) {
+    alert("Pick a month");
+    CDR.busy = false;
+    return;
   }
-  const start = new Date(y, m - 1, 1);
-  const end = new Date(y, m, 1);
-  const rows = CDR.all.filter((r) => r.endLocal >= start && r.endLocal < end);
-  const counts = hourlyCounts(rows);
-  const peakHour = counts.indexOf(Math.max(...counts));
-  const daysInMonth = new Date(y, m, 0).getDate();
-  const daysWithData = new Set(rows.map((r) => r.endLocal.getDate())).size || 1;
+  const [y, m] = monthStr.split("-").map(Number);
+  const from = `${y}-${pad2(m)}-01`;
+  const last = new Date(y, m, 0).getDate();
+  const to = `${y}-${pad2(m)}-${pad2(last)}`;
 
-  renderHourChart(document.getElementById("cdr-monthly-chart"), counts);
-  renderKpis(document.getElementById("cdr-monthly-kpi"), [
-    { label: "Calls (month)", value: rows.length },
-    { label: "Peak hour (total)", value: `${peakHour}:00 (${counts[peakHour]})` },
-    { label: "Avg calls / day", value: Math.round(rows.length / daysWithData) },
-    { label: "Days covered", value: `${daysWithData} / ${daysInMonth}` },
-  ]);
-}
-
-/** Erlang-ish rough check for trunk sizing */
-function recalculateTrunkSize() {
-  ensureMock();
-  const dayStr = document.getElementById("cdr-day")?.value;
-  const day = dayStr ? startOfDay(parseLocalDate(dayStr)) : startOfDay(new Date());
-  const next = new Date(day.getTime() + 86400000);
-  const rows = CDR.all.filter((r) => r.endLocal >= day && r.endLocal < next);
-  const counts = hourlyCounts(rows);
-  const peakCalls = Math.max(0, ...counts);
-  const peakHour = counts.indexOf(peakCalls);
-  const peakRows = rows.filter((r) => r.endLocal.getHours() === peakHour);
-  const avgDur =
-    peakRows.length > 0
-      ? peakRows.reduce((s, r) => s + r.durationSec, 0) / peakRows.length
-      : rows.length
-        ? rows.reduce((s, r) => s + r.durationSec, 0) / rows.length
-        : 120;
-
-  const erlang = (peakCalls * avgDur) / 3600;
-  const channels = Math.max(1, Number(document.getElementById("cdr-trunk-size")?.value) || 23);
-  const targetUtil = Math.min(95, Math.max(30, Number(document.getElementById("cdr-target-util")?.value) || 70)) / 100;
-  const util = erlang / channels;
-  const headroom = channels - erlang;
-  const suggested = Math.max(1, Math.ceil(erlang / targetUtil));
-
-  let verdict = "ok";
-  let title = "OK — headroom looks reasonable";
-  let detail = "Peak-hour offered load is within target util of provisioned channels (mock estimate).";
-  if (util >= 0.9) {
-    verdict = "high";
-    title = "Tight / possibly undersized";
-    detail = "Peak offered load is near or above channel count. Consider more trunks or overflow.";
-  } else if (util >= targetUtil) {
-    verdict = "warn";
-    title = "Above target util";
-    detail = "Working hard at busy hour. Watch grade of service; sizing may be tight.";
-  } else if (util < 0.35 && channels > suggested + 8) {
-    verdict = "over";
-    title = "Possibly oversized";
-    detail = "Peak load is low vs members. Trunks may be more than needed (cost / capacity).";
+  showProgress("Monthly hourly", "Listing month files…");
+  try {
+    const files = await apiGet(`cdr/files?from=${from}&to=${to}`);
+    let days = files.days || [];
+    if (!days.length) {
+      // generate all calendar days so progress still moves
+      days = eachDayKey(ymdFromInput(from), ymdFromInput(to));
+    }
+    const hourly = emptyHourly();
+    let total = 0;
+    let filesHit = 0;
+    await scanDays(days, {}, (pct, detail, day) => {
+      setProgress(pct, detail);
+      if (day.fileExists) {
+        filesHit++;
+        addHourly(hourly, day.hourly || emptyHourly());
+        total += (day.hourly || []).reduce((a, b) => a + b, 0);
+      }
+    }, 1);
+    const peak = peakOf(hourly);
+    renderHourChart(document.getElementById("cdr-monthly-chart"), hourly);
+    renderKpis(document.getElementById("cdr-monthly-kpi"), [
+      { label: "Calls (month)", value: total },
+      { label: "Peak hour", value: `${peak.hour}:00 (${peak.count})` },
+      { label: "Files found", value: filesHit },
+      { label: "Days in month", value: last },
+    ]);
+    setProgress(100, "Complete");
+    finishProgress(true, "Monthly chart ready");
+  } catch (e) {
+    finishProgress(false, String(e.message || e));
+    document.getElementById("btn-progress-close").hidden = false;
+  } finally {
+    CDR.busy = false;
   }
-
-  const el = document.getElementById("cdr-size-result");
-  if (!el) return;
-  el.innerHTML = `
-    <div class="size-verdict size-${verdict}">
-      <div class="size-title">${escapeHtml(title)}</div>
-      <div class="size-detail">${escapeHtml(detail)}</div>
-    </div>
-    <div class="cdr-kpi-row">
-      <div class="cdr-kpi"><div class="cdr-kpi-v">${peakHour}:00</div><div class="cdr-kpi-k">Busy hour (mock day)</div></div>
-      <div class="cdr-kpi"><div class="cdr-kpi-v">${peakCalls}</div><div class="cdr-kpi-k">Calls in busy hour</div></div>
-      <div class="cdr-kpi"><div class="cdr-kpi-v">${fmtDur(avgDur)}</div><div class="cdr-kpi-k">Avg talk (busy hour)</div></div>
-      <div class="cdr-kpi"><div class="cdr-kpi-v">${erlang.toFixed(2)}</div><div class="cdr-kpi-k">Offered erlang (approx)</div></div>
-      <div class="cdr-kpi"><div class="cdr-kpi-v">${channels}</div><div class="cdr-kpi-k">Trunk members</div></div>
-      <div class="cdr-kpi"><div class="cdr-kpi-v">${(util * 100).toFixed(0)}%</div><div class="cdr-kpi-k">Load / channels</div></div>
-      <div class="cdr-kpi"><div class="cdr-kpi-v">${headroom.toFixed(1)}</div><div class="cdr-kpi-k">Spare erlang</div></div>
-      <div class="cdr-kpi"><div class="cdr-kpi-v">${suggested}</div><div class="cdr-kpi-k">Suggested members @ target</div></div>
-    </div>
-    <p class="hint size-note">
-      Mock only — not full Erlang-B GoS. When live CDR is on, same UI will use real busy-hour counts.
-      Concurrent peak can exceed this simple offered-load model.
-    </p>
-  `;
 }
 
 function exportCsv() {
-  const rows = CDR.lastSearch.length ? CDR.lastSearch : filterCdr({
-    from: document.getElementById("cdr-from")?.value,
-    to: document.getElementById("cdr-to")?.value,
-  });
-  const header = ["end_time", "dir", "calling", "called", "tg", "duration_sec", "cond", "mock"];
+  const rows = CDR.lastSearch || [];
+  if (!rows.length) {
+    alert("Run Search first.");
+    return;
+  }
+  const header = [
+    "recv_local",
+    "date",
+    "time",
+    "dir",
+    "calling",
+    "called",
+    "code_used",
+    "in_trk",
+    "out_crt",
+    "duration_sec",
+    "cond",
+  ];
   const lines = [header.join(",")];
   for (const r of rows) {
-    const t = r.endLocal;
-    const ts = `${toDateInputValue(t)} ${pad2(t.getHours())}:${pad2(t.getMinutes())}:${pad2(t.getSeconds())}`;
     lines.push(
-      [ts, r.dir, r.calling, r.called, r.tg, r.durationSec, r.cond, "1"]
-        .map((x) => `"${String(x).replace(/"/g, '""')}"`)
+      [
+        r.recvLocal,
+        r.date,
+        r.time,
+        r.dir,
+        r.callingNum || r.clgNum,
+        r.dialedNum,
+        r.codeUsed,
+        r.inTrk,
+        r.outCrt,
+        r.durationSec,
+        r.cond,
+      ]
+        .map((x) => `"${String(x ?? "").replace(/"/g, '""')}"`)
         .join(",")
     );
   }
   const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
-  a.download = `cdr-mock-export-${toDateInputValue(new Date())}.csv`;
+  a.download = `cdr-export-${toDateInputValue(new Date())}.csv`;
   a.click();
   URL.revokeObjectURL(a.href);
 }
 
+async function refreshCdrStatus() {
+  const el = document.getElementById("cdr-status-line");
+  try {
+    const st = await apiGet("cdr/status");
+    if (el) {
+      el.textContent = st.dayCount
+        ? `${st.dayCount} day file(s) · latest ${st.latest}.txt · ${st.cdrDir}`
+        : `No .txt files yet · ${st.cdrDir}`;
+    }
+    document.getElementById("cdr-live-banner")?.classList.remove("warn");
+  } catch (e) {
+    if (el) el.textContent = "API error: " + (e.message || e);
+    document.getElementById("cdr-live-banner")?.classList.add("warn");
+  }
+}
+
 export function initCdrUi() {
-  ensureMock();
   const now = new Date();
-  const from = new Date(now);
-  from.setDate(from.getDate() - 7);
+  const from = addDays(now, -7);
+  const weekStart = addDays(now, -((now.getDay() + 6) % 7)); // Monday-start
 
   const elFrom = document.getElementById("cdr-from");
   const elTo = document.getElementById("cdr-to");
   const elDay = document.getElementById("cdr-day");
+  const elWeek = document.getElementById("cdr-week-start");
   const elMonth = document.getElementById("cdr-month");
   if (elFrom) elFrom.value = toDateInputValue(from);
   if (elTo) elTo.value = toDateInputValue(now);
   if (elDay) elDay.value = toDateInputValue(now);
+  if (elWeek) elWeek.value = toDateInputValue(weekStart);
   if (elMonth) elMonth.value = toMonthInputValue(now);
 
   document.getElementById("btn-cdr-search")?.addEventListener("click", runSearch);
   document.getElementById("btn-cdr-export")?.addEventListener("click", exportCsv);
-  document.getElementById("btn-cdr-size")?.addEventListener("click", recalculateTrunkSize);
-  elDay?.addEventListener("change", () => {
-    refreshDailyChart();
-    recalculateTrunkSize();
-  });
-  elMonth?.addEventListener("change", refreshMonthlyChart);
+  document.getElementById("btn-cdr-calc-daily")?.addEventListener("click", calcDaily);
+  document.getElementById("btn-cdr-calc-weekly")?.addEventListener("click", calcWeekly);
+  document.getElementById("btn-cdr-calc-monthly")?.addEventListener("click", calcMonthly);
+  document.getElementById("btn-progress-close")?.addEventListener("click", () => hideProgress());
 
-  ["cdr-from", "cdr-to", "cdr-calling", "cdr-called", "cdr-trunk", "cdr-dir", "cdr-min-dur"].forEach((id) => {
-    document.getElementById(id)?.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") runSearch();
-    });
-  });
+  // empty charts until Calculate
+  renderHourChart(document.getElementById("cdr-daily-chart"), emptyHourly());
+  renderHourChart(document.getElementById("cdr-weekly-chart"), emptyHourly());
+  renderHourChart(document.getElementById("cdr-monthly-chart"), emptyHourly());
+  renderKpis(document.getElementById("cdr-daily-kpi"), [
+    { label: "Calls (day)", value: "—" },
+    { label: "Peak hour", value: "—" },
+  ]);
+  renderKpis(document.getElementById("cdr-weekly-kpi"), [
+    { label: "Calls (7 days)", value: "—" },
+    { label: "Peak hour", value: "—" },
+  ]);
+  renderKpis(document.getElementById("cdr-monthly-kpi"), [
+    { label: "Calls (month)", value: "—" },
+    { label: "Peak hour", value: "—" },
+  ]);
 
-  runSearch();
-  refreshDailyChart();
-  refreshMonthlyChart();
-  recalculateTrunkSize();
+  refreshCdrStatus();
 }
 
 export function onCdrTabShow() {
-  // refresh charts when user opens tab
-  refreshDailyChart();
-  refreshMonthlyChart();
+  refreshCdrStatus();
 }

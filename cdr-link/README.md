@@ -6,7 +6,7 @@ CM **pushes** CDR to this PC (node **NMC-CDR** → `172.29.92.154`).
 |------|--------|
 | Listen | `0.0.0.0:9000` |
 | Code | `C:\inetpub\wwwroot\CM\cdr-link\` |
-| Daily logs | `C:\inetpub\wwwroot\CM\cdr-link\cdr\YYYYMMDD.TXT` |
+| Daily logs | `C:\inetpub\wwwroot\CM\cdr-link\cdr\YYYYMMDD.txt` (lowercase) |
 | Format | One **call = one line** (pipe-separated) |
 | CM layout | **customized** (fixed 173 bytes / record, from Main CM) |
 
@@ -31,7 +31,7 @@ C:\inetpub\wwwroot\CM\cdr-link\start-cdr-logger-background.bat
 
 ## File format
 
-Filename: `20260808.TXT` (local date when record is received).
+Filename: `20260808.txt` (local date when record is received).
 
 Each data line:
 

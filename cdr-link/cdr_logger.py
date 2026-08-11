@@ -118,7 +118,7 @@ def setup_logging(log_dir: Path) -> None:
 
 def daily_path(log_dir: Path, when: datetime | None = None) -> Path:
     when = when or datetime.now()
-    return log_dir / f"{when.strftime('%Y%m%d')}.TXT"
+    return log_dir / f"{when.strftime('%Y%m%d')}.txt"
 
 
 def parse_custom_record(blob: bytes | str) -> dict[str, str] | None:
@@ -268,47 +268,58 @@ class CdrBuffer:
         return out
 
 
-class CdrHandler(socketserver.StreamRequestHandler):
+class CdrHandler(socketserver.BaseRequestHandler):
     writer: DailyWriter
     cfg: LoggerConfig
 
     def handle(self) -> None:
         peer = self.client_address
+        conn: socket.socket = self.request
         logging.info("CM connected from %s:%s", peer[0], peer[1])
         buf = CdrBuffer()
         count = 0
         try:
-            self.connection.settimeout(300.0)
+            # Long-lived TCP session: CM keeps link open; do not close on idle
+            conn.settimeout(600.0)
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             while True:
                 try:
-                    chunk = self.connection.recv(4096)
+                    chunk = conn.recv(8192)
                 except socket.timeout:
-                    # idle keepalive — stay up for long CM sessions
+                    logging.debug("idle %s:%s (still up)", peer[0], peer[1])
                     continue
                 if not chunk:
                     break
+                logging.info("RX %s bytes from %s:%s", len(chunk), peer[0], peer[1])
                 for rec in buf.feed(chunk):
                     now = datetime.now()
-                    fields = parse_custom_record(rec)
-                    if fields:
-                        line = format_output_line(fields, now)
-                    elif self.cfg.raw_fallback:
-                        raw = rec.decode("ascii", errors="replace").rstrip("\r\n")
-                        if not raw.strip():
+                    try:
+                        fields = parse_custom_record(rec)
+                        if fields:
+                            line = format_output_line(fields, now)
+                        elif self.cfg.raw_fallback:
+                            raw = rec.decode("ascii", errors="replace").rstrip("\r\n")
+                            if not raw.strip():
+                                continue
+                            line = f"{now.strftime('%Y-%m-%d %H:%M:%S')}|{raw}"
+                        else:
                             continue
-                        line = f"{now.strftime('%Y-%m-%d %H:%M:%S')}|{raw}"
-                    else:
-                        continue
-                    self.writer.write_line(line, now)
-                    count += 1
-                    if count == 1 or count % 50 == 0:
-                        logging.info("Records written this connection: %s", count)
+                        self.writer.write_line(line, now)
+                        count += 1
+                        if count == 1 or count % 20 == 0:
+                            logging.info("Records written this connection: %s", count)
+                    except Exception:
+                        logging.exception("record parse/write error; continuing")
         except ConnectionResetError:
             logging.warning("Connection reset by %s", peer)
         except Exception:
             logging.exception("Error handling %s", peer)
         finally:
             logging.info("CM disconnected %s:%s (records=%s)", peer[0], peer[1], count)
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):

@@ -426,6 +426,35 @@ tr.tg-row.drag-over { outline: 1px dashed var(--accent); background: rgba(59, 13
   font-size: 0.78rem;
 }
 
+/* Progress bar (CDR scan / calculate) */
+.progress-bar-wrap {
+  height: 0.65rem;
+  background: #0b1220;
+  border: 1px solid var(--border);
+  border-radius: 99px;
+  overflow: hidden;
+  margin: 0.75rem 0 0.35rem;
+}
+.progress-bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #2563eb, #22d3ee);
+  border-radius: 99px;
+  transition: width 0.2s ease;
+  width: 0%;
+}
+.progress-pct {
+  margin: 0 0 0.5rem;
+  font-size: 1.1rem;
+  font-weight: 700;
+  color: var(--accent-2);
+  text-align: center;
+}
+.cdr-banner.warn {
+  background: rgba(239, 68, 68, 0.12);
+  border-color: rgba(239, 68, 68, 0.4);
+  color: #fca5a5;
+}
+
 /* Login / OSSI progress modal */
 .modal-backdrop {
   position: fixed;

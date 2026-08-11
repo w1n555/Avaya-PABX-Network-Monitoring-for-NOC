@@ -6,6 +6,10 @@ var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddSingleton<OssiBridgeClient>();
 builder.Services.AddHostedService<BridgeWarmupService>();
+builder.Services.ConfigureHttpJsonOptions(o =>
+{
+    o.SerializerOptions.PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase;
+});
 builder.Services.AddCors(o =>
 {
     o.AddDefaultPolicy(p => p
@@ -25,6 +29,7 @@ app.UseCors();
 var siteRoot = Path.GetFullPath(Path.Combine(app.Environment.ContentRootPath, ".."));
 var dataDir = Path.Combine(siteRoot, "data");
 Directory.CreateDirectory(dataDir);
+var cdrFiles = new CmApi.Services.CdrFileService(siteRoot);
 
 app.MapGet("/health", async (OssiBridgeClient bridge, HttpRequest req) =>
 {
@@ -283,6 +288,49 @@ app.MapGet("/trunks/{tg:int}/detail", async (int tg, OssiBridgeClient bridge) =>
         var code = msg.Contains("Not connected", StringComparison.OrdinalIgnoreCase) ? 401 : 502;
         return Results.Json(new { ok = false, error = msg }, statusCode: code);
     }
+});
+
+// ---------- CDR daily files (cdr-link/cdr/YYYYMMDD.txt) ----------
+app.MapGet("/cdr/status", () =>
+{
+    var days = cdrFiles.ListDays(null, null);
+    return Results.Ok(new
+    {
+        ok = true,
+        cdrDir = cdrFiles.CdrDirectory,
+        dayCount = days.Count,
+        days,
+        latest = days.Count > 0 ? days[^1] : null,
+    });
+});
+
+app.MapGet("/cdr/files", (string? from, string? to) =>
+{
+    DateOnly? f = null, t = null;
+    if (!string.IsNullOrWhiteSpace(from) && DateOnly.TryParse(from, out var fd)) f = fd;
+    if (!string.IsNullOrWhiteSpace(to) && DateOnly.TryParse(to, out var td)) t = td;
+    var days = cdrFiles.ListDays(f, t);
+    return Results.Ok(new { ok = true, days, count = days.Count, cdrDir = cdrFiles.CdrDirectory });
+});
+
+// Scan one day — UI calls per-day for progress %
+app.MapGet("/cdr/scan-day", (string date, string? calling, string? called, string? trunk, string? dir, int? minDur, int? maxMatches) =>
+{
+    // date: yyyy-MM-dd or yyyyMMdd
+    var key = date.Replace("-", "").Trim();
+    if (key.Length != 8 || !key.All(char.IsDigit))
+        return Results.BadRequest(new { ok = false, error = "date must be yyyy-MM-dd or yyyyMMdd" });
+
+    var filter = new CmApi.Services.CdrFilter
+    {
+        Calling = calling,
+        Called = called,
+        Trunk = trunk,
+        Dir = dir,
+        MinDur = minDur ?? 0,
+    };
+    var result = cdrFiles.ScanDay(key, filter, maxMatches ?? 500);
+    return Results.Ok(result);
 });
 
 app.Run();

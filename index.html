@@ -22,7 +22,6 @@
       </div>
     </header>
 
-    <!-- Always visible: Login -->
     <section class="connect-panel" id="connect-panel">
       <div class="connect-fields">
         <label>Host <input id="inp-host" value="" placeholder="CM IP / hostname" autocomplete="off" /></label>
@@ -37,7 +36,6 @@
       <div class="error-line" id="error-line" hidden></div>
     </section>
 
-    <!-- Tabs under login — Trunk needs session; CDR UI works with mock data for review -->
     <nav class="tabs" id="main-tabs" role="tablist" aria-label="NOC modules">
       <button type="button" class="tab active" data-tab="trunk" role="tab" aria-selected="true">Trunk</button>
       <button type="button" class="tab" data-tab="cdr" role="tab" aria-selected="false">CDR</button>
@@ -46,7 +44,6 @@
       <button type="button" class="tab disabled" data-tab="alarm" disabled title="Coming soon" role="tab">Alarm <span class="soon">soon</span></button>
     </nav>
 
-    <!-- TRUNK TAB: single card -->
     <main class="main" id="panel-trunk" data-panel="trunk">
       <section class="card trunk-card" id="trunk-card">
         <div class="panel-head">
@@ -64,14 +61,11 @@
             </div>
           </div>
         </div>
-
         <div class="admin-row add-row">
           <input type="number" id="inp-tg" min="1" max="9999" placeholder="TG #" />
           <input type="text" id="inp-tg-note" maxlength="200" placeholder="Note（可選）" />
           <button type="button" class="btn btn-primary" id="btn-add-tg">Add</button>
         </div>
-
-        <!-- List view -->
         <div id="trunk-list-view">
           <div class="table-wrap">
             <table class="data-table" id="trunk-table">
@@ -97,8 +91,6 @@
             </table>
           </div>
         </div>
-
-        <!-- Detail view (channel rows from status trunk N) -->
         <div id="trunk-detail-view" class="detail-view" hidden>
           <div class="detail-head">
             <button type="button" class="btn" id="btn-detail-back">← 返回清單</button>
@@ -127,19 +119,19 @@
       </section>
     </main>
 
-    <!-- CDR TAB: UI preview with mock data (real CM CDR later) -->
+    <!-- CDR TAB: real files from cdr-link/cdr -->
     <main class="main hidden" id="panel-cdr" data-panel="cdr">
-      <div class="cdr-banner" id="cdr-mock-banner">
-        <strong>UI preview · Mock data</strong>
-        — Not connected to CM CDR yet. Charts use simulated calls for layout / trunk sizing review.
+      <div class="cdr-banner" id="cdr-live-banner">
+        <strong>Live CDR files</strong>
+        — Source: <code>cdr-link/cdr/YYYYMMDD.txt</code>
+        · <span id="cdr-status-line">Checking…</span>
       </div>
 
-      <!-- Search -->
       <section class="card cdr-card">
         <div class="panel-head">
           <div>
             <h2>CDR Search</h2>
-            <p class="hint">Search call records (mock). Later: scan daily text logs from CDR logger :9000.</p>
+            <p class="hint">Search real daily logs (one file per day). Progress popup while scanning files.</p>
           </div>
           <div class="card-actions">
             <button type="button" class="btn" id="btn-cdr-export">Export CSV</button>
@@ -150,8 +142,8 @@
           <label>From <input type="date" id="cdr-from" /></label>
           <label>To <input type="date" id="cdr-to" /></label>
           <label>Calling <input type="text" id="cdr-calling" placeholder="e.g. 2123" /></label>
-          <label>Called <input type="text" id="cdr-called" placeholder="e.g. 8529…" /></label>
-          <label>Trunk / TG <input type="text" id="cdr-trunk" placeholder="e.g. 1 or TG1" /></label>
+          <label>Called <input type="text" id="cdr-called" placeholder="dialed number" /></label>
+          <label>Trunk / code <input type="text" id="cdr-trunk" placeholder="e.g. 1401 / TAC" /></label>
           <label>Direction
             <select id="cdr-dir">
               <option value="">All</option>
@@ -166,82 +158,72 @@
           <table class="data-table" id="cdr-result-table">
             <thead>
               <tr>
-                <th>End time</th>
+                <th>Recv time</th>
+                <th>CDR time</th>
                 <th>Dir</th>
                 <th>Calling</th>
                 <th>Called</th>
-                <th>TG</th>
+                <th>Code/Trk</th>
                 <th>Duration</th>
                 <th>Cond</th>
               </tr>
             </thead>
             <tbody id="cdr-result-tbody">
-              <tr class="empty"><td colspan="7">Run Search to list mock records.</td></tr>
+              <tr class="empty"><td colspan="8">Set date range and click Search.</td></tr>
             </tbody>
           </table>
         </div>
       </section>
 
-      <!-- Daily hourly -->
+      <!-- Daily -->
       <section class="card cdr-card">
         <div class="panel-head">
           <div>
             <h2>Daily · Hourly number of calls</h2>
-            <p class="hint">Calls ending in each hour on the selected day (0–23). Peak hour helps size trunks.</p>
+            <p class="hint">Calls per hour (0–23) for the selected day. Click Calculate to scan that day's file.</p>
           </div>
           <div class="card-actions">
             <label class="cdr-inline-label">Day <input type="date" id="cdr-day" /></label>
+            <button type="button" class="btn btn-primary" id="btn-cdr-calc-daily">Calculate</button>
           </div>
         </div>
         <div class="cdr-kpi-row" id="cdr-daily-kpi"></div>
         <div class="hour-chart" id="cdr-daily-chart" aria-label="Daily hourly chart"></div>
-        <div class="hour-axis">
-          <span>0</span><span>6</span><span>12</span><span>18</span><span>23</span>
-        </div>
+        <div class="hour-axis"><span>0</span><span>6</span><span>12</span><span>18</span><span>23</span></div>
       </section>
 
-      <!-- Monthly hourly -->
+      <!-- Weekly -->
+      <section class="card cdr-card">
+        <div class="panel-head">
+          <div>
+            <h2>Weekly · Hourly number of calls</h2>
+            <p class="hint">Sum of hourly calls across 7 days starting from the selected week start date.</p>
+          </div>
+          <div class="card-actions">
+            <label class="cdr-inline-label">Week start <input type="date" id="cdr-week-start" /></label>
+            <button type="button" class="btn btn-primary" id="btn-cdr-calc-weekly">Calculate</button>
+          </div>
+        </div>
+        <div class="cdr-kpi-row" id="cdr-weekly-kpi"></div>
+        <div class="hour-chart" id="cdr-weekly-chart" aria-label="Weekly hourly chart"></div>
+        <div class="hour-axis"><span>0</span><span>6</span><span>12</span><span>18</span><span>23</span></div>
+      </section>
+
+      <!-- Monthly -->
       <section class="card cdr-card">
         <div class="panel-head">
           <div>
             <h2>Monthly · Hourly number of calls</h2>
-            <p class="hint">Total calls per clock-hour across the selected month (profile of busy hours).</p>
+            <p class="hint">Total calls per clock-hour across all daily files in the selected month.</p>
           </div>
           <div class="card-actions">
             <label class="cdr-inline-label">Month <input type="month" id="cdr-month" /></label>
+            <button type="button" class="btn btn-primary" id="btn-cdr-calc-monthly">Calculate</button>
           </div>
         </div>
         <div class="cdr-kpi-row" id="cdr-monthly-kpi"></div>
         <div class="hour-chart" id="cdr-monthly-chart" aria-label="Monthly hourly chart"></div>
-        <div class="hour-axis">
-          <span>0</span><span>6</span><span>12</span><span>18</span><span>23</span>
-        </div>
-      </section>
-
-      <!-- Trunk sizing helper -->
-      <section class="card cdr-card">
-        <div class="panel-head">
-          <div>
-            <h2>Trunk size check <span class="badge-mock">estimate</span></h2>
-            <p class="hint">
-              Rough busy-hour load vs channels. Uses mock peak hour + average duration.
-              Formula: offered erlang ≈ (calls_in_busy_hour × avg_talk_sec) / 3600.
-              Compare to trunk members (Total channels).
-            </p>
-          </div>
-        </div>
-        <div class="cdr-size-grid">
-          <label>Trunk members (channels)
-            <input type="number" id="cdr-trunk-size" min="1" value="23" />
-          </label>
-          <label>Target busy-hour util %
-            <input type="number" id="cdr-target-util" min="30" max="95" value="70" />
-          </label>
-          <button type="button" class="btn btn-primary" id="btn-cdr-size">Recalculate</button>
-        </div>
-        <div class="cdr-size-result" id="cdr-size-result">
-          <!-- filled by JS -->
-        </div>
+        <div class="hour-axis"><span>0</span><span>6</span><span>12</span><span>18</span><span>23</span></div>
       </section>
     </main>
 
@@ -256,11 +238,11 @@
     </main>
 
     <footer class="footer">
-      Data via <strong>avaya-ossi</strong> · Trunk: OSSI RO · CDR tab: mock UI (live logger later) · Close page disconnects OSSI
+      Trunk: OSSI RO · CDR: daily files under <code>cdr-link/cdr</code> · Close page disconnects OSSI
     </footer>
   </div>
 
-  <!-- Login progress modal (English, coarse steps for multi-page future) -->
+  <!-- Login progress modal -->
   <div class="modal-backdrop" id="login-modal" hidden>
     <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="login-modal-title">
       <div class="modal-head">
@@ -276,6 +258,25 @@
       <p class="modal-detail mono" id="login-modal-detail"></p>
       <div class="modal-actions">
         <button type="button" class="btn" id="btn-login-modal-close" hidden>Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Generic progress modal (CDR search / calculate) -->
+  <div class="modal-backdrop" id="progress-modal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="progress-modal-title">
+      <div class="modal-head">
+        <h3 id="progress-modal-title">Working…</h3>
+        <span class="modal-spinner" id="progress-modal-spinner" aria-hidden="true"></span>
+      </div>
+      <p class="modal-sub" id="progress-modal-sub">Please wait…</p>
+      <div class="progress-bar-wrap">
+        <div class="progress-bar-fill" id="progress-bar-fill" style="width:0%"></div>
+      </div>
+      <p class="progress-pct mono" id="progress-pct">0%</p>
+      <p class="modal-detail mono" id="progress-modal-detail"></p>
+      <div class="modal-actions">
+        <button type="button" class="btn" id="btn-progress-close" hidden>Close</button>
       </div>
     </div>
   </div>

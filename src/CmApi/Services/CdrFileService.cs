@@ -92,10 +92,12 @@ public sealed class CdrFileService
                     continue;
 
                 totalInFile++;
-                if (rec.ParseOk)
-                    parseOk++;
+                if (!rec.ParseOk)
+                    continue; // skip keep-alives / half-lines
 
-                // hourly counts use all parseable records (for charts)
+                parseOk++;
+
+                // hourly counts only well-parsed CDR
                 if (rec.Hour is >= 0 and <= 23)
                     hourly[rec.Hour]++;
 

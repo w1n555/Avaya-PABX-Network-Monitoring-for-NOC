@@ -709,6 +709,25 @@ tr.tg-row.drag-over { outline: 1px dashed var(--accent); background: rgba(59, 13
   margin-left: 0.35rem;
   vertical-align: middle;
 }
+.countdown-line {
+  margin: 0.35rem 0 0;
+  font-size: 0.88rem;
+  font-family: var(--mono);
+  color: var(--accent-2);
+  font-weight: 600;
+}
+.countdown-line.is-updating {
+  color: var(--warn);
+}
+.btn-rm.is-loading,
+.btn.is-loading {
+  opacity: 0.55;
+  pointer-events: none;
+  position: relative;
+}
+tr.tg-row.row-updating td:not(.col-drag):not(.col-note) {
+  opacity: 0.65;
+}
 .size-verdict {
   border-radius: 8px;
   padding: 0.75rem 0.9rem;

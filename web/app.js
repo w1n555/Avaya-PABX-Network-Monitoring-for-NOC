@@ -3,9 +3,17 @@
  * OSSI via /CM/api · trunk_data.json + monitored_trunks.json
  */
 
-import { initCdrUi, onCdrTabShow } from "./cdr-ui.js";
+import {
+  initCdrUi,
+  onCdrTabShow,
+  showProgress,
+  setProgress,
+  hideProgress,
+  finishProgress,
+} from "./cdr-ui.js";
 
 const API = "api";
+const REFRESH_INTERVAL_SEC = 60;
 
 const $ = (id) => document.getElementById(id);
 
@@ -13,6 +21,7 @@ const state = {
   connected: false,
   timer: null,
   heartbeatTimer: null,
+  countdownTimer: null,
   /** Fast poll of trunk_data while progressive OSSI status runs */
   livePollTimer: null,
   /** @type {{tg:number,order:number,note:string}[]} */
@@ -22,6 +31,10 @@ const state = {
   disconnecting: false,
   detailTg: null,
   dragTg: null,
+  /** epoch ms when next auto progressive refresh should fire */
+  nextRefreshAt: 0,
+  refreshing: false,
+  activeTab: "trunk",
 };
 
 function apiUrl(path) {
@@ -203,7 +216,7 @@ function renderTrunkTable() {
 
     tr.innerHTML = `
       <td class="col-drag"><span class="drag-handle" title="拖曳排序">⋮⋮</span></td>
-      <td class="tg-cell"><button type="button" class="link-tg" data-open="${it.tg}">TG ${it.tg}</button></td>
+      <td class="tg-cell"><button type="button" class="link-tg" data-open="${it.tg}" title="Open detail">${it.tg}</button></td>
       <td class="col-note"><input type="text" class="note-input" data-note-tg="${it.tg}" maxlength="200" value="${escapeHtml(
         it.note || ""
       )}" placeholder="Note…" /></td>
@@ -229,13 +242,74 @@ function renderTrunkTable() {
           ? `<span class="badge ${color}"><span class="dot"></span>${color}</span>`
           : `<span class="badge muted">—</span>`
       }</td>
-      <td>${fmtTime(it.lastUpdate)}</td>
+      <td class="mono col-updated" data-updated-tg="${it.tg}">${fmtTime(it.lastUpdate)}</td>
       <td><button type="button" class="btn btn-danger btn-rm" data-rm="${it.tg}">Remove</button></td>
     `;
     tbody.appendChild(tr);
   }
 
   bindRowInteractions(tbody);
+}
+
+/** Merge one TG status item into state and repaint table (row-by-row updates). */
+function applyOneTrunkItem(item) {
+  if (!item || item.tg == null) return;
+  const tg = Number(item.tg);
+  const idx = state.trunkItems.findIndex((x) => Number(x.tg) === tg);
+  if (idx >= 0) state.trunkItems[idx] = { ...state.trunkItems[idx], ...item };
+  else state.trunkItems.push(item);
+  // Prefer full list from server when provided
+  renderTrunkTable();
+}
+
+function paintCountdown() {
+  const el = $("trunk-countdown");
+  if (!el) return;
+  if (!state.connected) {
+    el.textContent = "Next update: — (login required)";
+    el.classList.remove("is-updating");
+    return;
+  }
+  if (!$("chk-auto")?.checked) {
+    el.textContent = "Next update: Auto off";
+    el.classList.remove("is-updating");
+    return;
+  }
+  if (state.refreshing) {
+    el.textContent = "Updating now… (per TG)";
+    el.classList.add("is-updating");
+    return;
+  }
+  if (!state.nextRefreshAt) {
+    el.textContent = "Next update: —";
+    el.classList.remove("is-updating");
+    return;
+  }
+  const sec = Math.max(0, Math.ceil((state.nextRefreshAt - Date.now()) / 1000));
+  el.textContent = `Next update in ${sec}s`;
+  el.classList.remove("is-updating");
+}
+
+function startCountdownClock() {
+  if (state.countdownTimer) return;
+  state.countdownTimer = setInterval(() => {
+    paintCountdown();
+    if (
+      state.connected &&
+      $("chk-auto")?.checked &&
+      !state.refreshing &&
+      state.nextRefreshAt > 0 &&
+      Date.now() >= state.nextRefreshAt &&
+      state.activeTab === "trunk"
+    ) {
+      progressiveRefresh({ reason: "auto" });
+    }
+  }, 250);
+}
+
+function armNextRefresh(fromNowSec = REFRESH_INTERVAL_SEC) {
+  state.nextRefreshAt = Date.now() + fromNowSec * 1000;
+  paintCountdown();
 }
 
 function bindRowInteractions(tbody) {
@@ -486,54 +560,65 @@ async function openDetail(tg) {
   state.detailTg = tg;
   $("trunk-list-view").hidden = true;
   $("trunk-detail-view").hidden = false;
-  $("detail-title").textContent = `TG ${tg}`;
+  $("detail-title").textContent = `${tg}`;
   $("detail-meta").textContent = "Loading…";
   $("detail-tbody").innerHTML = `<tr class="empty"><td colspan="5">Loading…</td></tr>`;
-  await loadDetail(tg);
+
+  showProgress("Loading trunk detail", `status trunk ${tg}…`);
+  let fake = 8;
+  const tick = setInterval(() => {
+    fake = Math.min(88, fake + 7);
+    setProgress(fake, `status trunk ${tg}…`);
+  }, 280);
+  try {
+    await loadDetail(tg);
+    setProgress(100, "Done");
+    finishProgress(true, `TG ${tg} detail loaded`);
+  } catch (e) {
+    finishProgress(false, String(e.message || e));
+    const btn = $("btn-progress-close");
+    if (btn) btn.hidden = false;
+  } finally {
+    clearInterval(tick);
+  }
 }
 
 async function loadDetail(tg) {
-  try {
-    const res = await api(`trunks/${tg}/detail`);
-    const mon = state.monitored.find((m) => m.tg === tg);
-    const note = (res.note || (mon && mon.note) || "").trim();
-    $("detail-title").textContent = `TG ${tg}${res.name ? " · " + res.name : ""}`;
-    $("detail-meta").textContent = [
-      res.type ? res.type : "",
-      res.tac ? "TAC " + res.tac : "",
-      note ? "Note: " + note : "",
-      res.counts
-        ? `Total ${res.counts.total ?? "—"} · Idle ${res.counts.idle ?? "—"} · Busy ${res.counts.busy ?? "—"}`
-        : "",
-    ]
-      .filter(Boolean)
-      .join(" · ");
+  const res = await api(`trunks/${tg}/detail`);
+  const mon = state.monitored.find((m) => m.tg === tg);
+  const note = (res.note || (mon && mon.note) || "").trim();
+  $("detail-title").textContent = `${tg}${res.name ? " · " + res.name : ""}`;
+  $("detail-meta").textContent = [
+    res.type ? res.type : "",
+    res.tac ? "TAC " + res.tac : "",
+    note ? "Note: " + note : "",
+    res.counts
+      ? `Total ${res.counts.total ?? "—"} · Idle ${res.counts.idle ?? "—"} · Busy ${res.counts.busy ?? "—"}`
+      : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
 
-    const channels = res.channels || [];
-    const tbody = $("detail-tbody");
-    if (!channels.length) {
-      tbody.innerHTML = `<tr class="empty"><td colspan="5">${
-        res.error || "無 channel 資料（或 parse 唔到）。"
-      }</td></tr>`;
-      return;
-    }
-    tbody.innerHTML = "";
-    for (const ch of channels) {
-      const tr = document.createElement("tr");
-      const busy = String(ch.busy || "").toLowerCase() === "yes";
-      tr.innerHTML = `
-        <td class="mono">${escapeHtml(ch.member || "")}</td>
-        <td class="mono">${escapeHtml(ch.port || "—")}</td>
-        <td>${escapeHtml(ch.state || "—")}</td>
-        <td>${busy ? '<span class="badge yellow"><span class="dot"></span>yes</span>' : "no"}</td>
-        <td class="mono">${escapeHtml(ch.connected || "—")}</td>
-      `;
-      tbody.appendChild(tr);
-    }
-  } catch (e) {
-    $("detail-tbody").innerHTML = `<tr class="empty"><td colspan="5">${escapeHtml(
-      String(e.message || e)
-    )}</td></tr>`;
+  const channels = res.channels || [];
+  const tbody = $("detail-tbody");
+  if (!channels.length) {
+    tbody.innerHTML = `<tr class="empty"><td colspan="5">${
+      res.error || "無 channel 資料（或 parse 唔到）。"
+    }</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = "";
+  for (const ch of channels) {
+    const tr = document.createElement("tr");
+    const busy = String(ch.busy || "").toLowerCase() === "yes";
+    tr.innerHTML = `
+      <td class="mono">${escapeHtml(ch.member || "")}</td>
+      <td class="mono">${escapeHtml(ch.port || "—")}</td>
+      <td>${escapeHtml(ch.state || "—")}</td>
+      <td>${busy ? '<span class="badge yellow"><span class="dot"></span>yes</span>' : "no"}</td>
+      <td class="mono">${escapeHtml(ch.connected || "—")}</td>
+    `;
+    tbody.appendChild(tr);
   }
 }
 
@@ -611,10 +696,11 @@ async function connect() {
     setLoginStep(3, "done", "Monitoring active · live row updates · close page to disconnect");
     setStatus("Logged in. Keep this page open to monitor. Close tab disconnects OSSI.");
     $("chk-auto").checked = true;
-    scheduleAuto();
     startHeartbeat();
-    startLivePoll();
-    hideLoginModal(700);
+    startCountdownClock();
+    // Immediate progressive status for this page, then 60s countdown
+    hideLoginModal(400);
+    await progressiveRefresh({ reason: "login", showModal: false });
   } catch (e) {
     state.connected = false;
     const msg = String(e.message || e);
@@ -705,27 +791,88 @@ async function disconnect() {
   applyUiMode();
 }
 
-async function refreshNow() {
-  setStatus("Refreshing… each TG updates as soon as status trunk N returns");
-  setError("");
-  try {
-    // Fire full progressive refresh (server writes after each TG); UI live-poll paints rows
-    const refreshPromise = api("refresh", { method: "POST", body: "{}" });
-    // Meanwhile poll while refresh runs
-    const poll = setInterval(() => loadTrunkData({ soft: true }), 1200);
-    try {
-      await refreshPromise;
-    } finally {
-      clearInterval(poll);
-    }
-    await loadTrunkData({ soft: true });
-    if (state.detailTg) await loadDetail(state.detailTg);
-    setStatus("Refresh complete.");
-  } catch (e) {
-    // Keep existing rows on failure
-    setError(String(e.message || e));
-    await loadTrunkData({ soft: true });
+/**
+ * Refresh each monitored TG one-by-one via /refresh/one so Updated column
+ * advances per row (does not wait for full list).
+ */
+async function progressiveRefresh(opts = {}) {
+  const showModal = opts.showModal !== false;
+  const reason = opts.reason || "refresh";
+  if (!state.connected || state.refreshing) return;
+  if (!state.monitored.length) {
+    armNextRefresh(REFRESH_INTERVAL_SEC);
+    return;
   }
+
+  state.refreshing = true;
+  paintCountdown();
+  setError("");
+  const list = state.monitored.map((m) => m.tg);
+  const n = list.length;
+  if (showModal) showProgress("Updating trunks", `0 / ${n} · status trunk…`);
+
+  try {
+    for (let i = 0; i < list.length; i++) {
+      const tg = list[i];
+      const pct = ((i + 0.2) / n) * 100;
+      if (showModal) setProgress(pct, `status trunk ${tg}  (${i + 1}/${n})`);
+      setStatus(`Updating TG ${tg}… (${i + 1}/${n})`);
+
+      // mark row visually
+      const tr = document.querySelector(`tr.tg-row[data-tg="${tg}"]`);
+      if (tr) tr.classList.add("row-updating");
+
+      try {
+        const res = await api("refresh/one", {
+          method: "POST",
+          body: JSON.stringify({ tg }),
+        });
+        if (res.item) applyOneTrunkItem(res.item);
+        else if (res.data && Array.isArray(res.data.items)) {
+          state.trunkItems = res.data.items;
+          renderTrunkTable();
+        } else {
+          await loadTrunkData({ soft: true });
+        }
+      } catch (e) {
+        console.warn("refresh/one", tg, e);
+        // keep previous row; continue others
+      } finally {
+        const tr2 = document.querySelector(`tr.tg-row[data-tg="${tg}"]`);
+        if (tr2) tr2.classList.remove("row-updating");
+      }
+
+      if (showModal) setProgress(((i + 1) / n) * 100, `Done TG ${tg}  (${i + 1}/${n})`);
+    }
+
+    if (state.detailTg) {
+      try {
+        await loadDetail(state.detailTg);
+      } catch {
+        /* ignore */
+      }
+    }
+    setStatus(reason === "auto" ? "Auto update complete." : "Refresh complete.");
+    if (showModal) {
+      setProgress(100, "All trunks updated");
+      finishProgress(true, "Trunk status updated");
+    }
+  } catch (e) {
+    setError(String(e.message || e));
+    if (showModal) {
+      finishProgress(false, String(e.message || e));
+      const btn = $("btn-progress-close");
+      if (btn) btn.hidden = false;
+    }
+  } finally {
+    state.refreshing = false;
+    armNextRefresh(REFRESH_INTERVAL_SEC);
+  }
+}
+
+async function refreshNow() {
+  setError("");
+  await progressiveRefresh({ reason: "manual", showModal: true });
 }
 
 async function addTg() {
@@ -736,6 +883,8 @@ async function addTg() {
     return;
   }
   setError("");
+  showProgress("Add trunk", `Adding TG ${tg}…`);
+  setProgress(20, "Saving list…");
   try {
     const res = await api("monitored/add", {
       method: "POST",
@@ -744,22 +893,62 @@ async function addTg() {
     applyMonitoredResponse(res);
     $("inp-tg").value = "";
     $("inp-tg-note").value = "";
-    if (state.connected) await loadTrunkData();
-    else renderTrunkTable();
+    renderTrunkTable();
+    setProgress(60, `status trunk ${tg}…`);
+    if (state.connected) {
+      try {
+        const one = await api("refresh/one", {
+          method: "POST",
+          body: JSON.stringify({ tg }),
+        });
+        if (one.item) applyOneTrunkItem(one.item);
+        else await loadTrunkData({ soft: true });
+      } catch {
+        await loadTrunkData({ soft: true });
+      }
+    }
+    setProgress(100, "Done");
+    finishProgress(true, `TG ${tg} added`);
+    armNextRefresh(REFRESH_INTERVAL_SEC);
   } catch (e) {
+    finishProgress(false, String(e.message || e));
+    const btn = $("btn-progress-close");
+    if (btn) btn.hidden = false;
     setError(String(e.message || e));
   }
 }
 
 async function removeTg(tg) {
+  const btn = document.querySelector(`.btn-rm[data-rm="${tg}"]`);
+  if (btn) {
+    btn.classList.add("is-loading");
+    btn.disabled = true;
+    btn.textContent = "…";
+  }
+  showProgress("Remove trunk", `Removing TG ${tg}…`);
+  setProgress(30, "Updating list…");
   try {
-    const res = await api("monitored/remove", { method: "POST", body: JSON.stringify({ tg }) });
+    const res = await api("monitored/remove", {
+      method: "POST",
+      body: JSON.stringify({ tg }),
+    });
     applyMonitoredResponse(res);
+    // Immediate UI remove (do not wait for full trunk-data reload)
+    state.trunkItems = state.trunkItems.filter((x) => Number(x.tg) !== Number(tg));
     if (state.detailTg === tg) closeDetail();
-    if (state.connected) await loadTrunkData();
-    else renderTrunkTable();
+    renderTrunkTable();
+    setProgress(100, "Removed");
+    finishProgress(true, `TG ${tg} removed`);
   } catch (e) {
+    finishProgress(false, String(e.message || e));
+    const b = $("btn-progress-close");
+    if (b) b.hidden = false;
     setError(String(e.message || e));
+    if (btn) {
+      btn.classList.remove("is-loading");
+      btn.disabled = false;
+      btn.textContent = "Remove";
+    }
   }
 }
 
@@ -768,29 +957,26 @@ function clearAuto() {
     clearInterval(state.timer);
     state.timer = null;
   }
+  state.nextRefreshAt = 0;
+  paintCountdown();
 }
 
 function scheduleAuto() {
-  clearAuto();
-  if (!$("chk-auto").checked) return;
-  // UI only re-reads progressive trunk_data; server auto-loop does status trunk N every 60s
-  state.timer = setInterval(async () => {
-    if (!state.connected) return;
-    await loadTrunkData({ soft: true });
-    if (state.detailTg) {
-      try {
-        await loadDetail(state.detailTg);
-      } catch {
-        /* ignore */
-      }
-    }
-  }, 5000);
+  // Countdown-driven progressive refresh (see startCountdownClock)
+  if (!$("chk-auto")?.checked) {
+    clearAuto();
+    return;
+  }
+  startCountdownClock();
+  if (!state.nextRefreshAt) armNextRefresh(REFRESH_INTERVAL_SEC);
+  paintCountdown();
 }
 
 function bindTabs() {
   document.querySelectorAll(".tab:not(.disabled)").forEach((btn) => {
     btn.addEventListener("click", () => {
       const name = btn.dataset.tab;
+      state.activeTab = name;
       document.querySelectorAll(".tab").forEach((t) => {
         t.classList.toggle("active", t === btn);
         t.setAttribute("aria-selected", t === btn ? "true" : "false");
@@ -804,6 +990,10 @@ function bindTabs() {
         } catch {
           /* ignore */
         }
+      }
+      // Jump back to Trunk tab → refresh this page's data now, then 60s countdown
+      if (name === "trunk" && state.connected && $("chk-auto")?.checked) {
+        progressiveRefresh({ reason: "tab", showModal: true });
       }
     });
   });
@@ -838,13 +1028,28 @@ async function init() {
     if (e.key === "Enter") addTg();
   });
   $("chk-auto").addEventListener("change", () => {
-    if (state.connected) scheduleAuto();
-    else clearAuto();
+    if (state.connected && $("chk-auto").checked) {
+      // Turn auto on → update now, then 60s
+      progressiveRefresh({ reason: "auto-on", showModal: true });
+    } else {
+      clearAuto();
+    }
   });
+
+  const progClose = $("btn-progress-close");
+  if (progClose) progClose.addEventListener("click", () => hideProgress());
 
   window.addEventListener("pagehide", disconnectOnPageClose);
   window.addEventListener("beforeunload", disconnectOnPageClose);
 
+  // Browser tab focus: when user returns to this page, refresh trunk view
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && state.connected && state.activeTab === "trunk" && $("chk-auto")?.checked) {
+      progressiveRefresh({ reason: "visible", showModal: false });
+    }
+  });
+
+  startCountdownClock();
   applyUiMode();
 
   // Soft init: bridge down must not freeze the page (502 on /monitored)
@@ -857,9 +1062,10 @@ async function init() {
         $("meta-host").textContent = st.host || "—";
         setSessionLabel("Monitoring (OSSI)", true);
         applyUiMode();
-        scheduleAuto();
         startHeartbeat();
-        startLivePoll();
+        startCountdownClock();
+        // Resume: refresh this view now then arm 60s
+        progressiveRefresh({ reason: "resume", showModal: false });
       } else {
         state.connected = false;
         setSessionLabel("Disconnected", false);

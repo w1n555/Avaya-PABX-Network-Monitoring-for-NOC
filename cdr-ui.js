@@ -71,8 +71,8 @@ const CDR = {
   busy: false,
 };
 
-/* ---------- progress modal ---------- */
-function showProgress(title, sub) {
+/* ---------- progress modal (shared with Trunk tab) ---------- */
+export function showProgress(title, sub) {
   const m = document.getElementById("progress-modal");
   if (!m) return;
   m.hidden = false;
@@ -85,7 +85,7 @@ function showProgress(title, sub) {
   document.getElementById("btn-progress-close").hidden = true;
 }
 
-function setProgress(pct, detail) {
+export function setProgress(pct, detail) {
   const p = Math.max(0, Math.min(100, Math.round(pct)));
   const fill = document.getElementById("progress-bar-fill");
   const label = document.getElementById("progress-pct");
@@ -97,7 +97,7 @@ function setProgress(pct, detail) {
   }
 }
 
-function hideProgress(delayMs = 0) {
+export function hideProgress(delayMs = 0) {
   const m = document.getElementById("progress-modal");
   if (!m) return;
   const go = () => {
@@ -107,13 +107,15 @@ function hideProgress(delayMs = 0) {
   else go();
 }
 
-function finishProgress(ok, message) {
-  document.getElementById("progress-modal-spinner").className = ok
-    ? "modal-spinner done"
-    : "modal-spinner fail";
-  document.getElementById("progress-modal-sub").textContent = message || (ok ? "Done" : "Failed");
-  if (!ok) document.getElementById("btn-progress-close").hidden = false;
-  else hideProgress(500);
+export function finishProgress(ok, message) {
+  const spin = document.getElementById("progress-modal-spinner");
+  const sub = document.getElementById("progress-modal-sub");
+  if (spin) spin.className = ok ? "modal-spinner done" : "modal-spinner fail";
+  if (sub) sub.textContent = message || (ok ? "Done" : "Failed");
+  if (!ok) {
+    const btn = document.getElementById("btn-progress-close");
+    if (btn) btn.hidden = false;
+  } else hideProgress(500);
 }
 
 function renderHourChart(el, counts) {

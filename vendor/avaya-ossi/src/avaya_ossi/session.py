@@ -22,6 +22,8 @@ from paramiko.channel import Channel
 from avaya_ossi.config import SessionConfig
 from avaya_ossi.io import (
     channel_alive,
+    drain_pending,
+    drain_until_quiet,
     looks_like_prompt,
     ossi_has_error,
     recv_for,
@@ -141,12 +143,17 @@ class OssiSession:
         *,
         retry_on_error: bool = True,
         max_more_pages: int | None = None,
+        form_fields: list[str] | None = None,
     ) -> CommandResult:
         """
         Run one RO OSSI command.
 
         max_more_pages: override cfg cap for this call (e.g. sample first pages
         of a huge list station). When cap hit, sends ``n`` to stop more?[y].
+
+        form_fields: optional OSSI form values after ``c`` and before ``t``.
+        Each entry is a field payload without the leading ``f`` (e.g. ``0001y``)
+        or a full ``f…`` line. Used by form commands like ``display alarms``.
         """
         cmd = assert_readonly_command(command)
         with self._lock:
@@ -154,6 +161,7 @@ class OssiSession:
                 cmd,
                 retry_on_error=retry_on_error,
                 max_more_pages=max_more_pages,
+                form_fields=form_fields,
             )
 
     def touch(self) -> None:
@@ -283,23 +291,49 @@ class OssiSession:
             )
 
     def _run_command_unlocked(
-        self, command: str, *, max_more_pages: int
+        self,
+        command: str,
+        *,
+        max_more_pages: int,
+        form_fields: list[str] | None = None,
     ) -> tuple[str, int, bool]:
         chan = self._chan
         if chan is None:
             raise RuntimeError("No channel")
 
-        _ = recv_for(chan, timeout=0.5, idle=0.3)
+        # Clear residual more?/d-lines from previous list (desync poison)
+        _ = drain_until_quiet(chan, max_wait=2.0, quiet=0.35, stop_more=True)
         send_line(chan, f"c{command}")
         time.sleep(0.15)
+        # Form commands (display alarms): wait for form, then ONE packed f-line, then t.
+        # FID must be 4 digits (0001y). Short "1y" → CM "not a valid FID format".
+        form_prefix = ""
+        if form_fields:
+            # Wait for input form (short idle). Then f<FID><TAB><value> per field.
+            # This CM rejects "0001n" as FID — value MUST be tab-separated.
+            form_prefix = recv_for(chan, timeout=3.0, idle=0.35)
+            for raw in form_fields:
+                s = (raw or "").strip()
+                if not s:
+                    continue
+                if s.lower().startswith("f"):
+                    s = s[1:]
+                m = re.match(r"^([0-9A-Fa-f]{4})[\t ]*(.*)$", s)
+                if m:
+                    fid, val = m.group(1), m.group(2)
+                    send_line(chan, f"f{fid}\t{val}")
+                else:
+                    send_line(chan, "f" + s)
+                time.sleep(0.03)
+            time.sleep(0.08)
         send_line(chan, "t")
 
-        chunks: list[str] = []
+        chunks: list[str] = [form_prefix] if form_prefix else []
         deadline = time.monotonic() + self.cfg.read_timeout
-        idle = 1.2
         last = time.monotonic()
+        last_more_at = 0.0
+        last_answered_more_end = 0
         more_pages = 0
-        answered_upto = 0
         truncated = False
         chan.settimeout(0.35)
 
@@ -313,35 +347,47 @@ class OssiSession:
                     chunks.append(data)
                     last = time.monotonic()
                     joined = strip_ansi("".join(chunks))
-                    prompts = list(re.finditer(r"more\?\s*\[y\]", joined, re.I))
-                    while len(prompts) > answered_upto:
+                    # CM often sends "more?[y]\\nd00\\nt" in ONE chunk — more? is not at EOL.
+                    # Answer every new more?[y] by position (do not require EOL).
+                    for m in re.finditer(r"more\?\s*\[y\]", joined, re.I):
+                        if m.end() <= last_answered_more_end:
+                            continue
                         if more_pages >= max_more_pages:
-                            # stop pagination to protect Main CM / huge inventories
                             send_line(chan, "n")
-                            answered_upto = len(prompts)
                             truncated = True
-                            time.sleep(0.3)
-                            last = time.monotonic()
-                            break
-                        send_line(chan, "y")
-                        answered_upto += 1
-                        more_pages += 1
-                        time.sleep(0.25)
+                        else:
+                            send_line(chan, "y")
+                            more_pages += 1
+                        last_answered_more_end = m.end()
+                        last_more_at = time.monotonic()
                         last = time.monotonic()
-                    if re.search(r"(?m)^t\s*$", joined) and not re.search(
-                        r"more\?\s*\[y\]\s*$", joined, re.I
-                    ):
-                        time.sleep(0.25)
-                        if not chan.recv_ready():
-                            break
-            elif chunks and (time.monotonic() - last) >= idle:
-                break
+                        time.sleep(0.05)
+                    # Do not stop on "t" — it appears between more? pages
+            elif chunks:
+                # After more?, do not stop on "t" (it appears mid-page). Wait for quiet.
+                # Longer idle after multi-page lists so tail pages are not left on wire.
+                idle = 1.05 if last_more_at > 0 else 0.6
+                if (time.monotonic() - last) >= idle:
+                    break
             else:
                 time.sleep(0.05)
 
         raw = "".join(chunks)
         if not raw.strip():
             raise RuntimeError("Empty OSSI response (session may be dead)")
+
+        # Final quiet drain — never leave more?[y] hanging for the next command.
+        if truncated or more_pages > 0:
+            time.sleep(0.1)
+            extra = drain_until_quiet(
+                chan,
+                max_wait=3.5 if truncated else 1.8,
+                quiet=0.45,
+                stop_more=True,
+            )
+            if extra:
+                raw += extra
+
         return raw, more_pages, truncated
 
     def _run_unlocked(
@@ -350,6 +396,7 @@ class OssiSession:
         *,
         retry_on_error: bool,
         max_more_pages: int | None,
+        form_fields: list[str] | None = None,
     ) -> CommandResult:
         used_existing = False
         did_login = False
@@ -358,11 +405,12 @@ class OssiSession:
         page_cap = (
             max_more_pages if max_more_pages is not None else self.cfg.max_more_pages
         )
+        fields = list(form_fields) if form_fields else None
 
         try:
             used_existing, did_login = self._ensure_session_unlocked()
             raw, more, trunc = self._run_command_unlocked(
-                command, max_more_pages=page_cap
+                command, max_more_pages=page_cap, form_fields=fields
             )
             if retry_on_error and ossi_has_error(raw) and not trunc:
                 retried = True
@@ -370,7 +418,7 @@ class OssiSession:
                 _, did_login = self._ensure_session_unlocked()
                 did_login = True
                 raw, more, trunc = self._run_command_unlocked(
-                    command, max_more_pages=page_cap
+                    command, max_more_pages=page_cap, form_fields=fields
                 )
             self._touch_unlocked()
             self._command_count += 1
@@ -406,7 +454,7 @@ class OssiSession:
                 _, did_login = self._ensure_session_unlocked()
                 did_login = True
                 raw, more, trunc = self._run_command_unlocked(
-                    command, max_more_pages=page_cap
+                    command, max_more_pages=page_cap, form_fields=fields
                 )
                 self._touch_unlocked()
                 self._command_count += 1

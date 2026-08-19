@@ -45,4 +45,4 @@ First line of a new day is a `#` header comment.
 
 - Logger must be **running before / while** CM link is up; CM connects out to you.
 - Does not use OSSI / SAT.
-- CDR Tab UI still uses mock data until we wire Search to these files.
+- CDR tab Search / hourly / Erlang read these daily files (offline). Logger itself does not use OSSI.

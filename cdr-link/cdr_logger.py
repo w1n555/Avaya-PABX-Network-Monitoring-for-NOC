@@ -3,7 +3,7 @@
 Avaya CM CDR logger — TCP server (CM pushes records to us).
 
 Listens (default 0.0.0.0:9000). Writes one call per line into:
-  <log_dir>/YYYYMMDD.TXT
+  <log_dir>/YYYYMMDD.txt
 
 Tuned for this CM (read from SAT):
   - Primary format: customized
@@ -24,7 +24,6 @@ import re
 import socket
 import socketserver
 import threading
-import time
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
@@ -205,13 +204,8 @@ class DailyWriter:
                 pass
         path = daily_path(self.log_dir, when)
         new_file = not path.exists() or path.stat().st_size == 0
-        # buffering=1 line-buffered; allow other processes (API search) to read while we append
+        # line-buffered; Windows default share lets the API search today's file
         self._fh = open(path, "a", encoding="utf-8", newline="\n", buffering=1)
-        try:
-            # On Windows, ensure share mode is not exclusive (Python open defaults allow read share)
-            pass
-        except Exception:
-            pass
         self._current_day = day
         if new_file:
             self._fh.write(LINE_HEADER + "\n")
@@ -296,7 +290,7 @@ class CdrHandler(socketserver.BaseRequestHandler):
                     continue
                 if not chunk:
                     break
-                logging.info("RX %s bytes from %s:%s", len(chunk), peer[0], peer[1])
+                logging.debug("RX %s bytes from %s:%s", len(chunk), peer[0], peer[1])
                 for rec in buf.feed(chunk):
                     now = datetime.now()
                     try:
@@ -345,13 +339,10 @@ def run_server(cfg: LoggerConfig) -> None:
     )
     logging.info("Expect CM push from Main CM (NMC-CDR → this host). Format: customized.")
 
-    class Handler(CdrHandler):
-        pass
+    CdrHandler.writer = writer
+    CdrHandler.cfg = cfg
 
-    Handler.writer = writer
-    Handler.cfg = cfg
-
-    with ThreadedTCPServer((cfg.host, cfg.port), Handler) as server:
+    with ThreadedTCPServer((cfg.host, cfg.port), CdrHandler) as server:
         logging.info("Listening — waiting for CM CDR link…")
         try:
             server.serve_forever()
@@ -370,7 +361,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         "--log-dir",
         type=Path,
         default=here / "cdr",
-        help="Directory for YYYYMMDD.TXT (default ./cdr)",
+        help="Directory for YYYYMMDD.txt (default ./cdr)",
     )
     args = p.parse_args(list(argv) if argv is not None else None)
     cfg = LoggerConfig(host=args.host, port=args.port, log_dir=args.log_dir.resolve())

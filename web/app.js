@@ -11,9 +11,243 @@ import {
   hideProgress,
   finishProgress,
 } from "./cdr-ui.js";
+import {
+  initAlarmUi,
+  onAlarmTabShow,
+  setAlarmSessionConnected,
+  setAlarmTabActive,
+  refreshAlarmsSilent,
+  syncAlarmCountdown,
+  setOssiBusy as setAlarmOssiBusy,
+} from "./alarm-ui.js";
+import {
+  initGatewayUi,
+  onGatewayTabShow,
+  setGatewaySessionConnected,
+  setGatewayTabActive,
+  refreshGatewaysSilent,
+  syncGatewayCountdown,
+  setOssiBusy as setGatewayOssiBusy,
+} from "./gateway-ui.js";
+import {
+  initExtensionUi,
+  onExtensionTabShow,
+  setExtensionSessionConnected,
+  setExtensionTabActive,
+  runExtensionRefresh,
+  armExtensionNext,
+  EXTENSION_INTERVAL_MS,
+  setOssiBusy as setExtensionOssiBusy,
+} from "./extension-ui.js";
+import {
+  initMapUi,
+  onMapTabShow,
+  setMapSessionConnected,
+  setMapTabActive,
+  refreshMapFromCache,
+} from "./map-ui.js";
+
+function setOssiBusy(busy) {
+  try {
+    setAlarmOssiBusy(busy);
+  } catch {
+    /* ignore */
+  }
+  try {
+    setGatewayOssiBusy(busy);
+  } catch {
+    /* ignore */
+  }
+  try {
+    setExtensionOssiBusy(busy);
+  } catch {
+    /* ignore */
+  }
+}
 
 const API = "api";
 const REFRESH_INTERVAL_SEC = 60;
+/** This browser tab explicitly clicked Login (not auto-resume from leftover OSSI). */
+const UI_SESSION_KEY = "cm_noc_ui_logged_in";
+const NOTES_LS_KEY = "cm_noc_notes";
+
+/** File-only / OSSI jobs — never overlap a live status trunk / display alarms. */
+const cmdQueue = [];
+let queueRunning = false;
+
+function readLocalNotes() {
+  try {
+    const raw = localStorage.getItem(NOTES_LS_KEY);
+    const obj = raw ? JSON.parse(raw) : {};
+    return obj && typeof obj === "object" ? obj : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeLocalNote(tg, note) {
+  try {
+    const all = readLocalNotes();
+    all[String(tg)] = String(note ?? "");
+    localStorage.setItem(NOTES_LS_KEY, JSON.stringify(all));
+  } catch {
+    /* private mode */
+  }
+}
+
+function noteForTg(tg, fallback = "") {
+  const key = Number(tg);
+  if (Object.prototype.hasOwnProperty.call(state.noteDrafts, key)) return state.noteDrafts[key];
+  const local = readLocalNotes()[String(key)];
+  if (local != null) return local;
+  return fallback || "";
+}
+
+function rememberNote(tg, note) {
+  const key = Number(tg);
+  const val = String(note ?? "");
+  state.noteDrafts[key] = val;
+  writeLocalNote(key, val);
+  const mon = state.monitored.find((m) => Number(m.tg) === key);
+  if (mon) mon.note = val;
+}
+
+function enqueueJob(job) {
+  cmdQueue.push(job);
+  if (state.refreshing) {
+    setStatus(`Queued ${cmdQueue.length} command(s) — waiting for OSSI…`);
+  }
+  pumpQueue();
+}
+
+async function pumpQueue() {
+  if (queueRunning) return;
+  if (state.refreshing) return;
+  queueRunning = true;
+  try {
+    while (cmdQueue.length && !state.refreshing) {
+      const job = cmdQueue.shift();
+      try {
+        await runQueuedJob(job);
+      } catch (e) {
+        console.warn("queue job failed:", job?.kind, e?.message || e);
+        if (job?.kind === "add" || job?.kind === "status") {
+          finishProgress(false, String(e.message || e));
+          const btn = $("btn-progress-close");
+          if (btn) btn.hidden = false;
+        } else if (job?.kind === "note") {
+          cmdQueue.push(job);
+          break;
+        }
+      }
+    }
+  } finally {
+    queueRunning = false;
+    if (cmdQueue.length && !state.refreshing) pumpQueue();
+  }
+}
+
+async function runQueuedJob(job) {
+  if (job.kind === "note") {
+    const res = await api("monitored/note", {
+      method: "POST",
+      body: JSON.stringify({ tg: job.tg, note: job.note }),
+    });
+    applyMonitoredResponse(res);
+    if (state.noteDrafts[job.tg] === job.note) delete state.noteDrafts[job.tg];
+    return;
+  }
+  if (job.kind === "add") {
+    const nLeft = cmdQueue.filter((j) => j.kind === "add").length;
+    showProgress("Add trunk", nLeft ? `Adding TG ${job.tg} (${nLeft} more queued)…` : `Adding TG ${job.tg}…`);
+    setProgress(20, `Saving TG ${job.tg}…`);
+    const res = await api("monitored/add", {
+      method: "POST",
+      body: JSON.stringify({ tg: job.tg, note: job.note || "" }),
+    });
+    applyMonitoredResponse(res);
+    renderTrunkTable();
+    if (state.connected) {
+      setProgress(55, `status trunk ${job.tg}…`);
+      const one = await api("refresh/one", {
+        method: "POST",
+        body: JSON.stringify({ tg: job.tg }),
+      });
+      if (one.item) applyOneTrunkItem(one.item);
+      else await loadTrunkData({ soft: true });
+    }
+    setProgress(100, "Done");
+    finishProgress(true, `TG ${job.tg} added`);
+    return;
+  }
+  if (job.kind === "status") {
+    const one = await api("refresh/one", {
+      method: "POST",
+      body: JSON.stringify({ tg: job.tg }),
+    });
+    if (one.item) applyOneTrunkItem(one.item);
+    return;
+  }
+  if (job.kind === "extensions") {
+    // Low priority inventory — only runs when 60s pack is idle (pumpQueue waits on refreshing)
+    state.refreshing = true;
+    state.refreshingSince = Date.now();
+    try {
+      setOssiBusy(true);
+    } catch {
+      /* ignore */
+    }
+    try {
+      setStatus("OSSI list extension…");
+      await runExtensionRefresh({ showModal: !!job.showModal });
+      armExtensionNext(EXTENSION_INTERVAL_MS);
+      setStatus("");
+    } finally {
+      state.refreshing = false;
+      state.refreshingSince = 0;
+      try {
+        setOssiBusy(false);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
+/** Enqueue list extension (login / 1h / manual). Coalesce duplicate jobs. */
+function enqueueExtensionRefresh(opts = {}) {
+  const showModal = !!opts.showModal;
+  const has = cmdQueue.some((j) => j.kind === "extensions");
+  if (has) {
+    // Promote to modal if user clicked Refresh while already queued
+    if (showModal) {
+      const job = cmdQueue.find((j) => j.kind === "extensions");
+      if (job) job.showModal = true;
+      setStatus(`Queued list extension (${cmdQueue.length} command(s)) — waiting for OSSI…`);
+    }
+    pumpQueue();
+    return;
+  }
+  enqueueJob({ kind: "extensions", showModal, reason: opts.reason || "auto" });
+}
+
+/** Hourly list extension while session is live (not every 60s). */
+function startExtensionHourlyTimer() {
+  stopExtensionHourlyTimer();
+  armExtensionNext(EXTENSION_INTERVAL_MS);
+  state.extensionTimer = setInterval(() => {
+    if (!state.connected) return;
+    if (!$("chk-auto")?.checked) return;
+    enqueueExtensionRefresh({ showModal: false, reason: "hourly" });
+  }, EXTENSION_INTERVAL_MS);
+}
+
+function stopExtensionHourlyTimer() {
+  if (state.extensionTimer) {
+    clearInterval(state.extensionTimer);
+    state.extensionTimer = null;
+  }
+}
 
 const $ = (id) => document.getElementById(id);
 
@@ -22,6 +256,8 @@ const state = {
   timer: null,
   heartbeatTimer: null,
   countdownTimer: null,
+  /** Hourly list extension (not 60s pack) */
+  extensionTimer: null,
   /** Fast poll of trunk_data while progressive OSSI status runs */
   livePollTimer: null,
   /** @type {{tg:number,order:number,note:string}[]} */
@@ -34,7 +270,24 @@ const state = {
   /** epoch ms when next auto progressive refresh should fire */
   nextRefreshAt: 0,
   refreshing: false,
+  /** epoch ms when progressiveRefresh entered (stuck guard) */
+  refreshingSince: 0,
   activeTab: "trunk",
+  /** tg -> { until, timer } for Updated flash */
+  flashTimers: {},
+  /** tg -> note text being typed / not yet confirmed on server */
+  noteDrafts: {},
+  /** tg -> epoch ms. UPDATE FAILED sticks until a successful refresh/one for that TG. */
+  tgStickyError: {},
+  /** 60s re-sync of CM display time */
+  cmTimeTimer: null,
+  /** 1s local tick so System Time looks live */
+  cmTimeTickTimer: null,
+  /** CM wall-clock ms at last successful OSSI sync */
+  cmTimeAnchorMs: null,
+  /** Date.now() at last successful OSSI sync */
+  cmTimeLocalAnchor: null,
+  lastCmTimeAt: 0,
 };
 
 function apiUrl(path) {
@@ -45,13 +298,24 @@ function apiUrl(path) {
 }
 
 async function api(path, opts = {}) {
-  const res = await fetch(apiUrl(path), {
-    credentials: "same-origin",
-    headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
-    ...opts,
-  });
+  let res;
+  try {
+    res = await fetch(apiUrl(path), {
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
+      ...opts,
+    });
+  } catch (e) {
+    // Network / browser-extension interception failures
+    throw new Error(e?.message || "Network error");
+  }
   let body = null;
-  const text = await res.text();
+  let text = "";
+  try {
+    text = await res.text();
+  } catch {
+    text = "";
+  }
   try {
     body = text ? JSON.parse(text) : null;
   } catch {
@@ -61,11 +325,17 @@ async function api(path, opts = {}) {
     const err = (body && (body.error || body.Error)) || res.statusText || "Request failed";
     throw new Error(err);
   }
-  return body;
+  // Always return a plain object (never undefined) so callers/extensions don't choke
+  return body && typeof body === "object" ? body : {};
 }
 
+/**
+ * Login-card error only (connect panel).
+ * Never put trunk poll / TG OSSI failures here — those show as Status "UPDATE FAILED".
+ */
 function setError(msg) {
   const el = $("error-line");
+  if (!el) return;
   if (!msg) {
     el.hidden = true;
     el.textContent = "";
@@ -75,15 +345,38 @@ function setError(msg) {
   el.textContent = msg;
 }
 
+/**
+ * Monitoring / auto messages go next to 60s countdown (trunk-auto-status).
+ * Login / connect messages stay on connect-panel status-line.
+ */
 function setStatus(msg) {
-  const el = $("status-line");
-  if (!msg) {
-    el.hidden = true;
-    el.textContent = "";
+  const trunkEl = $("trunk-auto-status");
+  const connectEl = $("status-line");
+  const preferTrunk = trunkEl && state.connected;
+  if (preferTrunk) {
+    if (!msg) {
+      trunkEl.hidden = true;
+      trunkEl.textContent = "";
+      trunkEl.removeAttribute("title");
+    } else {
+      trunkEl.hidden = false;
+      trunkEl.textContent = msg;
+      trunkEl.title = msg;
+    }
+    if (connectEl) {
+      connectEl.hidden = true;
+      connectEl.textContent = "";
+    }
     return;
   }
-  el.hidden = false;
-  el.textContent = msg;
+  if (!connectEl) return;
+  if (!msg) {
+    connectEl.hidden = true;
+    connectEl.textContent = "";
+    return;
+  }
+  connectEl.hidden = false;
+  connectEl.textContent = msg;
 }
 
 function setSessionLabel(text, ok) {
@@ -107,8 +400,8 @@ function applyUiMode() {
   if (tabs) tabs.hidden = false;
 
   if (state.connected) {
-    if (panel && panel.dataset.panel === "trunk") panel.classList.remove("hidden");
-    card.classList.remove("dimmed");
+    // Logged in: never leave the trunk card dimmed (user may have logged in on another tab)
+    if (card) card.classList.remove("dimmed");
     btnRef.disabled = false;
     btnDisc.disabled = false;
     btnConn.disabled = true;
@@ -117,8 +410,10 @@ function applyUiMode() {
       if (el) el.disabled = true;
     });
     if (connectPanel) connectPanel.classList.add("is-logged-in");
-    $("connect-hint").textContent =
-      "Logged in. Keep this page open for auto refresh (60s). Close tab disconnects OSSI. Idle max 30 min.";
+    if ($("connect-hint")) {
+      $("connect-hint").hidden = true;
+      $("connect-hint").textContent = "";
+    }
   } else {
     // Trunk panel: dim if visible; keep structure when user is on Trunk tab
     if (card) card.classList.add("dimmed");
@@ -130,13 +425,41 @@ function applyUiMode() {
       if (el) el.disabled = false;
     });
     if (connectPanel) connectPanel.classList.remove("is-logged-in");
-    $("connect-hint").textContent =
-      "Login for live Trunk OSSI. CDR tab works with mock data (no CM CDR yet).";
+    if ($("connect-hint")) {
+      $("connect-hint").hidden = false;
+      $("connect-hint").textContent =
+        "必須手動 Login（Host / Password）。唔會自動登入。關閉分頁會切斷 OSSI。";
+    }
+  }
+}
+
+function markUiLoggedIn() {
+  try {
+    sessionStorage.setItem(UI_SESSION_KEY, "1");
+  } catch {
+    /* private mode */
+  }
+}
+
+function clearUiLoggedIn() {
+  try {
+    sessionStorage.removeItem(UI_SESSION_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
+function hasUiLoggedInFlag() {
+  try {
+    return sessionStorage.getItem(UI_SESSION_KEY) === "1";
+  } catch {
+    return false;
   }
 }
 
 function tickClock() {
-  $("live-clock").textContent = new Date().toLocaleTimeString();
+  const el = $("live-clock");
+  if (el) el.textContent = new Date().toLocaleTimeString();
 }
 
 function fmtTime(iso) {
@@ -176,7 +499,7 @@ function mergeRows() {
     return {
       tg: m.tg,
       order: m.order,
-      note: m.note ?? live.note ?? "",
+      note: noteForTg(m.tg, m.note ?? live.note ?? ""),
       name: live.name || "",
       type: live.type || "",
       tac: live.tac || "",
@@ -193,6 +516,56 @@ function mergeRows() {
   });
 }
 
+function utilCellHtml(it) {
+  if (!it.hasLive) return `<strong>—</strong>`;
+  if (it.error) return `<strong>—</strong>`;
+  const color = utilColorClass(it);
+  const util = Number(it.utilizationPct || 0);
+  return `<strong>${util.toFixed(1)}%</strong><div class="util-bar"><i style="width:${Math.min(
+    100,
+    util
+  )}%;background:var(--${color === "yellow" ? "warn" : color === "red" ? "bad" : "ok"})"></i></div>`;
+}
+
+function statusCellHtml(it) {
+  if (!it.hasLive) return `<span class="badge muted">—</span>`;
+  // Per-TG OSSI get fail → Status only (no login popup / no global error banner)
+  if (it.error) {
+    return `<span class="badge red" title="UPDATE FAILED"><span class="dot"></span>UPDATE FAILED</span>`;
+  }
+  const color = utilColorClass(it);
+  return `<span class="badge ${color}"><span class="dot"></span>${color}</span>`;
+}
+
+function buildTrunkRow(it) {
+  const tr = document.createElement("tr");
+  tr.className = "tg-row";
+  tr.dataset.tg = String(it.tg);
+  tr.draggable = true;
+  if (it.error) tr.title = "UPDATE FAILED";
+  else tr.removeAttribute("title");
+
+  tr.innerHTML = `
+      <td class="col-drag"><span class="drag-handle" title="拖曳排序">⋮⋮</span></td>
+      <td class="tg-cell"><button type="button" class="link-tg" data-open="${it.tg}" title="Open detail">${it.tg}</button></td>
+      <td class="col-note"><input type="text" class="note-input" data-note-tg="${it.tg}" maxlength="200" value="${escapeHtml(
+        it.note || ""
+      )}" placeholder="Note…" /></td>
+      <td class="name-cell">${escapeHtml(it.name || "—")}${
+        it.type ? `<span class="name">${escapeHtml(it.type)}${it.tac ? " · TAC " + escapeHtml(it.tac) : ""}</span>` : ""
+      }</td>
+      <td class="col-total">${it.total ?? "—"}</td>
+      <td class="col-idle">${it.idle ?? "—"}</td>
+      <td class="col-busy">${it.busy ?? "—"}</td>
+      <td class="col-oos">${it.oos ?? "—"}</td>
+      <td class="col-util">${utilCellHtml(it)}</td>
+      <td class="col-status">${statusCellHtml(it)}</td>
+      <td class="mono col-updated" data-updated-tg="${it.tg}">${fmtTime(it.lastUpdate)}</td>
+      <td><button type="button" class="btn btn-danger btn-rm" data-rm="${it.tg}">Remove</button></td>
+    `;
+  return tr;
+}
+
 function renderTrunkTable() {
   const tbody = $("trunk-tbody");
   const rows = mergeRows();
@@ -204,71 +577,163 @@ function renderTrunkTable() {
     return;
   }
 
+  // Preserve note focus while rebuilding structure (order/add/remove)
+  const focusTg = document.activeElement?.classList?.contains("note-input")
+    ? Number(document.activeElement.getAttribute("data-note-tg"))
+    : null;
+  const focusVal = focusTg != null ? document.activeElement.value : null;
+  const focusPos =
+    focusTg != null && typeof document.activeElement.selectionStart === "number"
+      ? document.activeElement.selectionStart
+      : null;
+
   tbody.innerHTML = "";
   for (const it of rows) {
-    const color = utilColorClass(it);
-    const util = Number(it.utilizationPct || 0);
-    const tr = document.createElement("tr");
-    tr.className = "tg-row";
-    tr.dataset.tg = String(it.tg);
-    tr.draggable = true;
-    if (it.error) tr.title = it.error;
+    tbody.appendChild(buildTrunkRow(it));
+  }
+  bindRowInteractions(tbody);
 
-    tr.innerHTML = `
-      <td class="col-drag"><span class="drag-handle" title="拖曳排序">⋮⋮</span></td>
-      <td class="tg-cell"><button type="button" class="link-tg" data-open="${it.tg}" title="Open detail">${it.tg}</button></td>
-      <td class="col-note"><input type="text" class="note-input" data-note-tg="${it.tg}" maxlength="200" value="${escapeHtml(
-        it.note || ""
-      )}" placeholder="Note…" /></td>
-      <td class="name-cell">${escapeHtml(it.name || "—")}${
-        it.type ? `<span class="name">${escapeHtml(it.type)}${it.tac ? " · TAC " + escapeHtml(it.tac) : ""}</span>` : ""
-      }</td>
-      <td>${it.total ?? "—"}</td>
-      <td>${it.idle ?? "—"}</td>
-      <td>${it.busy ?? "—"}</td>
-      <td>${it.oos ?? "—"}</td>
-      <td>
-        <strong>${it.hasLive ? util.toFixed(1) + "%" : "—"}</strong>
-        ${
-          it.hasLive
-            ? `<div class="util-bar"><i style="width:${Math.min(100, util)}%;background:var(--${
-                color === "yellow" ? "warn" : color === "red" ? "bad" : "ok"
-              })"></i></div>`
-            : ""
+  if (focusTg != null) {
+    const inp = tbody.querySelector(`.note-input[data-note-tg="${focusTg}"]`);
+    if (inp) {
+      inp.value = focusVal ?? inp.value;
+      inp.focus();
+      if (focusPos != null) {
+        try {
+          inp.setSelectionRange(focusPos, focusPos);
+        } catch {
+          /* ignore */
         }
-      </td>
-      <td>${
-        it.hasLive
-          ? `<span class="badge ${color}"><span class="dot"></span>${color}</span>`
-          : `<span class="badge muted">—</span>`
-      }</td>
-      <td class="mono col-updated" data-updated-tg="${it.tg}">${fmtTime(it.lastUpdate)}</td>
-      <td><button type="button" class="btn btn-danger btn-rm" data-rm="${it.tg}">Remove</button></td>
-    `;
-    tbody.appendChild(tr);
+      }
+    }
   }
 
-  bindRowInteractions(tbody);
+  // Re-apply any active flashes after rebuild
+  for (const [tg, info] of Object.entries(state.flashTimers)) {
+    if (info && info.until > Date.now()) {
+      const cell = tbody.querySelector(`td.col-updated[data-updated-tg="${tg}"]`);
+      if (cell) cell.classList.add("updated-flash");
+    }
+  }
 }
 
-/** Merge one TG status item into state and repaint; flash Updated cell green 2s. */
+/**
+ * In-place update one TG row — no full table reload (avoids flash cut-off / lag dim).
+ */
+function patchTrunkRow(item, { flash = false } = {}) {
+  if (!item || item.tg == null) return;
+  const tg = Number(item.tg);
+  const mon = state.monitored.find((m) => Number(m.tg) === tg);
+  const it = {
+    tg,
+    order: mon?.order ?? item.order ?? 0,
+    note: noteForTg(tg, mon?.note ?? item.note ?? ""),
+    name: item.name || "",
+    type: item.type || "",
+    tac: item.tac || "",
+    total: item.total,
+    idle: item.idle,
+    busy: item.busy,
+    oos: item.oos,
+    utilizationPct: item.utilizationPct,
+    statusColor: item.statusColor,
+    lastUpdate: item.lastUpdate,
+    error: item.error,
+    hasLive: item.tg != null || item.total != null,
+  };
+
+  const tbody = $("trunk-tbody");
+  let tr = tbody?.querySelector(`tr.tg-row[data-tg="${tg}"]`);
+  if (!tr || !tbody || tbody.querySelector("tr.empty")) {
+    // Row missing / empty placeholder — full structure paint once
+    renderTrunkTable();
+    if (flash) flashUpdatedTg(tg);
+    return;
+  }
+
+  if (it.error) tr.title = "UPDATE FAILED";
+  else tr.removeAttribute("title");
+
+  const setTxt = (sel, val) => {
+    const el = tr.querySelector(sel);
+    if (el) el.textContent = val == null || val === "" ? "—" : String(val);
+  };
+  setTxt(".col-total", it.total ?? "—");
+  setTxt(".col-idle", it.idle ?? "—");
+  setTxt(".col-busy", it.busy ?? "—");
+  setTxt(".col-oos", it.oos ?? "—");
+
+  const nameCell = tr.querySelector(".name-cell");
+  if (nameCell) {
+    nameCell.innerHTML = `${escapeHtml(it.name || "—")}${
+      it.type ? `<span class="name">${escapeHtml(it.type)}${it.tac ? " · TAC " + escapeHtml(it.tac) : ""}</span>` : ""
+    }`;
+  }
+  const utilCell = tr.querySelector(".col-util");
+  if (utilCell) utilCell.innerHTML = utilCellHtml(it);
+  const stCell = tr.querySelector(".col-status");
+  if (stCell) stCell.innerHTML = statusCellHtml(it);
+
+  const noteInp = tr.querySelector(".note-input");
+  if (
+    noteInp &&
+    document.activeElement !== noteInp &&
+    !Object.prototype.hasOwnProperty.call(state.noteDrafts, tg)
+  ) {
+    noteInp.value = it.note || "";
+  }
+
+  const upd = tr.querySelector(".col-updated");
+  if (upd) {
+    const wasFlashing = upd.classList.contains("updated-flash");
+    upd.textContent = fmtTime(it.lastUpdate);
+    if (wasFlashing) upd.classList.add("updated-flash");
+  }
+
+  if (flash) flashUpdatedTg(tg);
+}
+
+function markTrunkStickyError(tg, on) {
+  const key = Number(tg);
+  if (!key) return;
+  if (!state.tgStickyError) state.tgStickyError = {};
+  if (on) state.tgStickyError[key] = Date.now();
+  else delete state.tgStickyError[key];
+}
+
+function applyStickyTrunkErrors(items) {
+  const sticky = state.tgStickyError || {};
+  if (!items || !items.length || !Object.keys(sticky).length) return items || [];
+  return items.map((it) => {
+    const tg = Number(it.tg);
+    if (!sticky[tg] || it.error) return it;
+    return { ...it, error: "UPDATE FAILED", statusColor: "red" };
+  });
+}
+
+/** Merge one TG status item into state and patch row; flash Updated 2s. */
 function applyOneTrunkItem(item) {
   if (!item || item.tg == null) return;
   const tg = Number(item.tg);
+  if (item.error) markTrunkStickyError(tg, true);
+  else markTrunkStickyError(tg, false);
   const idx = state.trunkItems.findIndex((x) => Number(x.tg) === tg);
-  if (idx >= 0) state.trunkItems[idx] = { ...state.trunkItems[idx], ...item };
-  else state.trunkItems.push(item);
-  renderTrunkTable();
-  // Flash after DOM rebuild
-  requestAnimationFrame(() => {
-    const cell = document.querySelector(`td.col-updated[data-updated-tg="${tg}"]`);
-    if (!cell) return;
-    cell.classList.remove("updated-flash");
-    // reflow so animation restarts
-    void cell.offsetWidth;
-    cell.classList.add("updated-flash");
-    setTimeout(() => cell.classList.remove("updated-flash"), 2100);
-  });
+  if (idx >= 0) {
+    const prev = state.trunkItems[idx];
+    state.trunkItems[idx] = { ...prev, ...item };
+    // Keep previous channels if this payload omitted them
+    if (!Array.isArray(item.channels) && Array.isArray(prev.channels)) {
+      state.trunkItems[idx].channels = prev.channels;
+    }
+  } else state.trunkItems.push(item);
+  // Header "Updated" under Refresh button
+  const meta = $("meta-updated");
+  if (meta && item.lastUpdate) meta.textContent = fmtTime(item.lastUpdate);
+  patchTrunkRow({ ...item, tg }, { flash: true });
+  // Detail open on this TG → repaint member table from same cache (no extra OSSI)
+  if (state.detailTg != null && Number(state.detailTg) === tg && Array.isArray(item.channels)) {
+    paintDetailFromItem({ ...item, tg });
+  }
 }
 
 function paintCountdown() {
@@ -276,6 +741,12 @@ function paintCountdown() {
   if (!el) return;
   if (!state.connected) {
     el.textContent = "Next: —";
+    el.classList.remove("is-updating");
+    return;
+  }
+  // Only the open Trunk page runs Auto 60s
+  if (state.activeTab !== "trunk") {
+    el.textContent = "Next: — (other tab)";
     el.classList.remove("is-updating");
     return;
   }
@@ -302,6 +773,13 @@ function paintCountdown() {
 function startCountdownClock() {
   if (state.countdownTimer) return;
   state.countdownTimer = setInterval(() => {
+    // Safety: progressive refresh must never stick "Updating…" forever
+    if (state.refreshing && state.refreshingSince > 0 && Date.now() - state.refreshingSince > 180_000) {
+      console.warn("progressiveRefresh stuck >180s — forcing unlock");
+      state.refreshing = false;
+      state.refreshingSince = 0;
+      armNextRefresh(5);
+    }
     paintCountdown();
     // Auto refresh: no popup; only when countdown hits 0 on Trunk tab
     if (
@@ -310,17 +788,31 @@ function startCountdownClock() {
       !state.refreshing &&
       state.nextRefreshAt > 0 &&
       Date.now() >= state.nextRefreshAt &&
-      state.activeTab === "trunk" &&
       document.visibilityState === "visible"
     ) {
       // fire-and-forget; progressiveRefresh guards with state.refreshing
-      progressiveRefresh({ reason: "auto", showModal: false });
+      progressiveRefresh({ reason: "auto", showModal: false }).catch((e) => {
+        console.warn("auto refresh:", e?.message || e);
+        state.refreshing = false;
+        state.refreshingSince = 0;
+        armNextRefresh(REFRESH_INTERVAL_SEC);
+      });
     }
   }, 250);
 }
 
 function armNextRefresh(fromNowSec = REFRESH_INTERVAL_SEC) {
   state.nextRefreshAt = Date.now() + Math.max(1, fromNowSec) * 1000;
+  try {
+    syncAlarmCountdown(state.nextRefreshAt);
+  } catch {
+    /* alarm ui optional */
+  }
+  try {
+    syncGatewayCountdown(state.nextRefreshAt);
+  } catch {
+    /* gateway ui optional */
+  }
   paintCountdown();
 }
 
@@ -349,6 +841,7 @@ function bindRowInteractions(tbody) {
       }
     });
     inp.addEventListener("input", () => {
+      rememberNote(Number(inp.dataset.noteTg), inp.value);
       clearTimeout(t);
       t = setTimeout(save, 800);
     });
@@ -407,23 +900,23 @@ async function reorder(fromTg, toTg) {
     });
     applyMonitoredResponse(res);
   } catch (e) {
-    setError(String(e.message || e));
+    console.warn("reorder:", e?.message || e);
     await loadMonitored();
   }
 }
 
 async function saveNote(tg, note) {
-  const mon = state.monitored.find((x) => x.tg === tg);
-  if (mon && mon.note === note) return;
-  if (mon) mon.note = note;
+  rememberNote(tg, note);
   try {
     const res = await api("monitored/note", {
       method: "POST",
       body: JSON.stringify({ tg, note }),
     });
     applyMonitoredResponse(res);
+    if (state.noteDrafts[tg] === note) delete state.noteDrafts[tg];
   } catch (e) {
-    setError(String(e.message || e));
+    console.warn("save note (will retry):", e?.message || e);
+    enqueueJob({ kind: "note", tg, note });
   }
 }
 
@@ -432,13 +925,16 @@ function applyMonitoredResponse(res) {
     state.monitored = res.items.map((it, i) => ({
       tg: Number(it.tg),
       order: Number(it.order ?? i),
-      note: it.note || "",
+      note: noteForTg(it.tg, it.note || ""),
     }));
   } else if (res.trunks) {
     state.monitored = res.trunks.map((tg, i) => ({
       tg: Number(tg),
       order: i,
-      note: (state.monitored.find((m) => m.tg === Number(tg)) || {}).note || "",
+      note: noteForTg(
+        tg,
+        (state.monitored.find((m) => m.tg === Number(tg)) || {}).note || ""
+      ),
     }));
   }
 }
@@ -456,24 +952,62 @@ function renderTrunkMeta(data) {
 }
 
 /**
- * @param {{ soft?: boolean }} [opts] soft: never throw / never wipe rows on empty or 502
+ * @param {{ soft?: boolean, flashChanges?: boolean }} [opts]
+ * soft: never throw / never wipe rows on empty or 502
+ * flashChanges: green-flash Updated cells whose lastUpdate advanced
  */
 async function loadTrunkData(opts = {}) {
   const soft = !!opts.soft;
+  const flashChanges = !!opts.flashChanges;
   try {
     const res = await api("trunk-data");
     const data = res.data || res;
     const items = (data && data.items) || [];
+    const prevByTg = {};
+    for (const it of state.trunkItems || []) {
+      prevByTg[Number(it.tg)] = it.lastUpdate || "";
+    }
     // Never flash empty table on transient empty/error while we already have rows
     if (items.length > 0 || state.trunkItems.length === 0) {
-      state.trunkItems = items;
+      state.trunkItems = applyStickyTrunkErrors(items);
     }
     renderTrunkMeta(data);
-    renderTrunkTable();
-    if (data.error && !data.refreshing) setError(data.error);
-    else if (!data.error) setError("");
-    if (data.refreshing) {
+
+    // Prefer in-place patches when table already has the same TG set (no lag reload)
+    const tbody = $("trunk-tbody");
+    const existing = tbody ? tbody.querySelectorAll("tr.tg-row") : [];
+    const canPatch =
+      existing.length > 0 &&
+      items.length > 0 &&
+      existing.length === mergeRows().length &&
+      [...existing].every((tr) => items.some((it) => Number(it.tg) === Number(tr.dataset.tg)));
+
+    if (canPatch) {
+      for (const it of state.trunkItems) {
+        const tg = Number(it.tg);
+        const cur = it.lastUpdate || "";
+        const changed = cur && cur !== (prevByTg[tg] || "") && !it.error;
+        patchTrunkRow(it, { flash: flashChanges && changed });
+      }
+    } else {
+      renderTrunkTable();
+      if (flashChanges) {
+        for (const it of state.trunkItems || []) {
+          const tg = Number(it.tg);
+          const cur = it.lastUpdate || "";
+          if (cur && cur !== (prevByTg[tg] || "")) flashUpdatedTg(tg);
+        }
+      }
+    }
+
+    // Never surface per-TG / trunk_data.error on login card — Status column only
+    if (data.refreshing && !state.refreshing) {
       setStatus("Updating trunks… (live, per TG)");
+    }
+    // Soft fill System Time only if we have no anchor yet (don't reset tick every 2s)
+    if (state.connected && state.cmTimeAnchorMs == null) {
+      const ct = data.cmTime || (data.systemTime ? { systemTime: data.systemTime } : null);
+      if (_cmTimeText(ct)) setCmTimeAnchor(ct);
     }
     return data;
   } catch (e) {
@@ -501,18 +1035,48 @@ async function loadMonitoredSoft() {
 }
 
 /* ---------- Login progress modal (English, 3 coarse steps) ---------- */
-function showLoginModal() {
+function setLoginPct(pct, detail) {
+  const p = Math.max(0, Math.min(100, Math.round(pct)));
+  const fill = $("login-bar-fill");
+  const label = $("login-pct");
+  if (fill) fill.style.width = p + "%";
+  if (label) label.textContent = p + "%";
+  if (detail != null && $("login-modal-detail")) {
+    $("login-modal-detail").textContent = detail;
+  }
+}
+
+/** Live OSSI command on the login bar (NOC-visible). */
+function setLoginOssi(command, pct) {
+  const cmd = String(command || "").trim();
+  const el = $("login-ossi-cmd");
+  if (el) el.textContent = cmd || "—";
+  const sub = $("login-modal-sub");
+  if (sub && cmd) sub.textContent = cmd;
+  if (pct != null) setLoginPct(pct, cmd);
+}
+
+function showLoginModal(title = "Connecting to CM") {
   const m = $("login-modal");
   if (!m) return;
   m.hidden = false;
   $("btn-login-modal-close").hidden = true;
   $("login-modal-spinner").className = "modal-spinner";
-  $("login-modal-title").textContent = "Connecting to CM";
+  $("login-modal-title").textContent = title;
   $("login-modal-sub").textContent = "Please wait…";
   $("login-modal-detail").textContent = "";
+  setLoginPct(0, "");
+  const isLogout = /log\s*out/i.test(title);
+  const labels = isLogout
+    ? ["Stop auto refresh", "OSSI logoff", "Done"]
+    : ["Start OSSI bridge", "Connect to CM (SSH + OSSI login)", "OSSI cache (all tabs)"];
   m.querySelectorAll(".progress-steps li").forEach((li) => {
     li.classList.remove("active", "done", "fail");
+    const n = Number(li.dataset.step);
+    if (labels[n - 1]) li.textContent = labels[n - 1];
   });
+  const cmdEl = $("login-ossi-cmd");
+  if (cmdEl && !isLogout) cmdEl.textContent = "—";
 }
 
 function hideLoginModal(delayMs = 0) {
@@ -550,11 +1114,18 @@ function setLoginStep(step, kind, detail) {
     $("login-modal-spinner").className = "modal-spinner fail";
     $("login-modal-sub").textContent = "Login failed";
     $("btn-login-modal-close").hidden = false;
+    setLoginPct(100, detail);
   } else if (kind === "done" && step >= 3) {
     $("login-modal-spinner").className = "modal-spinner done";
-    $("login-modal-sub").textContent = "Connected · Monitoring";
+    $("login-modal-sub").textContent = "Connected · all tab caches ready";
+    setLoginPct(100, detail);
+    const cmdEl = $("login-ossi-cmd");
+    if (cmdEl) cmdEl.textContent = detail || "done";
   } else {
-    $("login-modal-sub").textContent = "Please wait…";
+    $("login-modal-sub").textContent = detail || "Please wait…";
+    const pct =
+      step <= 1 ? (kind === "done" ? 12 : 6) : step === 2 ? (kind === "done" ? 22 : 14) : 24;
+    setLoginPct(pct, detail);
   }
 }
 
@@ -564,58 +1135,40 @@ function failLoginModal(msg) {
   setLoginStep(step, "fail", msg || "Login failed");
 }
 
-async function openDetail(tg) {
-  if (!state.connected) {
-    setError("請先 Login 先睇 channel 詳情。");
-    return;
-  }
-  state.detailTg = tg;
-  $("trunk-list-view").hidden = true;
-  $("trunk-detail-view").hidden = false;
-  $("detail-title").textContent = `${tg}`;
-  $("detail-meta").textContent = "Loading…";
-  $("detail-tbody").innerHTML = `<tr class="empty"><td colspan="5">Loading…</td></tr>`;
-
-  showProgress("Loading trunk detail", `status trunk ${tg}…`);
-  let fake = 8;
-  const tick = setInterval(() => {
-    fake = Math.min(88, fake + 7);
-    setProgress(fake, `status trunk ${tg}…`);
-  }, 280);
-  try {
-    await loadDetail(tg);
-    setProgress(100, "Done");
-    finishProgress(true, `TG ${tg} detail loaded`);
-  } catch (e) {
-    finishProgress(false, String(e.message || e));
-    const btn = $("btn-progress-close");
-    if (btn) btn.hidden = false;
-  } finally {
-    clearInterval(tick);
-  }
-}
-
-async function loadDetail(tg) {
-  const res = await api(`trunks/${tg}/detail`);
-  const mon = state.monitored.find((m) => m.tg === tg);
-  const note = (res.note || (mon && mon.note) || "").trim();
-  $("detail-title").textContent = `${tg}${res.name ? " · " + res.name : ""}`;
+/**
+ * Paint TG detail from cached item (channels from 60s status trunk).
+ * No OSSI when data already in trunkItems / refresh/one response.
+ */
+function paintDetailFromItem(item, opts = {}) {
+  if (!item) return;
+  const tg = Number(item.tg);
+  const mon = state.monitored.find((m) => Number(m.tg) === tg);
+  const note = (item.note || (mon && mon.note) || "").trim();
+  $("detail-title").textContent = `${tg}${item.name ? " · " + item.name : ""}`;
+  const counts =
+    opts.counts ||
+    (item.total != null
+      ? { total: item.total, idle: item.idle, busy: item.busy, oos: item.oos }
+      : null);
   $("detail-meta").textContent = [
-    res.type ? res.type : "",
-    res.tac ? "TAC " + res.tac : "",
+    item.type ? item.type : "",
+    item.tac ? "TAC " + item.tac : "",
     note ? "Note: " + note : "",
-    res.counts
-      ? `Total ${res.counts.total ?? "—"} · Idle ${res.counts.idle ?? "—"} · Busy ${res.counts.busy ?? "—"}`
+    counts
+      ? `Total ${counts.total ?? "—"} · Idle ${counts.idle ?? "—"} · Busy ${counts.busy ?? "—"}`
       : "",
+    item.lastUpdate ? `Updated ${fmtTime(item.lastUpdate)}` : "",
   ]
     .filter(Boolean)
     .join(" · ");
 
-  const channels = res.channels || [];
+  const channels = item.channels || opts.channels || [];
   const tbody = $("detail-tbody");
   if (!channels.length) {
     tbody.innerHTML = `<tr class="empty"><td colspan="5">${
-      res.error || "無 channel 資料（或 parse 唔到）。"
+      item.error ||
+      opts.error ||
+      "未有 channel cache — 等下一次 Auto 60s，或撳 Refresh 此 TG。"
     }</td></tr>`;
     return;
   }
@@ -634,10 +1187,206 @@ async function loadDetail(tg) {
   }
 }
 
+/** Open detail from list cache — no immediate OSSI (shared with 60s poll). */
+async function openDetail(tg) {
+  if (!state.connected) {
+    setError("請先 Login 先睇 channel 詳情。");
+    return;
+  }
+  state.detailTg = tg;
+  $("trunk-list-view").hidden = true;
+  $("trunk-detail-view").hidden = false;
+  $("detail-title").textContent = `${tg}`;
+  $("detail-meta").textContent = "";
+  $("detail-tbody").innerHTML = `<tr class="empty"><td colspan="5">Loading…</td></tr>`;
+
+  // Prefer in-memory cache from last 60s / refresh/one
+  const local = (state.trunkItems || []).find((x) => Number(x.tg) === Number(tg));
+  if (local && Array.isArray(local.channels)) {
+    paintDetailFromItem(local);
+    return;
+  }
+  // Server trunk_data cache (still no extra OSSI if channels present)
+  try {
+    await loadDetail(tg, { force: false });
+  } catch (e) {
+    $("detail-tbody").innerHTML = `<tr class="empty"><td colspan="5">${escapeHtml(
+      String(e.message || e)
+    )}</td></tr>`;
+  }
+}
+
+/**
+ * @param {number} tg
+ * @param {{ force?: boolean }} [opts] force:true → one OSSI status trunk (Refresh 此 TG)
+ */
+async function loadDetail(tg, opts = {}) {
+  const force = !!opts.force;
+  if (force) {
+    // One status trunk via refresh/one — updates list + channels cache
+    const res = await api("refresh/one", {
+      method: "POST",
+      body: JSON.stringify({ tg }),
+    });
+    const item = res.item || res.Item;
+    if (item) {
+      applyOneTrunkItem(item);
+      paintDetailFromItem(item);
+      return item;
+    }
+  }
+
+  // Client cache
+  const local = (state.trunkItems || []).find((x) => Number(x.tg) === Number(tg));
+  if (!force && local && Array.isArray(local.channels)) {
+    paintDetailFromItem(local);
+    return local;
+  }
+
+  // Server cache (or live if no channels yet)
+  const res = await api(`trunks/${tg}/detail`);
+  const mon = state.monitored.find((m) => Number(m.tg) === Number(tg));
+  const item = {
+    tg,
+    name: res.name,
+    type: res.type,
+    tac: res.tac,
+    note: res.note || (mon && mon.note) || "",
+    total: res.counts?.total,
+    idle: res.counts?.idle,
+    busy: res.counts?.busy,
+    oos: res.counts?.oos,
+    channels: res.channels || [],
+    lastUpdate: res.lastUpdate,
+    error: res.error,
+  };
+  // Merge channels into trunkItems for next open
+  if (item.channels.length || res.fromCache) {
+    const idx = state.trunkItems.findIndex((x) => Number(x.tg) === Number(tg));
+    if (idx >= 0) {
+      state.trunkItems[idx] = { ...state.trunkItems[idx], ...item };
+    }
+  }
+  paintDetailFromItem(item, { counts: res.counts, channels: res.channels, error: res.error });
+  return item;
+}
+
 function closeDetail() {
   state.detailTg = null;
   $("trunk-detail-view").hidden = true;
   $("trunk-list-view").hidden = false;
+}
+
+/**
+ * Login OSSI pack: every tab's commands, cache to disk, live command on the bar.
+ * Trunk failures stay on the row — they must not fail login.
+ */
+async function runLoginOssiCache() {
+  state.refreshing = true;
+  state.refreshingSince = Date.now();
+  try {
+    setOssiBusy(true);
+  } catch {
+    /* ignore */
+  }
+  setLoginStep(3, "active", "Preparing OSSI cache…");
+  setLoginOssi("Preparing OSSI cache…", 24);
+
+  try {
+    try {
+      await loadMonitoredSoft();
+    } catch {
+      /* ignore */
+    }
+    let list = tgListForRefresh();
+    if (!list.length) {
+      try {
+        const st = await api("session/status");
+        const m = st.monitored || st.Monitored || [];
+        if (Array.isArray(m) && m.length) {
+          list = m.map((x) => Number(x)).filter((tg) => tg >= 1);
+          if (!state.monitored.length) {
+            state.monitored = list.map((tg, i) => ({ tg, order: i, note: "" }));
+          }
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+
+    const n = list.length;
+    const trunkLo = 24;
+    const trunkHi = 72;
+    for (let i = 0; i < n; i++) {
+      const tg = list[i];
+      const cmd = `status trunk ${tg}  (${i + 1}/${n})`;
+      const pct = trunkLo + ((i + 1) / n) * (trunkHi - trunkLo);
+      setLoginOssi(cmd, pct);
+      const tr = document.querySelector(`tr.tg-row[data-tg="${tg}"]`);
+      if (tr) tr.classList.add("row-updating");
+      try {
+        const res = await api("refresh/one", {
+          method: "POST",
+          body: JSON.stringify({ tg }),
+        });
+        const item = res && (res.item || res.Item);
+        if (item && item.tg != null) applyOneTrunkItem(item);
+        else if (res?.data?.items || res?.data?.Items) {
+          state.trunkItems = res.data.items || res.data.Items;
+          renderTrunkTable();
+        }
+      } catch {
+        applyOneTrunkItem({
+          tg,
+          error: "UPDATE FAILED",
+          statusColor: "red",
+          lastUpdate: new Date().toISOString(),
+        });
+      } finally {
+        const tr2 = document.querySelector(`tr.tg-row[data-tg="${tg}"]`);
+        if (tr2) tr2.classList.remove("row-updating");
+        if (i < n - 1) {
+          await new Promise((r) => setTimeout(r, 250));
+        }
+      }
+    }
+    try {
+      await loadTrunkData({ soft: true, flashChanges: false });
+    } catch {
+      /* cache paint optional */
+    }
+
+    setLoginOssi("display alarms", 80);
+    try {
+      await api("refresh/one", {
+        method: "POST",
+        body: JSON.stringify({ tg: 9996 }),
+      });
+    } catch (e) {
+      console.warn("login display alarms:", e?.message || e);
+      setLoginOssi("display alarms (failed — will retry on Auto 60s)", 80);
+    }
+
+    setLoginOssi("list media-gateway", 92);
+    try {
+      await api("refresh/one", {
+        method: "POST",
+        body: JSON.stringify({ tg: 9995 }),
+      });
+    } catch (e) {
+      console.warn("login list media-gateway:", e?.message || e);
+      setLoginOssi("list media-gateway (failed — will retry on Auto 60s)", 92);
+    }
+    pumpQueue();
+  } finally {
+    state.refreshing = false;
+    state.refreshingSince = 0;
+    try {
+      setOssiBusy(false);
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 async function connect() {
@@ -671,23 +1420,27 @@ async function connect() {
       setLoginStep(1, "done", "Bridge check failed — will retry on connect");
     }
 
-    // 2) SSH + OSSI login (one server call; includes first trunk poll)
+    // 2) SSH + OSSI login (display time + list trunk-group inside this call)
     setLoginStep(
       2,
       "active",
-      `SSH ${body.host}:${body.port} · OSSI login as ${body.username} (read-only)…`
+      `SSH ${body.host}:${body.port} · display time · list trunk-group`
     );
+    setLoginOssi(`SSH ${body.host}:${body.port} · display time · list trunk-group`, 16);
     const res = await api("session/connect", { method: "POST", body: JSON.stringify(body) });
-    setLoginStep(2, "done", "OSSI session open");
+    setLoginStep(2, "done", "OSSI session open · display time · list trunk-group");
 
     state.connected = true;
     state.disconnecting = false;
+    markUiLoggedIn();
     $("meta-host").textContent = res.host || body.host;
     setSessionLabel("Monitoring (OSSI)", true);
     applyUiMode();
+    // System Time from connect's display time → anchor for 1s local tick
+    if (_cmTimeText(res.cmTime) || _cmTimeText(res)) {
+      setCmTimeAnchor(res.cmTime || res);
+    }
 
-    // 3) Ready — load data quietly (no extra modal steps)
-    setLoginStep(3, "active", "Loading trunk data…");
     try {
       await loadMonitoredSoft();
     } catch {
@@ -700,21 +1453,34 @@ async function connect() {
       renderTrunkTable();
     } else {
       try {
-        await loadTrunkData();
+        await loadTrunkData({ soft: true });
       } catch {
         /* ignore */
       }
     }
-    setLoginStep(3, "done", "Monitoring active · live row updates · close page to disconnect");
-    setStatus("Logged in. Keep this page open to monitor. Close tab disconnects OSSI.");
+
+    // 3) Every tab's OSSI → cache (live command on the bar)
+    await runLoginOssiCache();
+
+    setAlarmSessionConnected(true);
+    setGatewaySessionConnected(true);
+    setExtensionSessionConnected(true);
+    setMapSessionConnected(true);
+    setLoginStep(3, "done", "Cached status trunk · display alarms · list media-gateway");
+    setLoginOssi("Cached · list extension queued (hourly)", 100);
+    setError("");
+    setStatus("Logged in. Trunk / Alarm / Gateway ready · list extension queued.");
     $("chk-auto").checked = true;
-    startHeartbeat();
-    startCountdownClock();
-    // Immediate progressive status for this page, then 60s countdown
-    hideLoginModal(400);
-    await progressiveRefresh({ reason: "login", showModal: false });
+    onSessionLive();
+    // list extension after login pack — enqueue (does not block 100%)
+    enqueueExtensionRefresh({ showModal: false, reason: "login" });
+    startExtensionHourlyTimer();
+    hideLoginModal(700);
+    refreshCmTime({ soft: true, force: false }).catch(() => {});
   } catch (e) {
+    // Real login failure only (SSH / password / bridge)
     state.connected = false;
+    clearUiLoggedIn();
     const msg = String(e.message || e);
     setError(msg);
     setSessionLabel("Disconnected", false);
@@ -735,12 +1501,14 @@ function stopHeartbeat() {
 
 function startHeartbeat() {
   stopHeartbeat();
-  state.heartbeatTimer = setInterval(() => {
+  const beat = () => {
     if (!state.connected) return;
-    // Soft: 502 / bridge busy must NOT clear table or flip session
-    api("session/heartbeat", { method: "POST", body: "{}" }).catch(() => {});
-  }, 30_000);
-  api("session/heartbeat", { method: "POST", body: "{}" }).catch(() => {});
+    // Tell bridge which tab is open — only that tab gets backend OSSI auto
+    const body = JSON.stringify({ tab: state.activeTab || "trunk" });
+    api("session/heartbeat", { method: "POST", body }).catch(() => {});
+  };
+  state.heartbeatTimer = setInterval(beat, 30_000);
+  beat();
 }
 
 function stopLivePoll() {
@@ -750,23 +1518,194 @@ function stopLivePoll() {
   }
 }
 
-/** Poll trunk_data every 2s so progressive status trunk N writes appear row-by-row */
+/**
+ * Poll trunk_data every 2s while logged in.
+ * Backend auto_loop + progressive /refresh write after each TG — UI must follow
+ * even if the browser auto path is mid-flight or skipped.
+ */
 function startLivePoll() {
   stopLivePoll();
   state.livePollTimer = setInterval(() => {
-    if (!state.connected) return;
-    loadTrunkData({ soft: true });
+    if (!state.connected || state.disconnecting) return;
+    // Only poll trunk cache while Trunk tab is open
+    if (state.activeTab !== "trunk") return;
+    // Do not fight progressive OSSI (avoids mid-flash table thrash)
+    if (state.refreshing) return;
+    loadTrunkData({ soft: true, flashChanges: true });
   }, 2000);
-  loadTrunkData({ soft: true });
+  if (state.activeTab === "trunk") {
+    loadTrunkData({ soft: true, flashChanges: false });
+  }
+}
+
+/** Ensure live poll + countdown are running after Login / resume. */
+function onSessionLive() {
+  startHeartbeat();
+  startLivePoll();
+  startCountdownClock();
+  startCmTimeWatch();
+  if ($("chk-auto")?.checked !== false) {
+    $("chk-auto").checked = true;
+    if (!state.nextRefreshAt || state.nextRefreshAt < Date.now()) {
+      armNextRefresh(REFRESH_INTERVAL_SEC);
+    }
+  }
+  paintCountdown();
+}
+
+function stopCmTimeWatch() {
+  if (state.cmTimeTimer) {
+    clearInterval(state.cmTimeTimer);
+    state.cmTimeTimer = null;
+  }
+  if (state.cmTimeTickTimer) {
+    clearInterval(state.cmTimeTickTimer);
+    state.cmTimeTickTimer = null;
+  }
+}
+
+/**
+ * System Time: OSSI sync ~60s, then local 1s tick so the clock runs live.
+ * Display = CM_anchor + (now − local_anchor). Re-sync corrects drift.
+ */
+function startCmTimeWatch() {
+  stopCmTimeWatch();
+  setTimeout(() => refreshCmTime({ soft: true, force: true }), 400);
+  state.cmTimeTimer = setInterval(() => {
+    if (!state.connected) return;
+    refreshCmTime({ soft: true, force: true });
+  }, 60_000);
+  state.cmTimeTickTimer = setInterval(() => {
+    if (!state.connected) return;
+    paintCmTimeTick();
+  }, 1000);
+  paintCmTimeTick();
+}
+
+function _cmTimeText(info) {
+  if (!info) return "";
+  const t = (info.systemTime || info.time || info.SystemTime || info.Time || "").trim();
+  if (!t || t === "—" || t === "-" || t === "null" || t === "undefined") return "";
+  return t;
+}
+
+/** Parse CM systemTime "MM/DD/YYYY HH:mm:ss" (and close variants) → Date */
+function parseCmSystemTime(text) {
+  const s = String(text || "").trim();
+  let m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2}):(\d{2})/);
+  if (m) {
+    return new Date(+m[3], +m[1] - 1, +m[2], +m[4], +m[5], +m[6]);
+  }
+  m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})/);
+  if (m) {
+    return new Date(+m[3], +m[1] - 1, +m[2], +m[4], +m[5], 0);
+  }
+  m = s.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{1,2}):(\d{2}):(\d{2})/);
+  if (m) {
+    return new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
+  }
+  const d = new Date(s);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function formatCmSystemTime(d) {
+  if (!d || Number.isNaN(d.getTime())) return "—";
+  const p = (n) => String(n).padStart(2, "0");
+  return `${p(d.getMonth() + 1)}/${p(d.getDate())}/${d.getFullYear()} ${p(d.getHours())}:${p(
+    d.getMinutes()
+  )}:${p(d.getSeconds())}`;
+}
+
+/** Anchor CM wall clock for local 1s advancement. */
+function setCmTimeAnchor(info) {
+  const text = _cmTimeText(info);
+  if (!text) return false;
+  const d = parseCmSystemTime(text);
+  if (!d || Number.isNaN(d.getTime())) return false;
+  state.cmTimeAnchorMs = d.getTime();
+  state.cmTimeLocalAnchor = Date.now();
+  state.lastCmTimeAt = Date.now();
+  paintCmTimeTick();
+  const el = $("meta-cm-time");
+  if (el) {
+    el.title = "CM System Time (synced ~60s, ticks locally each second)";
+  }
+  return true;
+}
+
+function clearCmTimeAnchor() {
+  state.cmTimeAnchorMs = null;
+  state.cmTimeLocalAnchor = null;
+  state.lastCmTimeAt = 0;
+  const el = $("meta-cm-time");
+  if (el) {
+    el.textContent = "—";
+    el.title = "";
+  }
+}
+
+/** Paint live CM time = anchor + local elapsed. */
+function paintCmTimeTick() {
+  const el = $("meta-cm-time");
+  if (!el) return;
+  if (state.cmTimeAnchorMs == null || state.cmTimeLocalAnchor == null) {
+    if (!state.connected) el.textContent = "—";
+    return;
+  }
+  const elapsed = Date.now() - state.cmTimeLocalAnchor;
+  const shown = new Date(state.cmTimeAnchorMs + elapsed);
+  el.textContent = formatCmSystemTime(shown);
+}
+
+/** @deprecated use setCmTimeAnchor / clearCmTimeAnchor / paintCmTimeTick */
+function paintCmTime(info) {
+  if (info == null) {
+    clearCmTimeAnchor();
+    return;
+  }
+  setCmTimeAnchor(info);
+}
+
+async function refreshCmTime(opts = {}) {
+  if (!state.connected) return null;
+  try {
+    let info = null;
+    // Heartbeat refreshes display time on bridge when stale (~55s); no /cm-time route needed
+    try {
+      const hb = await api("session/heartbeat", { method: "POST", body: "{}" });
+      if (_cmTimeText(hb?.cmTime) || _cmTimeText(hb)) info = hb.cmTime || hb;
+    } catch {
+      /* ignore */
+    }
+    if (!_cmTimeText(info)) {
+      try {
+        const st = await api("session/status");
+        info = st.cmTime || { ok: !!st.connected, systemTime: st.systemTime, time: st.time };
+      } catch {
+        /* ignore */
+      }
+    }
+    if (_cmTimeText(info)) {
+      setCmTimeAnchor(info);
+      return info;
+    }
+    return info;
+  } catch (e) {
+    if (!opts.soft) console.warn("cm-time:", e.message || e);
+    return null;
+  }
 }
 
 function disconnectOnPageClose() {
   if (!state.connected || state.disconnecting) return;
   state.disconnecting = true;
   state.connected = false;
+  clearUiLoggedIn();
   stopHeartbeat();
   stopLivePoll();
+  stopCmTimeWatch();
   clearAuto();
+  state.refreshing = false;
   try {
     const url = apiUrl("session/disconnect");
     const blob = new Blob(["{}"], { type: "application/json" });
@@ -787,110 +1726,362 @@ function disconnectOnPageClose() {
 
 async function disconnect() {
   state.disconnecting = true;
+  state.refreshing = false;
   stopHeartbeat();
   stopLivePoll();
+  stopCmTimeWatch();
+  showLoginModal("Logging out");
+  const s1 = document.querySelector('#login-progress-steps li[data-step="1"]');
+  const s2 = document.querySelector('#login-progress-steps li[data-step="2"]');
+  const s3 = document.querySelector('#login-progress-steps li[data-step="3"]');
+  if (s1) s1.textContent = "Stop auto refresh";
+  if (s2) s2.textContent = "OSSI logoff";
+  if (s3) s3.textContent = "Done";
+  setLoginStep(1, "active", "Stopping timers…");
+  setLoginPct(20, "Stopping timers…");
   try {
+    setLoginStep(2, "active", "Closing OSSI session…");
+    setLoginPct(55, "session/disconnect…");
     await api("session/disconnect", { method: "POST", body: "{}" });
+    setLoginStep(2, "done", "OSSI logged off");
+    setLoginPct(85, "OSSI logged off");
   } catch {
-    /* ignore */
+    setLoginStep(2, "done", "Disconnect (session already closed)");
+    setLoginPct(85, "Session already closed");
   }
   state.connected = false;
   state.disconnecting = false;
+  state.tgStickyError = {};
+  clearUiLoggedIn();
   setSessionLabel("Disconnected", false);
-  setStatus("Logged out — OSSI session closed.");
+  setStatus("Logged out — OSSI session closed. 請手動 Login。");
+  paintCmTime(null);
+  setAlarmSessionConnected(false);
+  setGatewaySessionConnected(false);
+  setExtensionSessionConnected(false);
+  setMapSessionConnected(false);
+  stopExtensionHourlyTimer();
   clearAuto();
   closeDetail();
   applyUiMode();
+  setLoginStep(3, "done", "Logged out");
+  setLoginPct(100, "Logged out");
+  hideLoginModal(600);
+  // restore login step labels for next Login
+  setTimeout(() => {
+    if (s1) s1.textContent = "Start OSSI bridge";
+    if (s2) s2.textContent = "Connect to CM (SSH + OSSI login)";
+    if (s3) s3.textContent = "OSSI cache (all tabs)";
+  }, 700);
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/** Solid green Updated flash for full 2s; survives sibling row patches. */
+function flashUpdatedTg(tg) {
+  const key = String(tg);
+  const prev = state.flashTimers[key];
+  if (prev?.timer) clearTimeout(prev.timer);
+  const cell = document.querySelector(`td.col-updated[data-updated-tg="${tg}"]`);
+  if (!cell) return;
+  cell.classList.remove("flash-fade");
+  cell.classList.add("updated-flash");
+  const until = Date.now() + 2000;
+  // Hold solid 2s, then short fade, then clear
+  const tHold = setTimeout(() => {
+    const c = document.querySelector(`td.col-updated[data-updated-tg="${tg}"]`);
+    if (c) c.classList.add("flash-fade");
+    const tClear = setTimeout(() => {
+      const c2 = document.querySelector(`td.col-updated[data-updated-tg="${tg}"]`);
+      if (c2) c2.classList.remove("updated-flash", "flash-fade");
+      delete state.flashTimers[key];
+    }, 400);
+    state.flashTimers[key] = { until: Date.now() + 400, timer: tClear };
+  }, 2000);
+  state.flashTimers[key] = { until, timer: tHold };
+}
+
+/** TG list for OSSI poll: monitored first, else trunk_data rows. */
+function tgListForRefresh() {
+  if (state.monitored.length) return state.monitored.map((m) => Number(m.tg));
+  return (state.trunkItems || [])
+    .map((it) => Number(it.tg))
+    .filter((tg) => tg >= 1);
 }
 
 /**
- * Refresh each monitored TG one-by-one via /refresh/one so Updated column
- * advances per row (does not wait for full list).
- */
-/**
- * @param {{ reason?: string, showModal?: boolean }} opts
- * showModal default FALSE — only manual Refresh / tab jump pass true.
- * Auto never uses popup.
+ * Refresh trunks via OSSI status trunk N.
+ * Strategy:
+ *  1) Prefer /refresh/one per TG (true row-by-row)
+ *  2) If unavailable (old bridge), POST /refresh once while polling trunk-data
+ *     (server already writes after each TG — UI shows updates as they land)
+ * Auto: never popup. Manual Refresh / tab jump: popup OK.
+ * Always: live poll keeps table fresh even if this path is skipped.
  */
 async function progressiveRefresh(opts = {}) {
   const showModal = opts.showModal === true;
   const reason = opts.reason || "refresh";
   if (!state.connected || state.refreshing) return;
+  try {
+    setOssiBusy(true);
+  } catch {
+    /* ignore */
+  }
+
+  // Resume/init often called before monitored loaded — fetch first
   if (!state.monitored.length) {
+    try {
+      await loadMonitoredSoft();
+    } catch {
+      /* ignore */
+    }
+  }
+  let list = tgListForRefresh();
+  if (!list.length) {
+    // Last resort: server session monitored list
+    try {
+      const st = await api("session/status");
+      const m = st.monitored || st.Monitored || [];
+      if (Array.isArray(m) && m.length) {
+        list = m.map((x) => Number(x)).filter((tg) => tg >= 1);
+        if (!state.monitored.length) {
+          state.monitored = list.map((tg, i) => ({ tg, order: i, note: "" }));
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  if (!list.length) {
+    setStatus("Auto: no TG to refresh — add a trunk group.");
     armNextRefresh(REFRESH_INTERVAL_SEC);
     return;
   }
 
   state.refreshing = true;
-  // Prevent countdown from re-firing while we run (push next far ahead temporarily)
+  state.refreshingSince = Date.now();
   state.nextRefreshAt = Date.now() + 24 * 3600 * 1000;
   paintCountdown();
-  setError("");
-  const list = state.monitored.map((m) => m.tg);
+  if (showModal) setError("");
+
   const n = list.length;
-  if (showModal) showProgress("Updating trunks", `0 / ${n} · status trunk…`);
+  if (showModal) showProgress("Updating trunks", `status trunk × ${n}…`);
+
+  // Snapshot lastUpdate to detect per-row changes while polling
+  const lastSeen = {};
+  for (const it of state.trunkItems) {
+    lastSeen[Number(it.tg)] = it.lastUpdate || "";
+  }
+
+  const noteProgress = (i, tg) => {
+    const pct = Math.round(((i + 1) / n) * 100);
+    if (showModal) setProgress(pct, `status trunk ${tg}  (${i + 1}/${n})`);
+    setStatus(
+      reason === "auto" || reason === "auto-on"
+        ? `Auto update: TG ${tg} (${i + 1}/${n}) · OSSI status trunk`
+        : `Updating TG ${tg}… (${i + 1}/${n})`
+    );
+  };
 
   try {
+    // --- Path A: per-TG endpoint ---
+    let oneOk = 0;
+    let lastErr = null;
     for (let i = 0; i < list.length; i++) {
       const tg = list[i];
-      const pct = ((i + 0.2) / n) * 100;
-      if (showModal) setProgress(pct, `status trunk ${tg}  (${i + 1}/${n})`);
-      if (reason !== "auto") setStatus(`Updating TG ${tg}… (${i + 1}/${n})`);
-      else setStatus(`Auto: TG ${tg} (${i + 1}/${n})`);
-
+      noteProgress(i, tg);
       const tr = document.querySelector(`tr.tg-row[data-tg="${tg}"]`);
       if (tr) tr.classList.add("row-updating");
-
       try {
         const res = await api("refresh/one", {
           method: "POST",
           body: JSON.stringify({ tg }),
         });
-        if (res.item) applyOneTrunkItem(res.item);
-        else if (res.data && Array.isArray(res.data.items)) {
-          state.trunkItems = res.data.items;
+        const item = res && (res.item || res.Item);
+        // item.error → Status "UPDATE FAILED" only (no login error banner)
+        if (item && item.tg != null) {
+          applyOneTrunkItem(item);
+          lastSeen[tg] = item.lastUpdate || item.LastUpdate || lastSeen[tg];
+          if (!item.error) oneOk++;
+        } else if (res?.data?.items || res?.data?.Items) {
+          state.trunkItems = applyStickyTrunkErrors(res.data.items || res.data.Items);
           renderTrunkTable();
+          flashUpdatedTg(tg);
+          oneOk++;
         } else {
-          await loadTrunkData({ soft: true });
+          applyOneTrunkItem({
+            tg,
+            error: "UPDATE FAILED",
+            statusColor: "red",
+            lastUpdate: new Date().toISOString(),
+          });
         }
       } catch (e) {
-        console.warn("refresh/one", tg, e);
+        lastErr = e;
+        // Mark this TG as update failed in table (HTTP path fail)
+        applyOneTrunkItem({
+          tg,
+          error: "UPDATE FAILED",
+          statusColor: "red",
+          lastUpdate: new Date().toISOString(),
+        });
+        // First hard failure on old bridge → fall back to bulk /refresh + poll
+        for (const el of document.querySelectorAll("tr.tg-row.row-updating")) {
+          el.classList.remove("row-updating");
+        }
+        if (oneOk === 0) {
+          await progressiveRefreshBulk({ showModal, reason, lastSeen, n });
+          return; // outer finally still runs
+        }
+        // partial: continue other TGs — failed row stays UPDATE FAILED until next 60s
       } finally {
         const tr2 = document.querySelector(`tr.tg-row[data-tg="${tg}"]`);
         if (tr2) tr2.classList.remove("row-updating");
+        if (i < list.length - 1) {
+          await new Promise((r) => setTimeout(r, 250));
+        }
       }
-
-      if (showModal) setProgress(((i + 1) / n) * 100, `Done TG ${tg}  (${i + 1}/${n})`);
     }
 
-    if (state.detailTg) {
+    // Never throw on partial TG fails — login / auto must keep running
+    if (oneOk === 0 && lastErr) {
+      setStatus("Trunk update incomplete — next Auto 60s will retry");
       try {
-        await loadDetail(state.detailTg);
+        await loadTrunkData({ soft: true, flashChanges: false });
       } catch {
         /* ignore */
       }
+      if (showModal) {
+        finishProgress(false, "Some trunks failed — see Status");
+        const btn = $("btn-progress-close");
+        if (btn) btn.hidden = false;
+      }
+      return;
     }
-    setStatus(reason === "auto" ? "Auto update complete." : "Refresh complete.");
+
+    // Final soft pull so meta Updated + any missed rows match disk (no flash — already flashed per TG)
+    await loadTrunkData({ soft: true, flashChanges: false });
+
+    // Detail open: channels already in each refresh/one item — paint from memory, no extra OSSI
+    if (state.detailTg) {
+      const d = (state.trunkItems || []).find((x) => Number(x.tg) === Number(state.detailTg));
+      if (d && Array.isArray(d.channels)) paintDetailFromItem(d);
+    }
+    const detailNote = state.detailTg ? ` · detail TG ${state.detailTg}` : "";
+    setStatus(
+      reason === "auto" || reason === "auto-on"
+        ? `Auto update complete (${oneOk}/${n} TG · OSSI)${detailNote}. Next in ${REFRESH_INTERVAL_SEC}s.`
+        : `Refresh complete (${oneOk}/${n} TG)${detailNote}.`
+    );
     if (showModal) {
       setProgress(100, "All trunks updated");
       finishProgress(true, "Trunk status updated");
     }
   } catch (e) {
-    setError(String(e.message || e));
+    // Transport / bridge issues — still no login-card error (Status / next 60s)
+    setStatus("Trunk update incomplete — next Auto 60s will retry");
+    try {
+      await loadTrunkData({ soft: true, flashChanges: true });
+    } catch {
+      /* ignore */
+    }
     if (showModal) {
-      finishProgress(false, String(e.message || e));
+      finishProgress(false, "Update incomplete — see Status");
       const btn = $("btn-progress-close");
       if (btn) btn.hidden = false;
     }
   } finally {
     state.refreshing = false;
+    state.refreshingSince = 0;
+    try {
+      setOssiBusy(false);
+    } catch {
+      /* ignore */
+    }
     armNextRefresh(REFRESH_INTERVAL_SEC);
+    // Pack Active Alarm after trunks (one OSSI owner — do not overlap)
+    const pack = ["auto", "auto-on", "login", "visible", "resume", "tab"].includes(reason);
+    if (pack && state.connected && $("chk-auto")?.checked) {
+      refreshAlarmsSilent()
+        .then(() => refreshGatewaysSilent())
+        .then(() => refreshMapFromCache())
+        .then(() => pumpQueue())
+        .catch((e) => console.warn("packed alarm/gw:", e?.message || e));
+    } else {
+      pumpQueue();
+    }
+  }
+}
+
+/** Bulk OSSI refresh + poll trunk_data so rows update as server writes each TG. */
+async function progressiveRefreshBulk({ showModal, reason, lastSeen, n }) {
+  if (showModal) setProgress(5, "Starting full OSSI refresh (status trunk N)…");
+  setStatus(reason === "auto" ? "Auto: OSSI refresh…" : "OSSI refresh…");
+
+  let done = false;
+  let err = null;
+  const refreshP = api("refresh", { method: "POST", body: "{}" })
+    .then((r) => {
+      done = true;
+      return r;
+    })
+    .catch((e) => {
+      done = true;
+      err = e;
+      throw e;
+    });
+
+  let ticks = 0;
+  while (!done) {
+    await sleep(700);
+    ticks++;
+    try {
+      await loadTrunkData({ soft: true });
+      // flash any TG whose lastUpdate advanced
+      for (const it of state.trunkItems) {
+        const tg = Number(it.tg);
+        const prev = lastSeen[tg] || "";
+        const cur = it.lastUpdate || "";
+        if (cur && cur !== prev) {
+          lastSeen[tg] = cur;
+          flashUpdatedTg(tg);
+          if (showModal) {
+            const doneCount = Object.keys(lastSeen).filter(
+              (k) => lastSeen[k] && lastSeen[k] !== ""
+            ).length;
+            setProgress(Math.min(95, (doneCount / Math.max(n, 1)) * 100), `Updated TG ${tg}`);
+          }
+        }
+      }
+    } catch {
+      /* keep polling */
+    }
+    if (ticks > 200) break; // safety ~140s
+  }
+
+  try {
+    await refreshP;
+  } catch (e) {
+    err = e;
+  }
+  await loadTrunkData({ soft: true });
+  for (const it of state.trunkItems) {
+    const tg = Number(it.tg);
+    if (it.lastUpdate && it.lastUpdate !== (lastSeen[tg] || "")) flashUpdatedTg(tg);
+  }
+
+  if (err) throw err;
+  setStatus(reason === "auto" ? "Auto update complete." : "Refresh complete.");
+  if (showModal) {
+    setProgress(100, "All trunks updated");
+    finishProgress(true, "Trunk status updated");
   }
 }
 
 async function refreshNow() {
-  setError("");
-  // Manual Refresh only — show popup
+  // Manual Refresh only — show popup. TG fails → Status UPDATE FAILED (not login card)
   await progressiveRefresh({ reason: "manual", showModal: true });
 }
 
@@ -898,43 +2089,35 @@ async function addTg() {
   const tg = Number($("inp-tg").value);
   const note = ($("inp-tg-note").value || "").trim();
   if (!tg || tg < 1) {
-    setError("請輸入有效 TG 號碼。");
+    showProgress("Add trunk", "Enter a valid TG number.");
+    finishProgress(false, "Enter a valid TG number.");
+    const btn = $("btn-progress-close");
+    if (btn) btn.hidden = false;
     return;
   }
   setError("");
-  showProgress("Add trunk", `Adding TG ${tg}…`);
-  setProgress(20, "Saving list…");
-  try {
-    const res = await api("monitored/add", {
-      method: "POST",
-      body: JSON.stringify({ tg, note }),
-    });
-    applyMonitoredResponse(res);
+  if (state.monitored.some((m) => Number(m.tg) === tg)) {
+    if (note) rememberNote(tg, note);
     $("inp-tg").value = "";
     $("inp-tg-note").value = "";
     renderTrunkTable();
-    setProgress(60, `status trunk ${tg}…`);
-    if (state.connected) {
-      try {
-        const one = await api("refresh/one", {
-          method: "POST",
-          body: JSON.stringify({ tg }),
-        });
-        if (one.item) applyOneTrunkItem(one.item);
-        else await loadTrunkData({ soft: true });
-      } catch {
-        await loadTrunkData({ soft: true });
-      }
-    }
-    setProgress(100, "Done");
-    finishProgress(true, `TG ${tg} added`);
-    armNextRefresh(REFRESH_INTERVAL_SEC);
-  } catch (e) {
-    finishProgress(false, String(e.message || e));
-    const btn = $("btn-progress-close");
-    if (btn) btn.hidden = false;
-    setError(String(e.message || e));
+    showProgress("Add trunk", `TG ${tg} already in list`);
+    finishProgress(true, `TG ${tg} already in list`);
+    return;
   }
+  state.monitored = state.monitored.concat([{ tg, order: state.monitored.length, note }]);
+  if (note) rememberNote(tg, note);
+  $("inp-tg").value = "";
+  $("inp-tg-note").value = "";
+  renderTrunkTable();
+  if (state.refreshing) {
+    showProgress("Add trunk", `Queued TG ${tg} — waiting for OSSI…`);
+    setProgress(15, `status trunk ${tg} queued`);
+  } else {
+    showProgress("Add trunk", `Adding TG ${tg}…`);
+    setProgress(15, `Saving TG ${tg}…`);
+  }
+  enqueueJob({ kind: "add", tg, note });
 }
 
 async function removeTg(tg) {
@@ -962,7 +2145,6 @@ async function removeTg(tg) {
     finishProgress(false, String(e.message || e));
     const b = $("btn-progress-close");
     if (b) b.hidden = false;
-    setError(String(e.message || e));
     if (btn) {
       btn.classList.remove("is-loading");
       btn.disabled = false;
@@ -1003,24 +2185,112 @@ function bindTabs() {
       document.querySelectorAll("[data-panel]").forEach((p) => {
         p.classList.toggle("hidden", p.dataset.panel !== name);
       });
+      // Only the open tab starts / owns AUTO 60s
+      try {
+        if (state.connected) {
+          api("session/heartbeat", {
+            method: "POST",
+            body: JSON.stringify({ tab: name }),
+          }).catch(() => {});
+        }
+      } catch {
+        /* ignore */
+      }
       if (name === "cdr") {
+        // CDR: no OSSI Auto 60s
         try {
           onCdrTabShow();
         } catch {
           /* ignore */
         }
-      }
-      // Jump back to Trunk tab → refresh data now (with popup), then 60s countdown
-      if (name === "trunk" && state.connected && $("chk-auto")?.checked) {
-        progressiveRefresh({ reason: "tab", showModal: true });
+        setAlarmTabActive(false);
+        setGatewayTabActive(false);
+        setExtensionTabActive(false);
+        setMapTabActive(false);
+        paintCountdown();
+      } else if (name === "alarm") {
+        try {
+          onAlarmTabShow();
+        } catch {
+          /* ignore */
+        }
+        setGatewayTabActive(false);
+        setExtensionTabActive(false);
+        setMapTabActive(false);
+        paintCountdown();
+      } else if (name === "gateway") {
+        try {
+          onGatewayTabShow();
+        } catch {
+          /* ignore */
+        }
+        setAlarmTabActive(false);
+        setExtensionTabActive(false);
+        setMapTabActive(false);
+        paintCountdown();
+      } else if (name === "map") {
+        try {
+          onMapTabShow();
+        } catch {
+          /* ignore */
+        }
+        setAlarmTabActive(false);
+        setGatewayTabActive(false);
+        setExtensionTabActive(false);
+        paintCountdown();
+      } else if (name === "extension") {
+        try {
+          onExtensionTabShow();
+        } catch {
+          /* ignore */
+        }
+        setAlarmTabActive(false);
+        setGatewayTabActive(false);
+        setMapTabActive(false);
+        paintCountdown();
+      } else if (name === "trunk") {
+        // Show last cache only — no popup / no extra OSSI. Auto 60s will refresh.
+        setAlarmTabActive(false);
+        setGatewayTabActive(false);
+        setExtensionTabActive(false);
+        setMapTabActive(false);
+        applyUiMode();
+        loadTrunkData({ soft: true, flashChanges: false }).catch(() => {});
+        paintCountdown();
       } else {
+        setAlarmTabActive(false);
+        setGatewayTabActive(false);
+        setExtensionTabActive(false);
+        setMapTabActive(false);
         paintCountdown();
       }
     });
   });
 }
 
+function initThemeToggle() {
+  const btn = $("btn-theme");
+  const root = document.documentElement;
+  const apply = (theme) => {
+    const t = theme === "light" ? "light" : "dark";
+    root.setAttribute("data-theme", t);
+    if (btn) btn.textContent = t === "light" ? "☾" : "☀";
+    if (btn) btn.title = t === "light" ? "Switch to dark theme" : "Switch to light theme";
+    try {
+      localStorage.setItem("cm_noc_theme", t);
+    } catch {
+      /* ignore */
+    }
+  };
+  apply(root.getAttribute("data-theme") || "dark");
+  btn?.addEventListener("click", () => {
+    const cur = root.getAttribute("data-theme") === "light" ? "light" : "dark";
+    apply(cur === "light" ? "dark" : "light");
+  });
+}
+
 async function init() {
+  initThemeToggle();
   bindTabs();
   tickClock();
   setInterval(tickClock, 1000);
@@ -1029,6 +2299,28 @@ async function init() {
   } catch (e) {
     console.warn("CDR UI init:", e);
   }
+  try {
+    initAlarmUi();
+  } catch (e) {
+    console.warn("Alarm UI init:", e);
+  }
+  try {
+    initGatewayUi();
+  } catch (e) {
+    console.warn("Gateway UI init:", e);
+  }
+  try {
+    initExtensionUi();
+  } catch (e) {
+    console.warn("Extension UI init:", e);
+  }
+  try {
+    initMapUi();
+  } catch (e) {
+    console.warn("MAP VIEW init:", e);
+  }
+  // Manual Refresh on Extension tab → enqueue (yields to 60s pack)
+  window.__cmEnqueueExtension = (opts) => enqueueExtensionRefresh(opts || {});
 
   $("btn-connect").addEventListener("click", connect);
   $("btn-disconnect").addEventListener("click", disconnect);
@@ -1039,8 +2331,35 @@ async function init() {
   }
   $("btn-add-tg").addEventListener("click", addTg);
   $("btn-detail-back").addEventListener("click", closeDetail);
-  $("btn-detail-refresh").addEventListener("click", () => {
-    if (state.detailTg) loadDetail(state.detailTg);
+  $("btn-detail-refresh").addEventListener("click", async () => {
+    if (!state.detailTg) return;
+    const tg = state.detailTg;
+    const btn = $("btn-detail-refresh");
+    if (btn) {
+      btn.disabled = true;
+      btn.classList.add("is-loading");
+      btn.textContent = "Refreshing…";
+    }
+    try {
+      if (state.refreshing) {
+        enqueueJob({ kind: "status", tg });
+        showProgress("Refresh TG", `Queued status trunk ${tg} — waiting for OSSI…`);
+        finishProgress(true, `Queued status trunk ${tg}`);
+      } else {
+        await loadDetail(tg, { force: true });
+      }
+    } catch (e) {
+      showProgress("Refresh TG", String(e.message || e));
+      finishProgress(false, String(e.message || e));
+      const closeBtn = $("btn-progress-close");
+      if (closeBtn) closeBtn.hidden = false;
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.classList.remove("is-loading");
+        btn.textContent = "Refresh 此 TG";
+      }
+    }
   });
   $("inp-tg").addEventListener("keydown", (e) => {
     if (e.key === "Enter") addTg();
@@ -1051,7 +2370,9 @@ async function init() {
   $("chk-auto").addEventListener("change", () => {
     if (state.connected && $("chk-auto").checked) {
       // Turn auto on → silent update now, then 60s (no popup for auto path)
-      progressiveRefresh({ reason: "auto-on", showModal: false });
+      progressiveRefresh({ reason: "auto-on", showModal: false }).catch((e) =>
+        console.warn("auto-on refresh:", e?.message || e)
+      );
     } else {
       clearAuto();
     }
@@ -1065,56 +2386,95 @@ async function init() {
 
   // Browser tab focus: when user returns to this page, refresh trunk view
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible" && state.connected && state.activeTab === "trunk" && $("chk-auto")?.checked) {
-      progressiveRefresh({ reason: "visible", showModal: false });
+    if (document.visibilityState === "visible" && state.connected && $("chk-auto")?.checked) {
+      progressiveRefresh({ reason: "visible", showModal: false }).catch((e) =>
+        console.warn("visible refresh:", e?.message || e)
+      );
     }
   });
 
   startCountdownClock();
   applyUiMode();
 
-  // Soft init: bridge down must not freeze the page (502 on /monitored)
+  // Soft init: NEVER auto-login. Only resume if this browser tab had clicked Login
+  // (sessionStorage) AND bridge still has OSSI — e.g. F5. Fresh open / reboot → must Login.
   try {
-    // Live session first — drives Session badge (not trunk_data cache)
     try {
       const st = await api("session/status");
-      if (st.connected) {
+      const allowResume = !!st.connected;
+
+      if (allowResume) {
+        // F5 / same API session still logged in → restore UI (do not drop OSSI)
+        markUiLoggedIn();
         state.connected = true;
         $("meta-host").textContent = st.host || "—";
         setSessionLabel("Monitoring (OSSI)", true);
         applyUiMode();
-        startHeartbeat();
-        startCountdownClock();
-        // Resume: refresh this view now then arm 60s
-        progressiveRefresh({ reason: "resume", showModal: false });
+        await loadMonitoredSoft();
+        try {
+          await loadTrunkData({ soft: true });
+        } catch {
+          /* cache miss OK */
+        }
+        $("chk-auto").checked = true;
+        onSessionLive();
+        setAlarmSessionConnected(true);
+        setGatewaySessionConnected(true);
+        setExtensionSessionConnected(true);
+        setMapSessionConnected(true);
+        startExtensionHourlyTimer();
+        // F5: use cache + hourly timer; re-queue list extension only if cache empty
+        try {
+          const cached = await api("extensions").catch(() => null);
+          const n = Array.isArray(cached?.items) ? cached.items.length : 0;
+          if (n === 0) {
+            enqueueExtensionRefresh({ showModal: false, reason: "resume-empty" });
+          }
+        } catch {
+          enqueueExtensionRefresh({ showModal: false, reason: "resume-empty" });
+        }
+        progressiveRefresh({ reason: "resume", showModal: false }).catch((e) =>
+          console.warn("resume refresh:", e?.message || e)
+        );
       } else {
+        clearUiLoggedIn();
         state.connected = false;
         setSessionLabel("Disconnected", false);
+        applyUiMode();
+        await loadMonitoredSoft();
+        try {
+          await loadTrunkData({ soft: true });
+        } catch {
+          /* cache miss OK */
+        }
       }
     } catch {
+      clearUiLoggedIn();
       state.connected = false;
       setSessionLabel("Disconnected", false);
-    }
-    await loadMonitoredSoft();
-    try {
-      await loadTrunkData(); // may show last numbers; will NOT flip Session to Monitoring if offline
-    } catch {
-      /* cache miss OK */
+      applyUiMode();
+      await loadMonitoredSoft();
+      try {
+        await loadTrunkData({ soft: true });
+      } catch {
+        /* ignore */
+      }
     }
   } catch {
     /* offline bridge */
   }
 
-  try {
-    // No ensure=1 here — auto-start can block ~10s; Login modal does ensure
-    const h = await api("health");
-    if (h && h.bridgeHealthy) {
-      setStatus("就緒：填 IP / Password → 撳 Login 即開始 monitor。");
-    } else {
-      setStatus("API 已上。撳 Login 會自動開 OSSI bridge 並連 CM（會顯示進度）。");
+  if (!state.connected) {
+    try {
+      const h = await api("health");
+      if (h && h.bridgeHealthy) {
+        setStatus("請手動 Login（填 Host / Password）。唔會自動登入。");
+      } else {
+        setStatus("API 已上。撳 Login 會開 OSSI bridge 並連 CM（需手動輸入密碼）。");
+      }
+    } catch {
+      setStatus("API 未就緒 — 檢查 IIS /CM/api。就緒後請手動 Login。");
     }
-  } catch {
-    setStatus("API 未就緒 — 檢查 IIS /CM/api。就緒後只需 Login。");
   }
 }
 

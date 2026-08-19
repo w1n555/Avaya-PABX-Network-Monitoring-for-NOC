@@ -28,8 +28,36 @@ app.UseCors();
 // Resolve data dir relative to published api/ → site root data/
 var siteRoot = Path.GetFullPath(Path.Combine(app.Environment.ContentRootPath, ".."));
 var dataDir = Path.Combine(siteRoot, "data");
+var dataLiveDir = Path.Combine(siteRoot, "data_live");
 Directory.CreateDirectory(dataDir);
 var cdrFiles = new CmApi.Services.CdrFileService(siteRoot);
+
+static async Task<IResult> ReadAlarmsFallback(string siteRoot, string dataLiveDir)
+{
+    foreach (var p in new[]
+             {
+                 Path.Combine(siteRoot, "alarms_cache.json"),
+                 Path.Combine(dataLiveDir, "alarms.json"),
+                 Path.Combine(siteRoot, "data", "alarms.json"),
+             })
+    {
+        if (!File.Exists(p)) continue;
+        try
+        {
+            var json = await File.ReadAllTextAsync(p);
+            return Results.Content(json, "application/json");
+        }
+        catch { /* try next */ }
+    }
+    return Results.Json(new
+    {
+        ok = true,
+        active = Array.Empty<object>(),
+        resolved = Array.Empty<object>(),
+        mtceTypes = Array.Empty<string>(),
+        summary = new { activeMajor = 0, activeMinor = 0, activeWarning = 0, activeTotal = 0 },
+    });
+}
 
 app.MapGet("/health", async (OssiBridgeClient bridge, HttpRequest req) =>
 {
@@ -109,11 +137,30 @@ app.MapPost("/session/disconnect", async (OssiBridgeClient bridge) =>
 
 // Browser open keep-alive; if no heartbeat ~90s, bridge logs off OSSI
 // Light path: no bridge auto-start storm; soft 200 on transient failure so UI does not thrash
-app.MapPost("/session/heartbeat", async (OssiBridgeClient bridge) =>
+// Forward { tab } so bridge knows which page is open (AUTO 60s is tab-scoped in the browser)
+app.MapPost("/session/heartbeat", async (HttpRequest req, OssiBridgeClient bridge) =>
 {
     try
     {
-        var el = await bridge.PostLightAsync("session/heartbeat", new { });
+        string tab = "trunk";
+        try
+        {
+            using var doc = await JsonDocument.ParseAsync(req.Body);
+            if (doc.RootElement.ValueKind == JsonValueKind.Object
+                && doc.RootElement.TryGetProperty("tab", out var t)
+                && t.ValueKind == JsonValueKind.String)
+            {
+                var s = (t.GetString() ?? "").Trim().ToLowerInvariant();
+                if (s is "trunk" or "alarm" or "cdr" or "station" or "vdn")
+                    tab = s;
+            }
+        }
+        catch
+        {
+            /* empty / invalid body → default trunk */
+        }
+
+        var el = await bridge.PostLightAsync("session/heartbeat", new { tab });
         return Results.Json(el);
     }
     catch (Exception ex)
@@ -165,6 +212,23 @@ app.MapPost("/refresh/one", async (TgRequest req, OssiBridgeClient bridge) =>
     }
 });
 
+// CM System Time + Time Sync (OSSI display time; UI polls hourly)
+app.MapGet("/cm-time", async (HttpRequest req, OssiBridgeClient bridge) =>
+{
+    try
+    {
+        var force = string.Equals(req.Query["force"], "1", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(req.Query["force"], "true", StringComparison.OrdinalIgnoreCase);
+        var path = force ? "cm-time?force=1" : "cm-time";
+        var el = await bridge.GetAsync(path);
+        return Results.Json(el);
+    }
+    catch (Exception ex)
+    {
+        return Results.Json(new { ok = false, error = ex.Message }, statusCode: 502);
+    }
+});
+
 app.MapGet("/trunk-data", async (OssiBridgeClient bridge) =>
 {
     try
@@ -182,6 +246,90 @@ app.MapGet("/trunk-data", async (OssiBridgeClient bridge) =>
             return Results.Content("{\"ok\":true,\"data\":" + json + "}", "application/json");
         }
         return Results.Json(new { ok = false, error = "No trunk data" }, statusCode: 503);
+    }
+});
+
+// Alarms — OSSI display alarms; file fallback for offline / no bridge
+app.MapGet("/alarms", async (HttpRequest req, OssiBridgeClient bridge) =>
+{
+    var force = string.Equals(req.Query["force"], "1", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(req.Query["refresh"], "1", StringComparison.OrdinalIgnoreCase);
+    try
+    {
+        var path = force ? "alarms?force=1" : "alarms";
+        var el = await bridge.GetAsync(path);
+        return Results.Json(el);
+    }
+    catch
+    {
+        return await ReadAlarmsFallback(siteRoot, dataLiveDir);
+    }
+});
+
+app.MapPost("/alarms/refresh", async (OssiBridgeClient bridge) =>
+{
+    try
+    {
+        var el = await bridge.PostAsync("alarms/refresh", new { });
+        return Results.Json(el);
+    }
+    catch
+    {
+        return await ReadAlarmsFallback(siteRoot, dataLiveDir);
+    }
+});
+
+static async Task<IResult> ReadGatewaysFallback(string siteRoot, string dataLiveDir)
+{
+    foreach (var p in new[]
+             {
+                 Path.Combine(siteRoot, "gateways_cache.json"),
+                 Path.Combine(dataLiveDir, "gateways.json"),
+                 Path.Combine(siteRoot, "data", "gateways.json"),
+             })
+    {
+        if (!File.Exists(p)) continue;
+        try
+        {
+            var json = await File.ReadAllTextAsync(p);
+            return Results.Content(json, "application/json");
+        }
+        catch { /* try next */ }
+    }
+    return Results.Json(new
+    {
+        ok = true,
+        items = Array.Empty<object>(),
+        summary = new { total = 0, up = 0, down = 0, mj = 0, mn = 0, wn = 0 },
+    });
+}
+
+app.MapGet("/gateways", async (HttpRequest req, OssiBridgeClient bridge) =>
+{
+    var force = string.Equals(req.Query["force"], "1", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(req.Query["refresh"], "1", StringComparison.OrdinalIgnoreCase);
+    try
+    {
+        var path = force ? "gateways?force=1" : "gateways";
+        var el = await bridge.GetAsync(path);
+        return Results.Json(el);
+    }
+    catch
+    {
+        return await ReadGatewaysFallback(siteRoot, dataLiveDir);
+    }
+});
+
+app.MapPost("/gateways/refresh", async (OssiBridgeClient bridge) =>
+{
+    try
+    {
+        var el = await bridge.PostAsync("gateways/refresh", new { });
+        return Results.Json(el);
+    }
+    catch
+    {
+        return await ReadGatewaysFallback(siteRoot, dataLiveDir);
     }
 });
 
@@ -271,20 +419,22 @@ app.MapPut("/monitored", async (MonitoredPutRequest req, OssiBridgeClient bridge
     }
 });
 
-// Channel-level detail from live `status trunk N` (Connected = port/raw only)
-app.MapGet("/trunks/{tg:int}/detail", async (int tg, OssiBridgeClient bridge) =>
+// Channel detail: cache from 60s poll by default; ?force=1 re-runs status trunk
+app.MapGet("/trunks/{tg:int}/detail", async (int tg, HttpRequest req, OssiBridgeClient bridge) =>
 {
     if (tg < 1)
         return Results.BadRequest(new { ok = false, error = "tg must be >= 1" });
     try
     {
-        var el = await bridge.GetAsync($"trunks/{tg}/detail");
+        var force = string.Equals(req.Query["force"], "1", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(req.Query["force"], "true", StringComparison.OrdinalIgnoreCase);
+        var path = force ? $"trunks/{tg}/detail?force=1" : $"trunks/{tg}/detail";
+        var el = await bridge.GetAsync(path);
         return Results.Json(el);
     }
     catch (Exception ex)
     {
         var msg = ex.Message ?? "";
-        // Bridge returns 401 when OSSI session not connected
         var code = msg.Contains("Not connected", StringComparison.OrdinalIgnoreCase) ? 401 : 502;
         return Results.Json(new { ok = false, error = msg }, statusCode: code);
     }
@@ -294,6 +444,7 @@ app.MapGet("/trunks/{tg:int}/detail", async (int tg, OssiBridgeClient bridge) =>
 app.MapGet("/cdr/status", () =>
 {
     var days = cdrFiles.ListDays(null, null);
+    var logger = cdrFiles.GetLoggerSnapshot();
     return Results.Ok(new
     {
         ok = true,
@@ -301,6 +452,27 @@ app.MapGet("/cdr/status", () =>
         dayCount = days.Count,
         days,
         latest = days.Count > 0 ? days[^1] : null,
+        loggerUp = logger.Listening,
+        loggerPort = logger.Port,
+        todayFile = logger.TodayFile,
+        lastCall = logger.LastWrite,
+        lastCallAgeSec = logger.LastWriteAgeSec,
+        todayBytes = logger.TodayBytes,
+    });
+});
+
+app.MapGet("/cdr/logger", () =>
+{
+    var logger = cdrFiles.GetLoggerSnapshot();
+    return Results.Ok(new
+    {
+        ok = true,
+        up = logger.Listening,
+        port = logger.Port,
+        todayFile = logger.TodayFile,
+        lastCall = logger.LastWrite,
+        lastCallAgeSec = logger.LastWriteAgeSec,
+        todayBytes = logger.TodayBytes,
     });
 });
 

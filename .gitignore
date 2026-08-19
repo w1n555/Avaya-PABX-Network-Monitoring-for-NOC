@@ -36,5 +36,16 @@ python/runtime/
 
 
 cdr-link/cdr/*.TXT
+cdr-link/cdr/*.txt
 cdr-link/logs/
+
+# Live OSSI caches (regenerated on this site)
+alarms_cache.json
+extensions_cache.json
+gateways_cache.json
+
+# Build / leftover
+vendor/avaya-ossi/**/*.egg-info/
+scripts/start-bridge-18766.*
+scripts/start-bridge-18767.*
 

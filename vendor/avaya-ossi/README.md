@@ -19,6 +19,7 @@ Verified style: **CM 10.2**, terminal type **`ossit`**, SAT port **5022**.
 | Idle logoff | Default **30 minutes**; every command resets the timer |
 | Error recovery | On failure → reconnect + **one** retry |
 | Huge lists | `max_more_pages` then answer **`n`** (safe sample) |
+| Forms | `run(..., form_fields=["0001y"])` → `f0001\\tvalue` then `t` |
 | Installable package | `pip install -e .` → `import avaya_ossi` |
 
 ---
@@ -108,6 +109,7 @@ with OssiSession(cfg) as sess:
     r1 = sess.run("status trunk 1")          # logs in
     r2 = sess.run("list trunk-group")        # reuses session
     r3 = sess.run("list station", max_more_pages=5)  # sample only
+    r4 = sess.run("display alarms", form_fields=["0001y"])  # Active=y (tab FID)
 
     print(r1.ok, r1.elapsed_seconds, r1.did_login)
     print(r2.used_existing_session)          # True

@@ -11,7 +11,7 @@ if not exist "%DIR%\logs" mkdir "%DIR%\logs"
 
 cd /d "%DIR%"
 echo Starting CDR logger on 0.0.0.0:9000 ...
-echo Logs: %DIR%\cdr\YYYYMMDD.TXT
+echo Daily files: %DIR%\cdr\YYYYMMDD.txt
 echo.
 "%PY%" "%DIR%\cdr_logger.py" --host 0.0.0.0 --port 9000 --log-dir "%DIR%\cdr"
 endlocal

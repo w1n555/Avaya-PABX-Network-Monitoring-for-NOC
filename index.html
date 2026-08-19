@@ -1,24 +1,32 @@
 <!DOCTYPE html>
-<html lang="zh-Hant">
+<html lang="zh-Hant" data-theme="dark">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Avaya PABX Network Monitoring for NOC</title>
   <link rel="icon" href="data:," />
   <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="vendor/leaflet/leaflet.css" />
+  <script>
+    // Apply theme before paint (avoid flash)
+    try {
+      var t = localStorage.getItem("cm_noc_theme");
+      if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
+    } catch (e) {}
+  </script>
 </head>
 <body>
   <div class="app">
     <header class="topbar">
       <div class="brand">
         <div class="brand-title">Avaya PABX Network Monitoring</div>
-        <div class="brand-sub">NOC · OSSI (avaya-ossi) · Read-only</div>
       </div>
       <div class="top-meta">
+        <button type="button" class="btn-theme" id="btn-theme" title="Switch light / dark theme" aria-label="Theme">☀</button>
         <div class="meta-item"><span class="k">CM</span><span class="v" id="meta-host">—</span></div>
         <div class="meta-item"><span class="k">Session</span><span class="v" id="meta-session">已斷線</span></div>
-        <div class="meta-item"><span class="k">Last update</span><span class="v" id="meta-updated">—</span></div>
-        <div class="meta-item clock" id="live-clock">--:--:--</div>
+        <div class="meta-item"><span class="k">System Time</span><span class="v" id="meta-cm-time">—</span></div>
+        <div class="meta-item clock"><span class="k">Local PC Time</span><span class="v" id="live-clock">--:--:--</span></div>
       </div>
     </header>
 
@@ -38,10 +46,11 @@
 
     <nav class="tabs" id="main-tabs" role="tablist" aria-label="NOC modules">
       <button type="button" class="tab active" data-tab="trunk" role="tab" aria-selected="true">Trunk</button>
+      <button type="button" class="tab" data-tab="gateway" role="tab" aria-selected="false">Gateway</button>
+      <button type="button" class="tab" data-tab="map" role="tab" aria-selected="false">MAP VIEW</button>
+      <button type="button" class="tab" data-tab="extension" role="tab" aria-selected="false">Extension</button>
       <button type="button" class="tab" data-tab="cdr" role="tab" aria-selected="false">CDR</button>
-      <button type="button" class="tab disabled" data-tab="station" disabled title="Coming soon" role="tab">Station <span class="soon">soon</span></button>
-      <button type="button" class="tab disabled" data-tab="vdn" disabled title="Coming soon" role="tab">VDN <span class="soon">soon</span></button>
-      <button type="button" class="tab disabled" data-tab="alarm" disabled title="Coming soon" role="tab">Alarm <span class="soon">soon</span></button>
+      <button type="button" class="tab" data-tab="alarm" role="tab" aria-selected="false">Alarm</button>
     </nav>
 
     <main class="main" id="panel-trunk" data-panel="trunk">
@@ -49,16 +58,24 @@
         <div class="panel-head">
           <div>
             <h2>Trunk Group Status</h2>
-            <p class="hint">監控清單 · OSSI <code>status trunk N</code>（唯讀）。拖曳 ⋮⋮ 可改排序；撳 TG 列睇 channel 詳情。</p>
+            <p class="hint hint-drag">拖曳 ⋮⋮ 可改排序</p>
           </div>
-          <div class="card-actions">
-            <label class="chk"><input type="checkbox" id="chk-auto" checked /> Auto 60s</label>
-            <span class="countdown-line" id="trunk-countdown">Next update: —</span>
-            <button type="button" class="btn btn-primary" id="btn-refresh-now" disabled>Refresh</button>
-            <div class="legend">
-              <span class="lg green"></span>&lt;70%
-              <span class="lg yellow"></span>70–90%
-              <span class="lg red"></span>&gt;90% / Idle=0
+          <div class="card-actions-col">
+            <div class="card-actions">
+              <label class="chk"><input type="checkbox" id="chk-auto" checked /> Auto 60s</label>
+              <span class="countdown-line" id="trunk-countdown">Next: —</span>
+              <span class="trunk-auto-status" id="trunk-auto-status" hidden></span>
+              <div class="refresh-btn-wrap">
+                <button type="button" class="btn btn-primary" id="btn-refresh-now" disabled>Refresh</button>
+                <div class="refresh-meta">Updated <span class="v mono" id="meta-updated">—</span></div>
+              </div>
+            </div>
+            <div class="legend-block">
+              <div class="legend">
+                <span class="lg green"></span>&lt;70%
+                <span class="lg yellow"></span>70–90%
+                <span class="lg red"></span>&gt;90% / Idle=0
+              </div>
             </div>
           </div>
         </div>
@@ -99,7 +116,6 @@
             <span class="detail-meta" id="detail-meta"></span>
             <button type="button" class="btn" id="btn-detail-refresh">Refresh 此 TG</button>
           </div>
-          <p class="hint detail-hint">Connected 欄係 port／raw（唔做 station 反查）。</p>
           <div class="table-wrap">
             <table class="data-table detail-table" id="detail-table">
               <thead>
@@ -123,9 +139,8 @@
     <!-- CDR TAB: real files from cdr-link/cdr -->
     <main class="main hidden" id="panel-cdr" data-panel="cdr">
       <div class="cdr-banner" id="cdr-live-banner">
-        <strong>Live CDR files</strong>
-        — Daily logs under <code id="cdr-rel-path">cdr-link/cdr/YYYYMMDD.txt</code>
-        · <span id="cdr-status-line">Checking…</span>
+        <span class="cdr-logger-pill" id="cdr-logger-pill">Logger —</span>
+        <span id="cdr-status-line">Checking…</span>
       </div>
 
       <section class="card cdr-card">
@@ -183,6 +198,12 @@
             <p class="hint">Calls per hour (0–23) for the selected day. Click Calculate to scan that day's file.</p>
           </div>
           <div class="card-actions">
+            <div class="cdr-toggle-row" data-flt-scope="daily" role="group" aria-label="Daily filters">
+              <button type="button" class="btn cdr-toggle" data-flt="in" aria-pressed="false" title="Incoming">IN</button>
+              <button type="button" class="btn cdr-toggle" data-flt="out" aria-pressed="false" title="Outgoing">OUT</button>
+              <button type="button" class="btn cdr-toggle" data-flt="ssp" aria-pressed="false" title="TAC 1401–1403">SSP</button>
+              <button type="button" class="btn cdr-toggle" data-flt="bps" aria-pressed="false" title="TAC 1411–1413">BPS</button>
+            </div>
             <label class="cdr-inline-label">Day <input type="date" id="cdr-day" /></label>
             <button type="button" class="btn btn-primary" id="btn-cdr-calc-daily">Calculate</button>
           </div>
@@ -200,6 +221,12 @@
             <p class="hint">Sum of hourly calls across 7 days starting from the selected week start date.</p>
           </div>
           <div class="card-actions">
+            <div class="cdr-toggle-row" data-flt-scope="weekly" role="group" aria-label="Weekly filters">
+              <button type="button" class="btn cdr-toggle" data-flt="in" aria-pressed="false" title="Incoming">IN</button>
+              <button type="button" class="btn cdr-toggle" data-flt="out" aria-pressed="false" title="Outgoing">OUT</button>
+              <button type="button" class="btn cdr-toggle" data-flt="ssp" aria-pressed="false" title="TAC 1401–1403">SSP</button>
+              <button type="button" class="btn cdr-toggle" data-flt="bps" aria-pressed="false" title="TAC 1411–1413">BPS</button>
+            </div>
             <label class="cdr-inline-label">Week start <input type="date" id="cdr-week-start" /></label>
             <button type="button" class="btn btn-primary" id="btn-cdr-calc-weekly">Calculate</button>
           </div>
@@ -217,6 +244,12 @@
             <p class="hint">Total calls per clock-hour across all daily files in the selected month.</p>
           </div>
           <div class="card-actions">
+            <div class="cdr-toggle-row" data-flt-scope="monthly" role="group" aria-label="Monthly filters">
+              <button type="button" class="btn cdr-toggle" data-flt="in" aria-pressed="false" title="Incoming">IN</button>
+              <button type="button" class="btn cdr-toggle" data-flt="out" aria-pressed="false" title="Outgoing">OUT</button>
+              <button type="button" class="btn cdr-toggle" data-flt="ssp" aria-pressed="false" title="TAC 1401–1403">SSP</button>
+              <button type="button" class="btn cdr-toggle" data-flt="bps" aria-pressed="false" title="TAC 1411–1413">BPS</button>
+            </div>
             <label class="cdr-inline-label">Month <input type="month" id="cdr-month" /></label>
             <button type="button" class="btn btn-primary" id="btn-cdr-calc-monthly">Calculate</button>
           </div>
@@ -225,21 +258,236 @@
         <div class="hour-chart" id="cdr-monthly-chart" aria-label="Monthly hourly chart"></div>
         <div class="hour-axis"><span>0</span><span>6</span><span>12</span><span>18</span><span>23</span></div>
       </section>
+
+      <!-- Erlang — offline CDR .txt only -->
+      <section class="card cdr-card" id="cdr-erlang-card">
+        <div class="panel-head">
+          <div>
+            <h2>Erlang capacity</h2>
+            <p class="hint">
+              Offline CDR only (daily .txt). Busy hour = max concurrent hour.
+              Live util stays on Trunk tab.
+            </p>
+          </div>
+          <div class="card-actions erlang-actions">
+            <div class="cdr-toggle-row" data-flt-scope="erlang" role="group" aria-label="Erlang filters">
+              <button type="button" class="btn cdr-toggle" data-flt="in" aria-pressed="false" title="Incoming">IN</button>
+              <button type="button" class="btn cdr-toggle" data-flt="out" aria-pressed="false" title="Outgoing">OUT</button>
+              <button type="button" class="btn cdr-toggle" data-flt="ssp" aria-pressed="false" title="TAC 1401–1403">SSP</button>
+              <button type="button" class="btn cdr-toggle" data-flt="bps" aria-pressed="false" title="TAC 1411–1413">BPS</button>
+            </div>
+            <label class="cdr-inline-label">Day <input type="date" id="erlang-day" /></label>
+            <label class="cdr-inline-label" title="Channels available (edit for what-if)">Channels <input type="number" id="erlang-n" min="1" max="9999" step="1" placeholder="auto" class="erlang-n-input" /></label>
+            <label class="cdr-inline-label" title="Target block % (service grade)">Target Block % <input type="number" id="erlang-target-b" min="0.01" max="20" step="0.1" value="1" class="erlang-b-input" /></label>
+            <button type="button" class="btn btn-primary" id="btn-cdr-calc-erlang">Calculate</button>
+          </div>
+        </div>
+        <div class="cdr-kpi-row" id="cdr-erlang-kpi"></div>
+        <p class="hint erlang-meta" id="cdr-erlang-meta">Pick day → Calculate (reads offline CDR files only).</p>
+      </section>
     </main>
 
-    <main class="main hidden" id="panel-station" data-panel="station">
-      <div class="placeholder">Station — coming soon</div>
-    </main>
-    <main class="main hidden" id="panel-vdn" data-panel="vdn">
-      <div class="placeholder">VDN — coming soon</div>
+    <main class="main hidden" id="panel-extension" data-panel="extension">
+      <section class="card alarm-card" id="extension-card">
+        <div class="panel-head">
+          <div>
+            <h2>Extension List</h2>
+            <p class="hint">OSSI <span class="mono">list extension</span> + <span class="mono">list station</span> — Port merged — search + type filter — refresh hourly (queued)</p>
+          </div>
+          <div class="card-actions-col">
+            <div class="card-actions">
+              <span class="countdown-line" id="ext-countdown">Next: —</span>
+              <span class="trunk-auto-status" id="ext-auto-status" hidden></span>
+              <div class="refresh-btn-wrap">
+                <button type="button" class="btn btn-primary" id="btn-ext-refresh" disabled>Refresh</button>
+                <div class="refresh-meta">Updated <span class="v mono" id="ext-meta-updated">—</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="alarm-type-filters" id="ext-search-filters">
+          <span class="hint" style="margin:0">Search (contains):</span>
+          <input type="search" id="ext-search" class="gw-search" placeholder="extension / name / port / type / gateway" autocomplete="off" />
+          <span class="hint mono" id="ext-search-meta" style="margin:0"></span>
+        </div>
+        <div class="alarm-type-filters" id="ext-type-filters">
+          <span class="hint" style="margin:0">Type filters (ON=show, default all ON):</span>
+          <div class="cdr-toggle-row" id="ext-type-btns"></div>
+        </div>
+        <div class="cdr-kpi-row" id="ext-summary-kpi"></div>
+        <div class="table-wrap alarm-table-wrap">
+          <table class="data-table" id="ext-table">
+            <thead>
+              <tr>
+                <th>Extension</th>
+                <th>Type</th>
+                <th>Port</th>
+                <th>Gateway</th>
+                <th>Name</th>
+              </tr>
+            </thead>
+            <tbody id="ext-tbody">
+              <tr class="empty"><td colspan="5">Login queues list extension — open this tab to view cache.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
     </main>
     <main class="main hidden" id="panel-alarm" data-panel="alarm">
-      <div class="placeholder">Alarm — coming soon</div>
+      <section class="card alarm-card">
+        <div class="panel-head">
+          <div>
+            <h2>Active Alarms</h2>
+          </div>
+          <div class="card-actions-col">
+            <div class="card-actions">
+              <span class="countdown-line" id="alarm-countdown">Next: —</span>
+              <span class="trunk-auto-status" id="alarm-auto-status" hidden></span>
+              <div class="alarm-actions" id="alarm-active-actions">
+                <button type="button" class="btn" id="btn-alarm-ack" title="Stop webpage flash only — does NOT clear alarms on CM">Ack (stop flash)</button>
+                <button type="button" class="btn cdr-toggle" id="btn-flash-yellow" data-manual-flash="minor" title="Manual deep yellow flash test">Flash Yellow</button>
+                <button type="button" class="btn cdr-toggle" id="btn-flash-red" data-manual-flash="major" title="Manual deep red flash test">Flash Red</button>
+              </div>
+              <div class="refresh-btn-wrap">
+                <button type="button" class="btn btn-primary" id="btn-alarm-refresh" disabled>Refresh</button>
+                <div class="refresh-meta">Updated <span class="v mono" id="alarm-meta-updated">—</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="alarm-type-filters" id="alarm-type-filters">
+          <span class="hint" style="margin:0">Mtce type filters (ON=show, default all ON):</span>
+          <div class="cdr-toggle-row" id="alarm-type-btns"></div>
+        </div>
+        <div class="cdr-kpi-row" id="alarm-summary-kpi"></div>
+        <div class="table-wrap alarm-table-wrap">
+          <table class="data-table" id="alarm-table">
+            <thead>
+              <tr>
+                <th>Date Alarmed</th>
+                <th>Severity</th>
+                <th>Mtce Name</th>
+                <th>Port</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="alarm-tbody">
+              <tr class="empty"><td colspan="5">Login then open Alarm tab — polls every 60s.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
     </main>
 
-    <footer class="footer">
-      Trunk: OSSI RO · CDR: daily files under <code>cdr-link/cdr</code> · Close page disconnects OSSI
-    </footer>
+    <main class="main hidden" id="panel-gateway" data-panel="gateway">
+      <section class="card alarm-card" id="gateway-card">
+        <div class="panel-head">
+          <div>
+            <h2>Media Gateway Status</h2>
+          </div>
+          <div class="card-actions-col">
+            <div class="card-actions">
+              <span class="countdown-line" id="gw-countdown">Next: —</span>
+              <span class="trunk-auto-status" id="gw-auto-status" hidden></span>
+              <div class="refresh-btn-wrap">
+                <button type="button" class="btn btn-primary" id="btn-gw-refresh" disabled>Refresh</button>
+                <div class="refresh-meta">Updated <span class="v mono" id="gw-meta-updated">—</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="alarm-type-filters" id="gw-search-filters">
+          <span class="hint" style="margin:0">Search hostname / IP (contains):</span>
+          <input type="search" id="gw-search" class="gw-search" placeholder="e.g. L  or  172.29.88" autocomplete="off" />
+        </div>
+        <div class="cdr-kpi-row" id="gw-summary-kpi"></div>
+        <div class="table-wrap alarm-table-wrap">
+          <table class="data-table" id="gw-table">
+            <thead>
+              <tr>
+                <th>MG</th>
+                <th>Hostname</th>
+                <th>Node</th>
+                <th>IP</th>
+                <th>Major</th>
+                <th>Minor</th>
+                <th>Warning</th>
+              </tr>
+            </thead>
+            <tbody id="gw-tbody">
+              <tr class="empty"><td colspan="7">Login then open Gateway tab — polls every 60s.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <main class="main hidden" id="panel-map" data-panel="map">
+      <section class="card map-card" id="map-card">
+        <div class="panel-head">
+          <div>
+            <h2>MAP VIEW</h2>
+            <p class="hint">Offline HK map · site pin from <span class="mono">map/sites.json</span> · lights from Gateway cache (WN = green)</p>
+          </div>
+          <div class="card-actions-col">
+            <div class="card-actions">
+              <span class="hint" style="margin:0">Search site / hostname</span>
+              <input type="search" id="map-search" class="gw-search" placeholder="CPB / GW43 / 172.29" autocomplete="off" />
+              <div class="refresh-meta">GW cache <span class="v mono" id="map-meta-updated">—</span></div>
+            </div>
+            <div class="legend-block">
+              <div class="legend">
+                <span class="lg green"></span>OK / Warning
+                <span class="lg yellow"></span>Minor
+                <span class="lg red"></span>Major / DOWN
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="cdr-kpi-row" id="map-summary-kpi"></div>
+        <p class="hint map-unmapped" id="map-unmapped" hidden></p>
+        <div class="map-shell">
+          <div class="map-canvas-wrap">
+            <div id="map-canvas" class="map-canvas" role="application" aria-label="Hong Kong site map"></div>
+          </div>
+          <aside class="map-side" id="map-side">
+            <div id="map-side-empty" class="map-side-empty">
+              <p class="hint">Click a site on the map.</p>
+              <p class="hint">Edit coordinates in <span class="mono">map/sites.json</span> on this web server, then refresh this tab.</p>
+            </div>
+            <div id="map-side-body" hidden>
+              <div class="map-side-head">
+                <div>
+                  <h3 id="map-side-title">—</h3>
+                  <p class="hint" id="map-side-sub"></p>
+                </div>
+                <div class="map-side-head-actions">
+                  <span class="map-light green" id="map-side-light">GREEN</span>
+                  <button type="button" class="btn" id="map-side-close" title="Close">×</button>
+                </div>
+              </div>
+              <div class="cdr-kpi-row" id="map-side-meta"></div>
+              <div class="table-wrap">
+                <table class="data-table" id="map-side-table">
+                  <thead>
+                    <tr>
+                      <th>MG</th>
+                      <th>Hostname</th>
+                      <th>Node</th>
+                      <th>MJ</th>
+                      <th>MN</th>
+                    </tr>
+                  </thead>
+                  <tbody id="map-side-tbody"></tbody>
+                </table>
+              </div>
+            </div>
+          </aside>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">Powered by Telecom</footer>
   </div>
 
   <!-- Login progress modal -->
@@ -250,10 +498,15 @@
         <span class="modal-spinner" id="login-modal-spinner" aria-hidden="true"></span>
       </div>
       <p class="modal-sub" id="login-modal-sub">Please wait…</p>
+      <div class="progress-bar-wrap">
+        <div class="progress-bar-fill" id="login-bar-fill" style="width:0%"></div>
+      </div>
+      <p class="progress-pct mono" id="login-pct">0%</p>
+      <p class="login-ossi-cmd mono" id="login-ossi-cmd">—</p>
       <ol class="progress-steps" id="login-progress-steps">
         <li data-step="1">Start OSSI bridge</li>
         <li data-step="2">Connect to CM (SSH + OSSI login)</li>
-        <li data-step="3">Ready</li>
+        <li data-step="3">OSSI cache (all tabs)</li>
       </ol>
       <p class="modal-detail mono" id="login-modal-detail"></p>
       <div class="modal-actions">
@@ -281,6 +534,7 @@
     </div>
   </div>
 
+  <script src="vendor/leaflet/leaflet.js"></script>
   <script src="app.js" type="module"></script>
 </body>
 </html>

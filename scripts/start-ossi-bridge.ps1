@@ -1,9 +1,9 @@
-# Start local OSSI bridge (127.0.0.1:18765) — portable, no hard-coded machine paths.
+# Start local OSSI bridge (127.0.0.1:18776 ONLY) — match api\appsettings.json.
 # Prefer: install.ps1 (auto). This script is for manual troubleshooting only.
 
 param(
     [string]$Root = "",
-    [int]$Port = 18765
+    [int]$Port = 18776
 )
 
 $ErrorActionPreference = "Stop"

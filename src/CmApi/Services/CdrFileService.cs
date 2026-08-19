@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Net.NetworkInformation;
 using System.Text.RegularExpressions;
 
 namespace CmApi.Services;
@@ -18,6 +19,69 @@ public sealed class CdrFileService
     }
 
     public string CdrDirectory => _cdrDir;
+
+    /// <summary>Port 9000 LISTENING + today's file last write. Does not connect (won't disturb CM TCP).</summary>
+    public CdrLoggerSnapshot GetLoggerSnapshot(int port = 9000)
+    {
+        var listening = false;
+        try
+        {
+            foreach (var ep in IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpListeners())
+            {
+                if (ep.Port == port)
+                {
+                    listening = true;
+                    break;
+                }
+            }
+        }
+        catch
+        {
+            /* ignore */
+        }
+
+        var today = DateTime.Now.ToString("yyyyMMdd", CultureInfo.InvariantCulture);
+        string? todayPath = null;
+        foreach (var name in new[] { today + ".txt", today + ".TXT" })
+        {
+            var p = Path.Combine(_cdrDir, name);
+            if (File.Exists(p))
+            {
+                todayPath = p;
+                break;
+            }
+        }
+
+        DateTime? lastWrite = null;
+        long? size = null;
+        if (todayPath != null)
+        {
+            try
+            {
+                var fi = new FileInfo(todayPath);
+                lastWrite = fi.LastWriteTime;
+                size = fi.Length;
+            }
+            catch
+            {
+                /* ignore */
+            }
+        }
+
+        int? ageSec = null;
+        if (lastWrite.HasValue)
+            ageSec = Math.Max(0, (int)(DateTime.Now - lastWrite.Value).TotalSeconds);
+
+        return new CdrLoggerSnapshot
+        {
+            Listening = listening,
+            Port = port,
+            TodayFile = todayPath != null ? Path.GetFileName(todayPath) : null,
+            LastWrite = lastWrite?.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture),
+            LastWriteAgeSec = ageSec,
+            TodayBytes = size,
+        };
+    }
 
     public IReadOnlyList<string> ListDays(DateOnly? from, DateOnly? to)
     {
@@ -97,12 +161,12 @@ public sealed class CdrFileService
 
                 parseOk++;
 
-                // hourly counts only well-parsed CDR
-                if (rec.Hour is >= 0 and <= 23)
-                    hourly[rec.Hour]++;
-
                 if (!filter.Matches(rec))
                     continue;
+
+                // Hourly only for filter-matched rows
+                if (rec.Hour is >= 0 and <= 23)
+                    hourly[rec.Hour]++;
 
                 matchTotal++;
                 if (matched.Count < maxMatches)
@@ -287,16 +351,28 @@ public sealed class CdrFilter
     public string? Calling { get; set; }
     public string? Called { get; set; }
     public string? Trunk { get; set; }
+    /// <summary>Single dir: in | out. Prefer Dirs for multi.</summary>
     public string? Dir { get; set; }
+    /// <summary>Multiple dirs (in/out). Empty = any.</summary>
+    public List<string>? Dirs { get; set; }
+    /// <summary>TAC list (e.g. 1401,1402). Empty = any. Matches code-used / in-trk / out-crt.</summary>
+    public List<string>? Tacs { get; set; }
     public int MinDur { get; set; }
 
     public bool Matches(CdrRecordDto r)
     {
         if (MinDur > 0 && r.DurationSec < MinDur)
             return false;
-        if (!string.IsNullOrWhiteSpace(Dir) &&
+
+        if (Dirs is { Count: > 0 })
+        {
+            if (!Dirs.Any(d => string.Equals(r.Dir, d, StringComparison.OrdinalIgnoreCase)))
+                return false;
+        }
+        else if (!string.IsNullOrWhiteSpace(Dir) &&
             !string.Equals(r.Dir, Dir, StringComparison.OrdinalIgnoreCase))
             return false;
+
         if (!string.IsNullOrWhiteSpace(Calling))
         {
             var q = Calling.Trim();
@@ -310,17 +386,29 @@ public sealed class CdrFilter
             if (!r.DialedNum.Contains(q, StringComparison.OrdinalIgnoreCase))
                 return false;
         }
-        if (!string.IsNullOrWhiteSpace(Trunk))
+        if (Tacs is { Count: > 0 })
+        {
+            if (!Tacs.Any(t => TacHit(r, t)))
+                return false;
+        }
+        else if (!string.IsNullOrWhiteSpace(Trunk))
         {
             var t = Trunk.Trim().Replace("TG", "", StringComparison.OrdinalIgnoreCase).Trim();
-            // match code_used / in_trk / out_crt
-            if (!r.CodeUsed.Contains(t, StringComparison.OrdinalIgnoreCase) &&
-                !r.InTrk.Contains(t, StringComparison.OrdinalIgnoreCase) &&
-                !r.OutCrt.Contains(t, StringComparison.OrdinalIgnoreCase) &&
-                !r.InCrt.Contains(t, StringComparison.OrdinalIgnoreCase))
+            if (!TacHit(r, t))
                 return false;
         }
         return true;
+    }
+
+    private static bool TacHit(CdrRecordDto r, string t)
+    {
+        if (string.IsNullOrWhiteSpace(t)) return false;
+        t = t.Trim();
+        return r.CodeUsed.Contains(t, StringComparison.OrdinalIgnoreCase) ||
+               r.InTrk.Contains(t, StringComparison.OrdinalIgnoreCase) ||
+               r.OutCrt.Contains(t, StringComparison.OrdinalIgnoreCase) ||
+               r.InCrt.Contains(t, StringComparison.OrdinalIgnoreCase) ||
+               r.CodeDial.Contains(t, StringComparison.OrdinalIgnoreCase);
     }
 }
 
@@ -343,6 +431,16 @@ public sealed class CdrRecordDto
     public string OutCrt { get; set; } = "";
     public string Dir { get; set; } = "";
     public bool ParseOk { get; set; }
+}
+
+public sealed class CdrLoggerSnapshot
+{
+    public bool Listening { get; set; }
+    public int Port { get; set; }
+    public string? TodayFile { get; set; }
+    public string? LastWrite { get; set; }
+    public int? LastWriteAgeSec { get; set; }
+    public long? TodayBytes { get; set; }
 }
 
 public sealed class CdrDayScanResult

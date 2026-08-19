@@ -12,7 +12,7 @@ namespace CmApi.Services;
 /// </summary>
 public sealed class OssiBridgeClient
 {
-    public const string DefaultBase = "http://127.0.0.1:18765";
+    public const string DefaultBase = "http://127.0.0.1:18776";
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
         PropertyNameCaseInsensitive = true,
@@ -65,12 +65,13 @@ public sealed class OssiBridgeClient
 
         var bridgeUri = new Uri(baseUrl.TrimEnd('/') + "/");
         _bridgeListenHost = string.IsNullOrWhiteSpace(bridgeUri.Host) ? "127.0.0.1" : bridgeUri.Host;
-        _bridgeListenPort = bridgeUri.IsDefaultPort ? 18765 : bridgeUri.Port;
+        _bridgeListenPort = bridgeUri.IsDefaultPort ? 18776 : bridgeUri.Port;
 
         _http = new HttpClient
         {
             BaseAddress = bridgeUri,
-            Timeout = TimeSpan.FromMinutes(3),
+            // list extension can take 30–120s; keep headroom over IIS proxy
+            Timeout = TimeSpan.FromMinutes(10),
         };
 
         _log.LogInformation(

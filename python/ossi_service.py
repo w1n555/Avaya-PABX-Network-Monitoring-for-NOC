@@ -61,7 +61,9 @@ from trunk_parse import (  # noqa: E402
 from alarm_parse import parse_alarms  # noqa: E402
 from gateway_parse import (  # noqa: E402
     gateway_summary,
+    join_config_extensions,
     join_gateways,
+    parse_list_configuration_media_gateway,
     parse_list_media_gateway,
 )
 from extension_parse import (  # noqa: E402
@@ -135,6 +137,7 @@ _gateway_items: list[dict[str, Any]] = []
 _last_gateway_at = 0.0
 _extension_items: list[dict[str, Any]] = []
 _last_extension_at = 0.0
+_gw_config_by_mg: dict[int, dict[str, Any]] = {}
 # Which UI tab is open (from heartbeat) — only that tab's OSSI auto work runs
 _ui_active_tab: str = "trunk"
 
@@ -450,7 +453,10 @@ def _status_one_tg(sess: OssiSession, tg: int, catalog: dict[int, dict[str, Any]
     No OSSI command logging — only structured result in trunk_data.json.
     """
     meta = catalog.get(tg, {})
-    st = sess.run(f"status trunk {tg}", max_more_pages=12)
+    st = sess.run(f"status trunk {tg}", max_more_pages=40)
+    if not st.ok:
+        time.sleep(0.4)
+        st = sess.run(f"status trunk {tg}", max_more_pages=40, retry_on_error=True)
     if not st.ok:
         # Quiet fail — no OSSI body log. UI shows Status "UPDATE FAILED".
         return {
@@ -620,6 +626,14 @@ def refresh_one_tg(tg: int) -> dict[str, Any]:
             "item": None,
             "extensionRefresh": True,
         }
+    if GATEWAY_CONFIG_TG_BASE <= tg_i <= GATEWAY_CONFIG_TG_BASE + 999:
+        payload = refresh_gateway_config(tg_i - GATEWAY_CONFIG_TG_BASE)
+        return {
+            "ok": payload.get("ok", True),
+            "gatewayConfig": payload,
+            "item": None,
+            "gatewayConfigRefresh": True,
+        }
     with _lock:
         if not _connected or _session is None:
             raise RuntimeError("Not connected")
@@ -628,8 +642,8 @@ def refresh_one_tg(tg: int) -> dict[str, Any]:
     try:
         with _ossi_lock:
             row = _status_one_tg(sess, int(tg), catalog)
-            # Brief gap so SAT is not hammered back-to-back (matches bulk path)
-            time.sleep(0.25)
+        # Gap after releasing lock so heartbeat / display time can slip in
+        time.sleep(0.2)
     except Exception as exc:
         meta = catalog.get(int(tg), {})
         row = {
@@ -1021,6 +1035,8 @@ ALARM_REFRESH_TG = 9999
 ALARM_REFRESH_ACTIVE_TG = 9996
 GATEWAY_REFRESH_TG = 9995
 EXTENSION_REFRESH_TG = 9994
+# refresh/one tg = 990000 + MG  →  list configuration media-gateway N (old CmApi)
+GATEWAY_CONFIG_TG_BASE = 990000
 
 
 def _run_display_alarms_form(
@@ -1217,6 +1233,121 @@ def gateways_public() -> dict[str, Any]:
         "items": [],
         "summary": gateway_summary([]),
     }
+
+
+def _gw_meta(mg: int) -> dict[str, Any]:
+    with _lock:
+        items = list(_gateway_items)
+    for g in items:
+        if int(g.get("mg") or 0) == int(mg):
+            return dict(g)
+    return {"mg": int(mg)}
+
+
+def gateway_config_public(mg: int) -> dict[str, Any]:
+    with _lock:
+        cached = _gw_config_by_mg.get(int(mg))
+        connected = _connected
+    if cached:
+        out = dict(cached)
+        out["connected"] = connected
+        out["cached"] = True
+        return out
+    return {
+        "ok": True,
+        "connected": connected,
+        "mg": int(mg),
+        "boards": [],
+        "assigned": [],
+        "cached": True,
+        "lastUpdate": None,
+        **_gw_meta(mg),
+    }
+
+
+def refresh_gateway_config(mg: int) -> dict[str, Any]:
+    """On-click OSSI `list configuration media-gateway N` (data is often page 2+)."""
+    global _gw_config_by_mg
+    mg_i = int(mg)
+    if mg_i < 1:
+        return {"ok": False, "error": "mg required", "mg": mg_i, "boards": [], "assigned": []}
+    with _lock:
+        if not _connected or _session is None:
+            raise RuntimeError("Not connected")
+        sess = _session
+        ext_items = list(_extension_items)
+
+    cmd = f"list configuration media-gateway {mg_i}"
+    text = ""
+    err: str | None = None
+    sec = 0.0
+    with _ossi_lock:
+        t0 = time.perf_counter()
+        try:
+            st = sess.run(cmd, max_more_pages=25, retry_on_error=False)
+            text = st.text or ""
+            if not parse_list_configuration_media_gateway(text, mg_i):
+                st2 = sess.run(
+                    "list configuration media-gateway",
+                    max_more_pages=25,
+                    form_fields=[f"0001\t{mg_i}"],
+                    retry_on_error=False,
+                )
+                alt = st2.text or ""
+                if parse_list_configuration_media_gateway(alt, mg_i) or len(alt) > len(text):
+                    text = alt
+                    cmd = "list configuration media-gateway + form"
+            if not getattr(st, "ok", True):
+                err = getattr(st, "error", None)
+        except Exception as exc:
+            err = str(exc)
+        sec = round(time.perf_counter() - t0, 2)
+        try:
+            p = PATHS.data_dir / f"list_configuration_media-gateway_{mg_i}_last.txt"
+            PATHS.data_dir.mkdir(parents=True, exist_ok=True)
+            p.write_text(text[:200000], encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+        time.sleep(0.15)
+
+    boards = parse_list_configuration_media_gateway(text, mg_i)
+    assigned = join_config_extensions(boards, ext_items)
+    assigned_n = sum(
+        1 for b in boards for p in (b.get("ports") or []) if p.get("state") == "assigned"
+    )
+    unassigned_n = sum(
+        1 for b in boards for p in (b.get("ports") or []) if p.get("state") == "unassigned"
+    )
+    payload = {
+        "ok": err is None,
+        "connected": True,
+        "mg": mg_i,
+        "command": cmd,
+        "boards": boards,
+        "assigned": assigned,
+        "summary": {
+            "boards": len(boards),
+            "assigned": assigned_n,
+            "unassigned": unassigned_n,
+            "withExt": sum(1 for a in assigned if a.get("extension")),
+        },
+        "lastUpdate": _now_iso(),
+        "timing": {"listSec": sec},
+        "cached": False,
+        **{k: v for k, v in _gw_meta(mg_i).items() if k not in ("mj", "mn", "wn")},
+    }
+    if err:
+        payload["error"] = err
+        payload["ok"] = bool(boards)
+    with _lock:
+        if boards or not _gw_config_by_mg.get(mg_i):
+            _gw_config_by_mg[mg_i] = payload
+        elif _gw_config_by_mg.get(mg_i) and err:
+            prev = dict(_gw_config_by_mg[mg_i])
+            prev["error"] = err
+            prev["connected"] = True
+            return prev
+    return payload
 
 
 def _write_extensions_payload() -> dict[str, Any]:
@@ -1609,6 +1740,31 @@ class Handler(BaseHTTPRequestHandler):
                     code = 401 if "Not connected" in str(exc) else 500
                     self._send(code, {"ok": False, "error": str(exc)})
                 return
+            # GET /gateways/51/config
+            if path.startswith("/gateways/") and path.endswith("/config"):
+                parts = path.strip("/").split("/")
+                qs = urlparse(self.path).query or ""
+                force = "force=1" in qs or "force=true" in qs.lower() or "refresh=1" in qs
+                try:
+                    mg = int(parts[1]) if len(parts) >= 3 else 0
+                except ValueError:
+                    mg = 0
+                if mg < 1:
+                    self._send(400, {"ok": False, "error": "invalid mg"})
+                    return
+                try:
+                    if force:
+                        touch_ui()
+                        payload = refresh_gateway_config(mg)
+                    else:
+                        if _connected:
+                            touch_ui()
+                        payload = gateway_config_public(mg)
+                    self._send(200, payload)
+                except Exception as exc:
+                    code = 401 if "Not connected" in str(exc) else 500
+                    self._send(code, {"ok": False, "error": str(exc)})
+                return
             if path in ("/alarms", "/alarm"):
                 # Cached list (also written to site alarms_cache.json for static fallback)
                 qs = urlparse(self.path).query or ""
@@ -1767,9 +1923,15 @@ class Handler(BaseHTTPRequestHandler):
                     with _lock:
                         _ui_active_tab = tab
                 try:
-                    if _connected and (
-                        _last_cm_time_mono <= 0
-                        or (time.monotonic() - _last_cm_time_mono) >= 55
+                    skip_time = bool(body.get("skipTime") or body.get("SkipTime"))
+                    if (
+                        _connected
+                        and not skip_time
+                        and not _ossi_lock.locked()
+                        and (
+                            _last_cm_time_mono <= 0
+                            or (time.monotonic() - _last_cm_time_mono) >= 55
+                        )
                     ):
                         fetch_cm_time(force=True)
                 except Exception:
@@ -1799,6 +1961,24 @@ class Handler(BaseHTTPRequestHandler):
                 touch_ui()
                 try:
                     payload = refresh_gateways()
+                    self._send(200, payload)
+                except Exception as exc:
+                    self._send(
+                        401 if "Not connected" in str(exc) else 500,
+                        {"ok": False, "error": str(exc)},
+                    )
+                return
+            if path in ("/gateways/config", "/gateway/config"):
+                touch_ui()
+                try:
+                    mg = int(body.get("mg") or body.get("Mg") or 0)
+                except (TypeError, ValueError):
+                    mg = 0
+                if mg < 1:
+                    self._send(400, {"ok": False, "error": "mg required"})
+                    return
+                try:
+                    payload = refresh_gateway_config(mg)
                     self._send(200, payload)
                 except Exception as exc:
                     self._send(

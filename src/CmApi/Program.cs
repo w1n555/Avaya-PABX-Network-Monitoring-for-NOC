@@ -151,7 +151,7 @@ app.MapPost("/session/heartbeat", async (HttpRequest req, OssiBridgeClient bridg
                 && t.ValueKind == JsonValueKind.String)
             {
                 var s = (t.GetString() ?? "").Trim().ToLowerInvariant();
-                if (s is "trunk" or "alarm" or "cdr" or "station" or "vdn")
+                if (s is "trunk" or "alarm" or "cdr" or "station" or "vdn" or "gateway" or "extension" or "map")
                     tab = s;
             }
         }
@@ -330,6 +330,26 @@ app.MapPost("/gateways/refresh", async (OssiBridgeClient bridge) =>
     catch
     {
         return await ReadGatewaysFallback(siteRoot, dataLiveDir);
+    }
+});
+
+app.MapGet("/gateways/{mg:int}/config", async (int mg, HttpRequest req, OssiBridgeClient bridge) =>
+{
+    if (mg < 1)
+        return Results.BadRequest(new { ok = false, error = "mg must be >= 1" });
+    try
+    {
+        var force = string.Equals(req.Query["force"], "1", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(req.Query["refresh"], "1", StringComparison.OrdinalIgnoreCase);
+        var path = force ? $"gateways/{mg}/config?force=1" : $"gateways/{mg}/config";
+        var el = await bridge.GetAsync(path);
+        return Results.Json(el);
+    }
+    catch (Exception ex)
+    {
+        var msg = ex.Message ?? "";
+        var code = msg.Contains("Not connected", StringComparison.OrdinalIgnoreCase) ? 401 : 502;
+        return Results.Json(new { ok = false, error = msg }, statusCode: code);
     }
 });
 

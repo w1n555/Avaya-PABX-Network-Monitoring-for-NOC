@@ -28,6 +28,8 @@ import {
   refreshGatewaysSilent,
   syncGatewayCountdown,
   setOssiBusy as setGatewayOssiBusy,
+  runGatewayConfigRefresh,
+  getOpenGatewayDetailMg,
 } from "./gateway-ui.js";
 import {
   initExtensionUi,
@@ -211,6 +213,29 @@ async function runQueuedJob(job) {
         /* ignore */
       }
     }
+    return;
+  }
+  if (job.kind === "gw-config") {
+    state.refreshing = true;
+    state.refreshingSince = Date.now();
+    try {
+      setOssiBusy(true);
+    } catch {
+      /* ignore */
+    }
+    try {
+      setStatus(`OSSI list configuration media-gateway ${job.mg}…`);
+      await runGatewayConfigRefresh(job.mg, { showModal: !!job.showModal });
+      setStatus("");
+    } finally {
+      state.refreshing = false;
+      state.refreshingSince = 0;
+      try {
+        setOssiBusy(false);
+      } catch {
+        /* ignore */
+      }
+    }
   }
 }
 
@@ -229,6 +254,16 @@ function enqueueExtensionRefresh(opts = {}) {
     return;
   }
   enqueueJob({ kind: "extensions", showModal, reason: opts.reason || "auto" });
+}
+
+/** Enqueue one-GW list configuration (click-in). Coalesce to latest MG. */
+function enqueueGwConfig(mg, opts = {}) {
+  const n = Number(mg);
+  if (!n) return;
+  for (let i = cmdQueue.length - 1; i >= 0; i -= 1) {
+    if (cmdQueue[i].kind === "gw-config") cmdQueue.splice(i, 1);
+  }
+  enqueueJob({ kind: "gw-config", mg: n, showModal: opts.showModal !== false });
 }
 
 /** Hourly list extension while session is live (not every 60s). */
@@ -295,6 +330,31 @@ function apiUrl(path) {
   if (/\.html?$/i.test(dir)) dir = dir.replace(/\/[^/]*$/, "/");
   else if (!dir.endsWith("/")) dir += "/";
   return dir + API + "/" + String(path).replace(/^\//, "");
+}
+
+function sleepMs(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/** One status trunk; retry once — SAT/lock blips are the usual UPDATE FAILED. */
+async function refreshOneTrunk(tg) {
+  const once = () =>
+    api("refresh/one", {
+      method: "POST",
+      body: JSON.stringify({ tg }),
+    });
+  try {
+    const res = await once();
+    const item = res && (res.item || res.Item);
+    if (item && item.tg != null && !item.error) return { res, item };
+    await sleepMs(450);
+    const res2 = await once();
+    return { res: res2, item: res2 && (res2.item || res2.Item) };
+  } catch (e) {
+    await sleepMs(450);
+    const res2 = await once();
+    return { res: res2, item: res2 && (res2.item || res2.Item) };
+  }
 }
 
 async function api(path, opts = {}) {
@@ -428,7 +488,7 @@ function applyUiMode() {
     if ($("connect-hint")) {
       $("connect-hint").hidden = false;
       $("connect-hint").textContent =
-        "必須手動 Login（Host / Password）。唔會自動登入。關閉分頁會切斷 OSSI。";
+        "必須手動 Login（Host / Password）。唔會自動登入。F5 會保持 session；關閉分頁約 90 秒後先切斷 OSSI。";
     }
   }
 }
@@ -496,6 +556,8 @@ function mergeRows() {
 
   return mon.map((m) => {
     const live = byTg.get(m.tg) || {};
+    const sticky = !!(state.tgStickyError && state.tgStickyError[m.tg]);
+    const err = live.error || (sticky ? "UPDATE FAILED" : null);
     return {
       tg: m.tg,
       order: m.order,
@@ -503,17 +565,29 @@ function mergeRows() {
       name: live.name || "",
       type: live.type || "",
       tac: live.tac || "",
-      total: live.total,
-      idle: live.idle,
-      busy: live.busy,
-      oos: live.oos,
-      utilizationPct: live.utilizationPct,
-      statusColor: live.statusColor,
+      total: err ? null : live.total,
+      idle: err ? null : live.idle,
+      busy: err ? null : live.busy,
+      oos: err ? null : live.oos,
+      utilizationPct: err ? null : live.utilizationPct,
+      statusColor: err ? "red" : live.statusColor,
       lastUpdate: live.lastUpdate,
-      error: live.error,
+      error: err,
       hasLive: !!live.tg || live.total != null,
     };
   });
+}
+
+function stripStaleTrunkCounts(row) {
+  return {
+    ...row,
+    total: null,
+    idle: null,
+    busy: null,
+    oos: null,
+    utilizationPct: null,
+    channels: [],
+  };
 }
 
 function utilCellHtml(it) {
@@ -554,10 +628,10 @@ function buildTrunkRow(it) {
       <td class="name-cell">${escapeHtml(it.name || "—")}${
         it.type ? `<span class="name">${escapeHtml(it.type)}${it.tac ? " · TAC " + escapeHtml(it.tac) : ""}</span>` : ""
       }</td>
-      <td class="col-total">${it.total ?? "—"}</td>
-      <td class="col-idle">${it.idle ?? "—"}</td>
-      <td class="col-busy">${it.busy ?? "—"}</td>
-      <td class="col-oos">${it.oos ?? "—"}</td>
+      <td class="col-total">${it.error ? "—" : it.total ?? "—"}</td>
+      <td class="col-idle">${it.error ? "—" : it.idle ?? "—"}</td>
+      <td class="col-busy">${it.error ? "—" : it.busy ?? "—"}</td>
+      <td class="col-oos">${it.error ? "—" : it.oos ?? "—"}</td>
       <td class="col-util">${utilCellHtml(it)}</td>
       <td class="col-status">${statusCellHtml(it)}</td>
       <td class="mono col-updated" data-updated-tg="${it.tg}">${fmtTime(it.lastUpdate)}</td>
@@ -658,10 +732,10 @@ function patchTrunkRow(item, { flash = false } = {}) {
     const el = tr.querySelector(sel);
     if (el) el.textContent = val == null || val === "" ? "—" : String(val);
   };
-  setTxt(".col-total", it.total ?? "—");
-  setTxt(".col-idle", it.idle ?? "—");
-  setTxt(".col-busy", it.busy ?? "—");
-  setTxt(".col-oos", it.oos ?? "—");
+  setTxt(".col-total", it.error ? "—" : it.total ?? "—");
+  setTxt(".col-idle", it.error ? "—" : it.idle ?? "—");
+  setTxt(".col-busy", it.error ? "—" : it.busy ?? "—");
+  setTxt(".col-oos", it.error ? "—" : it.oos ?? "—");
 
   const nameCell = tr.querySelector(".name-cell");
   if (nameCell) {
@@ -706,8 +780,12 @@ function applyStickyTrunkErrors(items) {
   if (!items || !items.length || !Object.keys(sticky).length) return items || [];
   return items.map((it) => {
     const tg = Number(it.tg);
-    if (!sticky[tg] || it.error) return it;
-    return { ...it, error: "UPDATE FAILED", statusColor: "red" };
+    if (!sticky[tg] && !it.error) return it;
+    return stripStaleTrunkCounts({
+      ...it,
+      error: it.error || "UPDATE FAILED",
+      statusColor: "red",
+    });
   });
 }
 
@@ -715,23 +793,32 @@ function applyStickyTrunkErrors(items) {
 function applyOneTrunkItem(item) {
   if (!item || item.tg == null) return;
   const tg = Number(item.tg);
-  if (item.error) markTrunkStickyError(tg, true);
-  else markTrunkStickyError(tg, false);
+  if (item.error) {
+    markTrunkStickyError(tg, true);
+    item = stripStaleTrunkCounts({
+      ...item,
+      error: "UPDATE FAILED",
+      statusColor: "red",
+    });
+  } else {
+    markTrunkStickyError(tg, false);
+  }
   const idx = state.trunkItems.findIndex((x) => Number(x.tg) === tg);
   if (idx >= 0) {
     const prev = state.trunkItems[idx];
     state.trunkItems[idx] = { ...prev, ...item };
-    // Keep previous channels if this payload omitted them
-    if (!Array.isArray(item.channels) && Array.isArray(prev.channels)) {
+    if (item.error) {
+      state.trunkItems[idx] = stripStaleTrunkCounts(state.trunkItems[idx]);
+    } else if (!Array.isArray(item.channels) && Array.isArray(prev.channels)) {
       state.trunkItems[idx].channels = prev.channels;
     }
   } else state.trunkItems.push(item);
   // Header "Updated" under Refresh button
   const meta = $("meta-updated");
   if (meta && item.lastUpdate) meta.textContent = fmtTime(item.lastUpdate);
-  patchTrunkRow({ ...item, tg }, { flash: true });
+  patchTrunkRow({ ...state.trunkItems.find((x) => Number(x.tg) === tg), tg }, { flash: !item.error });
   // Detail open on this TG → repaint member table from same cache (no extra OSSI)
-  if (state.detailTg != null && Number(state.detailTg) === tg && Array.isArray(item.channels)) {
+  if (state.detailTg != null && Number(state.detailTg) === tg && Array.isArray(item.channels) && !item.error) {
     paintDetailFromItem({ ...item, tg });
   }
 }
@@ -788,9 +875,11 @@ function startCountdownClock() {
       !state.refreshing &&
       state.nextRefreshAt > 0 &&
       Date.now() >= state.nextRefreshAt &&
-      document.visibilityState === "visible"
+      document.visibilityState === "visible" &&
+      (state.activeTab === "trunk" || !!getOpenGatewayDetailMg())
     ) {
       // fire-and-forget; progressiveRefresh guards with state.refreshing
+      // Gateway Details keeps global 60s + this-GW list configuration in the same pack
       progressiveRefresh({ reason: "auto", showModal: false }).catch((e) => {
         console.warn("auto refresh:", e?.message || e);
         state.refreshing = false;
@@ -1325,14 +1414,10 @@ async function runLoginOssiCache() {
       const tr = document.querySelector(`tr.tg-row[data-tg="${tg}"]`);
       if (tr) tr.classList.add("row-updating");
       try {
-        const res = await api("refresh/one", {
-          method: "POST",
-          body: JSON.stringify({ tg }),
-        });
-        const item = res && (res.item || res.Item);
+        const { res, item } = await refreshOneTrunk(tg);
         if (item && item.tg != null) applyOneTrunkItem(item);
         else if (res?.data?.items || res?.data?.Items) {
-          state.trunkItems = res.data.items || res.data.Items;
+          state.trunkItems = applyStickyTrunkErrors(res.data.items || res.data.Items);
           renderTrunkTable();
         }
       } catch {
@@ -1504,8 +1589,13 @@ function startHeartbeat() {
   const beat = () => {
     if (!state.connected) return;
     // Tell bridge which tab is open — only that tab gets backend OSSI auto
-    const body = JSON.stringify({ tab: state.activeTab || "trunk" });
-    api("session/heartbeat", { method: "POST", body }).catch(() => {});
+    api("session/heartbeat", {
+      method: "POST",
+      body: JSON.stringify({
+        tab: state.activeTab || "trunk",
+        skipTime: !!state.refreshing,
+      }),
+    }).catch(() => {});
   };
   state.heartbeatTimer = setInterval(beat, 30_000);
   beat();
@@ -1573,6 +1663,7 @@ function startCmTimeWatch() {
   setTimeout(() => refreshCmTime({ soft: true, force: true }), 400);
   state.cmTimeTimer = setInterval(() => {
     if (!state.connected) return;
+    if (state.refreshing) return;
     refreshCmTime({ soft: true, force: true });
   }, 60_000);
   state.cmTimeTickTimer = setInterval(() => {
@@ -1693,34 +1784,6 @@ async function refreshCmTime(opts = {}) {
   } catch (e) {
     if (!opts.soft) console.warn("cm-time:", e.message || e);
     return null;
-  }
-}
-
-function disconnectOnPageClose() {
-  if (!state.connected || state.disconnecting) return;
-  state.disconnecting = true;
-  state.connected = false;
-  clearUiLoggedIn();
-  stopHeartbeat();
-  stopLivePoll();
-  stopCmTimeWatch();
-  clearAuto();
-  state.refreshing = false;
-  try {
-    const url = apiUrl("session/disconnect");
-    const blob = new Blob(["{}"], { type: "application/json" });
-    if (navigator.sendBeacon) {
-      navigator.sendBeacon(url, blob);
-    } else {
-      fetch(url, {
-        method: "POST",
-        body: "{}",
-        headers: { "Content-Type": "application/json" },
-        keepalive: true,
-      });
-    }
-  } catch {
-    /* ignore */
   }
 }
 
@@ -1866,6 +1929,15 @@ async function progressiveRefresh(opts = {}) {
   paintCountdown();
   if (showModal) setError("");
 
+  // New 60s round: drop last-fail counts so stale 23/21/2 cannot linger
+  for (const it of state.trunkItems || []) {
+    if (!it || !it.error) continue;
+    const wiped = stripStaleTrunkCounts(it);
+    const idx = state.trunkItems.findIndex((x) => Number(x.tg) === Number(it.tg));
+    if (idx >= 0) state.trunkItems[idx] = wiped;
+    patchTrunkRow(wiped, { flash: false });
+  }
+
   const n = list.length;
   if (showModal) showProgress("Updating trunks", `status trunk × ${n}…`);
 
@@ -1895,11 +1967,7 @@ async function progressiveRefresh(opts = {}) {
       const tr = document.querySelector(`tr.tg-row[data-tg="${tg}"]`);
       if (tr) tr.classList.add("row-updating");
       try {
-        const res = await api("refresh/one", {
-          method: "POST",
-          body: JSON.stringify({ tg }),
-        });
-        const item = res && (res.item || res.Item);
+        const { res, item } = await refreshOneTrunk(tg);
         // item.error → Status "UPDATE FAILED" only (no login error banner)
         if (item && item.tg != null) {
           applyOneTrunkItem(item);
@@ -2006,6 +2074,16 @@ async function progressiveRefresh(opts = {}) {
     if (pack && state.connected && $("chk-auto")?.checked) {
       refreshAlarmsSilent()
         .then(() => refreshGatewaysSilent())
+        .then(() => {
+          const mg = getOpenGatewayDetailMg();
+          if (!mg) return null;
+          for (let i = cmdQueue.length - 1; i >= 0; i -= 1) {
+            if (cmdQueue[i].kind === "gw-config" && Number(cmdQueue[i].mg) === Number(mg)) {
+              cmdQueue.splice(i, 1);
+            }
+          }
+          return runGatewayConfigRefresh(mg, { showModal: false });
+        })
         .then(() => refreshMapFromCache())
         .then(() => pumpQueue())
         .catch((e) => console.warn("packed alarm/gw:", e?.message || e));
@@ -2321,6 +2399,7 @@ async function init() {
   }
   // Manual Refresh on Extension tab → enqueue (yields to 60s pack)
   window.__cmEnqueueExtension = (opts) => enqueueExtensionRefresh(opts || {});
+  window.__cmEnqueueGwConfig = (mg, opts) => enqueueGwConfig(mg, opts || {});
 
   $("btn-connect").addEventListener("click", connect);
   $("btn-disconnect").addEventListener("click", disconnect);
@@ -2381,12 +2460,18 @@ async function init() {
   const progClose = $("btn-progress-close");
   if (progClose) progClose.addEventListener("click", () => hideProgress());
 
-  window.addEventListener("pagehide", disconnectOnPageClose);
-  window.addEventListener("beforeunload", disconnectOnPageClose);
+  // Do NOT sendBeacon session/disconnect on pagehide/beforeunload.
+  // F5 and close-tab both fire those events — disconnect made F5 require Login.
+  // Close-tab: 90s UI watchdog logs off OSSI after heartbeat stops.
 
   // Browser tab focus: when user returns to this page, refresh trunk view
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible" && state.connected && $("chk-auto")?.checked) {
+    if (
+      document.visibilityState === "visible" &&
+      state.connected &&
+      $("chk-auto")?.checked &&
+      (state.activeTab === "trunk" || !!getOpenGatewayDetailMg())
+    ) {
       progressiveRefresh({ reason: "visible", showModal: false }).catch((e) =>
         console.warn("visible refresh:", e?.message || e)
       );

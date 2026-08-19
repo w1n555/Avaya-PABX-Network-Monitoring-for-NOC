@@ -146,3 +146,199 @@ def gateway_summary(items: list[dict[str, Any]]) -> dict[str, int]:
         "mn": mn,
         "wn": wn,
     }
+
+
+# list configuration media-gateway — board 051V5, ports 01 / u / t / p
+_BOARD_NUM = re.compile(r"^0*(\d+)V(\d+)$", re.I)
+_SAT_BOARD = re.compile(
+    r"^(?P<board>0*\d{1,3}V\d{1,2})\s+"
+    r"(?P<typ>[A-Za-z][A-Za-z0-9]*(?:\s+[A-Za-z][A-Za-z0-9]*)?)\s+"
+    r"(?P<code>[A-Za-z0-9]+)\s+"
+    r"(?P<hw>HW\S+)(?:\s+(?P<fw>FW\S+))?"
+    r"(?:\s+(?P<ports>.*))?$",
+    re.I,
+)
+_PORT_TOK = re.compile(r"^(?:u|t|p|[0-9]{1,2})$", re.I)
+_SKIP_CFG = re.compile(
+    r"system configuration|board\s+number|assigned ports|command:|"
+    r"command successfully|more\?|u=unassigned",
+    re.I,
+)
+
+
+def avaya_port(mg: int, slot: str | int, circuit: str | int) -> str:
+    """051 + V + 5 + 01 → 051V501 (list station Port)."""
+    try:
+        circ = int(str(circuit).strip())
+    except ValueError:
+        circ = 0
+    return f"{int(mg):03d}V{int(slot)}{circ:02d}"
+
+
+def norm_avaya_port(port: str | None) -> str:
+    s = str(port or "").strip().upper()
+    m = re.match(r"^0*(\d+)V(\d+)$", s, re.I)
+    if not m:
+        return s
+    gw = int(m.group(1))
+    rest = m.group(2)
+    if len(rest) <= 2:
+        return f"{gw:03d}V{int(rest)}"
+    slot, circ = rest[:-2], rest[-2:]
+    return f"{gw:03d}V{int(slot)}{int(circ):02d}"
+
+
+def _port_state(tok: str) -> tuple[str, str]:
+    t = (tok or "").strip().lower()
+    if t == "u":
+        return "", "unassigned"
+    if t == "t":
+        return "", "tti"
+    if t == "p":
+        return "", "psa"
+    if t.isdigit():
+        return f"{int(t):02d}", "assigned"
+    return "", "unassigned"
+
+
+def _new_board(board: str, typ: str, code: str, vintage: str) -> dict[str, Any]:
+    m = _BOARD_NUM.match((board or "").strip())
+    mg = int(m.group(1)) if m else 0
+    slot = m.group(2) if m else ""
+    return {
+        "board": f"{mg:03d}V{slot}" if m else (board or "").strip().upper(),
+        "mg": mg,
+        "slot": slot,
+        "type": (typ or "").strip(),
+        "code": (code or "").strip(),
+        "vintage": (vintage or "").strip(),
+        "ports": [],
+    }
+
+
+def _append_port_tokens(board: dict[str, Any], tokens: list[str]) -> None:
+    for raw in tokens:
+        tok = (raw or "").strip()
+        if not tok or not _PORT_TOK.match(tok):
+            continue
+        circ, state = _port_state(tok)
+        n = circ or tok.lower()
+        board["ports"].append(
+            {
+                "n": n,
+                "state": state,
+                "port": avaya_port(board["mg"], board["slot"], circ) if state == "assigned" and circ else "",
+            }
+        )
+
+
+def parse_list_configuration_media_gateway(text: str, mg: int | None = None) -> list[dict[str, Any]]:
+    """Parse OSSI d-lines or SAT-like SYSTEM CONFIGURATION dump into boards."""
+    boards: list[dict[str, Any]] = []
+    cur: dict[str, Any] | None = None
+    lines = _norm_lines(text)
+
+    def _keep(b: dict[str, Any] | None) -> None:
+        if b and b.get("board") and b["board"] not in {x["board"] for x in boards}:
+            boards.append(b)
+
+    for ln in lines:
+        if _SKIP_CFG.search(ln) and not ln.startswith("d"):
+            continue
+        f = _d_fields(ln)
+        if f:
+            head = (f[0] or "").strip()
+            bm = _BOARD_NUM.match(head)
+            if bm:
+                _keep(cur)
+                rest = [(x or "").strip() for x in f[1:]]
+                typ = ""
+                code = ""
+                vintage = ""
+                port_at = 0
+                if len(rest) >= 2 and rest[1].upper() == "MM":
+                    typ = f"{rest[0]} {rest[1]}".strip()
+                    port_at = 2
+                elif rest:
+                    typ = rest[0]
+                    port_at = 1
+                if port_at < len(rest) and rest[port_at] and not _PORT_TOK.match(rest[port_at]) and not rest[port_at].upper().startswith("HW"):
+                    code = rest[port_at]
+                    port_at += 1
+                hw_bits: list[str] = []
+                while port_at < len(rest) and rest[port_at].upper().startswith(("HW", "FW")):
+                    hw_bits.append(rest[port_at])
+                    port_at += 1
+                vintage = " ".join(hw_bits)
+                cur = _new_board(head, typ, code, vintage)
+                if mg and cur["mg"] and int(mg) != cur["mg"]:
+                    cur = None
+                    continue
+                _append_port_tokens(cur, rest[port_at:])
+                continue
+            if cur is not None:
+                toks = [(x or "").strip() for x in f if (x or "").strip()]
+                if toks and all(_PORT_TOK.match(t) for t in toks):
+                    _append_port_tokens(cur, toks)
+                    continue
+            continue
+
+        sat = _SAT_BOARD.match(ln)
+        if sat:
+            _keep(cur)
+            vintage = " ".join(x for x in (sat.group("hw"), sat.group("fw")) if x)
+            cur = _new_board(sat.group("board"), sat.group("typ"), sat.group("code"), vintage)
+            if mg and cur["mg"] and int(mg) != cur["mg"]:
+                cur = None
+                continue
+            extra = sat.group("ports") or ""
+            _append_port_tokens(cur, extra.split())
+            continue
+        if cur is not None:
+            toks = ln.split()
+            if toks and all(_PORT_TOK.match(t) for t in toks):
+                _append_port_tokens(cur, toks)
+
+    _keep(cur)
+    if mg:
+        boards = [b for b in boards if int(b.get("mg") or 0) == int(mg)]
+    return boards
+
+
+def join_config_extensions(
+    boards: list[dict[str, Any]],
+    extensions: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Attach list station extension/name onto assigned ports. Missing ext → empty."""
+    by_port: dict[str, dict[str, Any]] = {}
+    for e in extensions or []:
+        p = norm_avaya_port(str(e.get("port") or ""))
+        if p and p != "—":
+            by_port[p] = e
+    assigned: list[dict[str, Any]] = []
+    for b in boards:
+        for p in b.get("ports") or []:
+            if p.get("state") != "assigned" or not p.get("port"):
+                p["extension"] = ""
+                p["name"] = ""
+                p["extType"] = ""
+                continue
+            key = norm_avaya_port(p["port"])
+            ext = by_port.get(key) or {}
+            p["extension"] = str(ext.get("extension") or "")
+            p["name"] = str(ext.get("name") or "")
+            p["extType"] = str(ext.get("type") or "")
+            assigned.append(
+                {
+                    "port": p["port"],
+                    "slot": b.get("slot"),
+                    "circuit": p.get("n"),
+                    "board": b.get("board"),
+                    "code": b.get("code"),
+                    "type": b.get("type"),
+                    "extension": p["extension"],
+                    "name": p["name"],
+                    "extType": p["extType"],
+                }
+            )
+    return assigned

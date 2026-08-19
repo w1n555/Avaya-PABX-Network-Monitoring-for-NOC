@@ -1,9 +1,11 @@
 /**
- * MAP VIEW — offline Leaflet + map/tiles/{z}/{x}/{y}.png
+ * Map View — offline Leaflet + map/tiles/{z}/{x}/{y}.jpg
  * Coordinates: hand-edit map/sites.json
  * Live data: hostname prefix → site, alarms from Gateway cache (no extra OSSI).
  * Light: any MAJOR or DOWN → red; else any MINOR → yellow; WARNING counts as green.
  */
+
+import { openGatewayDetail } from "./gateway-ui.js";
 
 function apiUrlMap(path) {
   let dir = window.location.pathname || "/";
@@ -47,6 +49,7 @@ const MAP = {
   map: null,
   layer: null,
   markers: {},
+  resetAdded: false,
 };
 
 function escapeHtml(s) {
@@ -70,6 +73,22 @@ function siteLight(site) {
   if (mj > 0 || down > 0) return "red";
   if (mn > 0) return "yellow";
   return "green";
+}
+
+function lightLabel(light) {
+  if (light === "red") return "Critical";
+  if (light === "yellow") return "Minor";
+  return "Healthy";
+}
+
+function fmtGwTs(s) {
+  if (!s) return "—";
+  return String(s).replace("T", " ").replace("Z", "").slice(0, 19);
+}
+
+function setText(id, text) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = text;
 }
 
 function buildSiteRows() {
@@ -149,27 +168,21 @@ function filteredSites(rows) {
   });
 }
 
-function paintMapKpi(rows) {
-  const el = document.getElementById("map-summary-kpi");
-  if (!el) return;
-  const mapped = rows.filter((s) => s.lat != null && s.lng != null).length;
-  const gws = rows.reduce((n, s) => n + s.gwCount, 0);
-  const red = rows.filter((s) => s.light === "red").length;
-  const yellow = rows.filter((s) => s.light === "yellow").length;
-  const green = rows.filter((s) => s.light === "green").length;
-  el.innerHTML = [
-    { k: "Sites", v: rows.length },
-    { k: "On map", v: mapped },
-    { k: "Gateways", v: gws },
-    { k: "Red", v: red },
-    { k: "Yellow", v: yellow },
-    { k: "Green", v: green },
-  ]
-    .map(
-      (it) => `<div class="cdr-kpi"><div class="cdr-kpi-v">${escapeHtml(String(it.v))}</div>
-      <div class="cdr-kpi-k">${escapeHtml(it.k)}</div></div>`
-    )
-    .join("");
+function paintMapStats(rows) {
+  const gws = MAP.gateways || [];
+  const online = gws.filter((g) => String(g.node || "").toUpperCase() === "UP").length;
+  const healthy = rows.filter((s) => s.light === "green").length;
+  setText("map-stat-sites", `${healthy} / ${rows.length}`);
+  setText("map-stat-gws", `${online} / ${gws.length}`);
+  setText("map-stat-critical", String(rows.filter((s) => s.light === "red").length));
+  setText("map-stat-minor", String(rows.filter((s) => s.light === "yellow").length));
+  setText("map-stat-updated", fmtGwTs(MAP.gwUpdated));
+  const gwCard = document.getElementById("map-stat-gws-card");
+  if (gwCard) {
+    gwCard.classList.remove("accent-red", "accent-green");
+    if (gws.length && online === gws.length) gwCard.classList.add("accent-green");
+    else if (gws.length && online < gws.length) gwCard.classList.add("accent-red");
+  }
 }
 
 function paintUnmapped(rows) {
@@ -192,10 +205,13 @@ function renderSide(site) {
   if (!site) {
     empty.hidden = false;
     body.hidden = true;
+    body.classList.remove("is-red", "is-yellow", "is-green");
     return;
   }
   empty.hidden = true;
   body.hidden = false;
+  body.classList.remove("is-red", "is-yellow", "is-green");
+  body.classList.add(`is-${site.light}`);
   const title = document.getElementById("map-side-title");
   const sub = document.getElementById("map-side-sub");
   const light = document.getElementById("map-side-light");
@@ -206,15 +222,14 @@ function renderSide(site) {
   }
   if (light) {
     light.className = `map-light ${site.light}`;
-    light.textContent = site.light.toUpperCase();
+    light.textContent = lightLabel(site.light).toUpperCase();
   }
   if (meta) {
     meta.innerHTML = [
-      { k: "GW", v: site.gwCount },
-      { k: "DOWN", v: site.down },
-      { k: "MJ", v: site.mj },
-      { k: "MN", v: site.mn },
-      { k: "WN", v: site.wn },
+      { k: "Gateways", v: site.gwCount },
+      { k: "Down", v: site.down },
+      { k: "Major", v: site.mj },
+      { k: "Minor", v: site.mn },
     ]
       .map(
         (it) => `<div class="cdr-kpi"><div class="cdr-kpi-v">${escapeHtml(String(it.v))}</div>
@@ -225,7 +240,7 @@ function renderSide(site) {
   const tbody = document.getElementById("map-side-tbody");
   if (!tbody) return;
   if (!site.gws.length) {
-    tbody.innerHTML = `<tr class="empty"><td colspan="5">${
+    tbody.innerHTML = `<tr class="empty"><td colspan="6">${
       MAP.connected ? "No live GW for this code yet." : "Login to load live GW / alarms."
     }</td></tr>`;
     return;
@@ -236,9 +251,12 @@ function renderSide(site) {
     .map((g) => {
       const node = String(g.node || "").toUpperCase() === "DOWN" ? "DOWN" : "UP";
       const nodeCls = node === "UP" ? "node-up" : "node-down";
+      const host = g.hostname || "—";
+      const ip = g.ip || "—";
       return `<tr>
         <td class="mono">${escapeHtml(String(g.mg ?? "—"))}</td>
-        <td>${escapeHtml(g.hostname || "—")}</td>
+        <td><button type="button" class="gw-host-btn" data-mg="${escapeHtml(String(g.mg ?? ""))}" title="Open Media Gateway Status">${escapeHtml(host)}</button></td>
+        <td class="map-ip" title="${escapeHtml(ip)}">${escapeHtml(ip)}</td>
         <td><span class="badge-node ${nodeCls}">${node}</span></td>
         <td class="mono">${g.mj || 0}</td>
         <td class="mono">${g.mn || 0}</td>
@@ -255,6 +273,7 @@ function selectSite(code) {
   for (const [k, mk] of Object.entries(MAP.markers)) {
     const el = mk.getElement && mk.getElement();
     if (el) el.classList.toggle("is-selected", k === MAP.selected);
+    if (mk.setZIndexOffset) mk.setZIndexOffset(k === MAP.selected ? 800 : 0);
   }
   if (site && site.lat != null && site.lng != null && MAP.map) {
     const z = Math.max(MAP.map.getZoom(), 13);
@@ -264,9 +283,28 @@ function selectSite(code) {
 
 function markerHtml(site) {
   const dummy = site.dummy ? " is-dummy" : "";
-  return `<div class="map-pin map-pin-${site.light}${dummy}" title="${escapeHtml(site.code)}">
+  const pulse = site.light === "green" ? "" : " is-pulse";
+  return `<div class="map-pin map-pin-${site.light}${dummy}${pulse}">
     <span class="map-pin-code">${escapeHtml(site.code)}</span>
     <span class="map-pin-dot"></span>
+  </div>`;
+}
+
+function tooltipHtml(site) {
+  const bits = [];
+  if (site.down > 0) bits.push(`DOWN ${site.down}`);
+  if (site.mj > 0) bits.push(`MJ ${site.mj}`);
+  if (site.mn > 0) bits.push(`MN ${site.mn}`);
+  const name = site.name
+    ? `<div class="map-tip-name">${escapeHtml(site.name)}</div>`
+    : "";
+  const counts = bits.length ? `<div class="map-tip-alarms">${escapeHtml(bits.join(" · "))}</div>` : "";
+  return `<div class="map-tip-inner">
+    <div class="map-tip-code">${escapeHtml(site.code)}</div>
+    ${name}
+    <div class="map-tip-status map-tip-${site.light}">${escapeHtml(lightLabel(site.light))}</div>
+    <div class="map-tip-row">Gateways ${escapeHtml(String(site.gwCount))}</div>
+    ${counts}
   </div>`;
 }
 
@@ -282,10 +320,17 @@ function redrawMarkers() {
     const icon = L.divIcon({
       className: "map-pin-wrap",
       html: markerHtml(site),
-      iconSize: [52, 28],
-      iconAnchor: [26, 28],
+      iconSize: [58, 32],
+      iconAnchor: [29, 32],
     });
-    const mk = L.marker([site.lat, site.lng], { icon, keyboard: true, title: site.code });
+    const mk = L.marker([site.lat, site.lng], { icon, keyboard: true, riseOnHover: true });
+    mk.bindTooltip(tooltipHtml(site), {
+      className: "map-tip",
+      direction: "top",
+      offset: [0, -10],
+      opacity: 1,
+      sticky: false,
+    });
     mk.on("click", () => selectSite(site.code));
     mk.addTo(MAP.layer);
     MAP.markers[site.code] = mk;
@@ -294,7 +339,49 @@ function redrawMarkers() {
     const still = rows.find((s) => s.code === MAP.selected);
     renderSide(still || null);
     if (!still) MAP.selected = null;
+    else {
+      const el = MAP.markers[MAP.selected] && MAP.markers[MAP.selected].getElement && MAP.markers[MAP.selected].getElement();
+      if (el) el.classList.add("is-selected");
+      if (MAP.markers[MAP.selected] && MAP.markers[MAP.selected].setZIndexOffset) {
+        MAP.markers[MAP.selected].setZIndexOffset(800);
+      }
+    }
   }
+}
+
+function resetMapView() {
+  if (!MAP.map) return;
+  const c = MAP.cfg.center || [22.35, 114.15];
+  const z = Number(MAP.cfg.zoom || 11);
+  MAP.map.setView(c, z, { animate: true });
+}
+
+function addResetControl() {
+  const L = window.L;
+  if (!MAP.map || !L || MAP.resetAdded) return;
+  const Ctrl = L.Control.extend({
+    options: { position: "topleft" },
+    onAdd() {
+      const bar = L.DomUtil.create("div", "leaflet-bar leaflet-control map-reset-control");
+      const a = L.DomUtil.create("a", "", bar);
+      a.href = "#";
+      a.title = "Reset view";
+      a.setAttribute("role", "button");
+      a.setAttribute("aria-label", "Reset map view");
+      a.innerHTML =
+        '<svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path fill="currentColor" d="M12 3.4 3.5 10.8h2.3V20h5.2v-5.6h2V20h5.2v-9.2h2.3L12 3.4z"/></svg>';
+      L.DomEvent.disableClickPropagation(bar);
+      L.DomEvent.disableScrollPropagation(bar);
+      L.DomEvent.on(a, "click", (ev) => {
+        L.DomEvent.preventDefault(ev);
+        L.DomEvent.stopPropagation(ev);
+        resetMapView();
+      });
+      return bar;
+    },
+  });
+  MAP.map.addControl(new Ctrl());
+  MAP.resetAdded = true;
 }
 
 function ensureMap() {
@@ -323,20 +410,19 @@ function ensureMap() {
     errorTileUrl: "",
     attribution: "Tiles © Esri · offline cache",
   }).addTo(MAP.map);
+  addResetControl();
   setTimeout(() => MAP.map.invalidateSize(), 120);
   return true;
 }
 
 function paintAll() {
-  const rows = filteredSites(buildSiteRows());
-  paintMapKpi(buildSiteRows());
-  paintUnmapped(buildSiteRows());
+  const all = buildSiteRows();
+  paintMapStats(all);
+  paintUnmapped(all);
   if (MAP.tabActive) {
     ensureMap();
     redrawMarkers();
   }
-  const meta = document.getElementById("map-meta-updated");
-  if (meta) meta.textContent = MAP.gwUpdated ? String(MAP.gwUpdated).replace("T", " ").slice(0, 19) : "—";
 }
 
 async function loadSitesFile() {
@@ -440,7 +526,21 @@ export function initMapUi() {
       for (const mk of Object.values(MAP.markers)) {
         const el = mk.getElement && mk.getElement();
         if (el) el.classList.remove("is-selected");
+        if (mk.setZIndexOffset) mk.setZIndexOffset(0);
       }
+    });
+  }
+  const tbody = document.getElementById("map-side-tbody");
+  if (tbody) {
+    tbody.addEventListener("click", (ev) => {
+      const btn = ev.target && ev.target.closest && ev.target.closest(".gw-host-btn");
+      if (!btn) return;
+      ev.preventDefault();
+      const mg = Number(btn.getAttribute("data-mg"));
+      if (!mg) return;
+      const tab = document.querySelector('.tab[data-tab="gateway"]');
+      if (tab) tab.click();
+      openGatewayDetail(mg, { showModal: true });
     });
   }
 }

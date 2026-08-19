@@ -45,9 +45,9 @@
     </section>
 
     <nav class="tabs" id="main-tabs" role="tablist" aria-label="NOC modules">
+      <button type="button" class="tab" data-tab="map" role="tab" aria-selected="false">Map View</button>
       <button type="button" class="tab active" data-tab="trunk" role="tab" aria-selected="true">Trunk</button>
       <button type="button" class="tab" data-tab="gateway" role="tab" aria-selected="false">Gateway</button>
-      <button type="button" class="tab" data-tab="map" role="tab" aria-selected="false">MAP VIEW</button>
       <button type="button" class="tab" data-tab="extension" role="tab" aria-selected="false">Extension</button>
       <button type="button" class="tab" data-tab="cdr" role="tab" aria-selected="false">CDR</button>
       <button type="button" class="tab" data-tab="alarm" role="tab" aria-selected="false">Alarm</button>
@@ -396,6 +396,7 @@
             </div>
           </div>
         </div>
+        <div id="gw-list-view">
         <div class="alarm-type-filters" id="gw-search-filters">
           <span class="hint" style="margin:0">Search hostname / IP (contains):</span>
           <input type="search" id="gw-search" class="gw-search" placeholder="e.g. L  or  172.29.88" autocomplete="off" />
@@ -419,6 +420,49 @@
             </tbody>
           </table>
         </div>
+        </div>
+        <div id="gw-detail-view" class="detail-view" hidden>
+          <div class="detail-head">
+            <button type="button" class="btn" id="btn-gw-detail-back">← Back</button>
+            <h3 id="gw-detail-title">MG —</h3>
+            <span class="detail-meta" id="gw-detail-meta"></span>
+            <span class="countdown-line" id="gw-detail-countdown">Next: —</span>
+            <button type="button" class="btn btn-primary" id="btn-gw-detail-refresh">Refresh</button>
+          </div>
+          <div class="cdr-kpi-row" id="gw-detail-kpi"></div>
+          <h3 class="gw-detail-h">Boards</h3>
+          <div class="table-wrap gw-detail-table-wrap">
+            <table class="data-table gw-detail-table" id="gw-board-table">
+              <thead>
+                <tr>
+                  <th>Slot</th>
+                  <th>Board type</th>
+                  <th>Code</th>
+                  <th>Vintage</th>
+                  <th>Asg</th>
+                  <th>Una</th>
+                  <th>Ports</th>
+                </tr>
+              </thead>
+              <tbody id="gw-board-tbody"></tbody>
+            </table>
+          </div>
+          <h3 class="gw-detail-h">Assigned ports</h3>
+          <div class="table-wrap gw-detail-table-wrap">
+            <table class="data-table gw-detail-table" id="gw-port-table">
+              <thead>
+                <tr>
+                  <th>Port</th>
+                  <th>Ext</th>
+                  <th>Name</th>
+                  <th>Type</th>
+                  <th>Card</th>
+                </tr>
+              </thead>
+              <tbody id="gw-port-tbody"></tbody>
+            </table>
+          </div>
+        </div>
       </section>
     </main>
 
@@ -426,14 +470,13 @@
       <section class="card map-card" id="map-card">
         <div class="panel-head">
           <div>
-            <h2>MAP VIEW</h2>
+            <h2>Map View</h2>
             <p class="hint">Offline HK map · site pin from <span class="mono">map/sites.json</span> · lights from Gateway cache (WN = green)</p>
           </div>
           <div class="card-actions-col">
             <div class="card-actions">
               <span class="hint" style="margin:0">Search site / hostname</span>
               <input type="search" id="map-search" class="gw-search" placeholder="CPB / GW43 / 172.29" autocomplete="off" />
-              <div class="refresh-meta">GW cache <span class="v mono" id="map-meta-updated">—</span></div>
             </div>
             <div class="legend-block">
               <div class="legend">
@@ -444,7 +487,30 @@
             </div>
           </div>
         </div>
-        <div class="cdr-kpi-row" id="map-summary-kpi"></div>
+        <div class="map-stat-row" id="map-stat-row" aria-label="Map summary">
+          <div class="map-stat accent-green">
+            <div class="map-stat-k">Sites</div>
+            <div class="map-stat-v" id="map-stat-sites">—</div>
+            <div class="map-stat-sub">Healthy / Total</div>
+          </div>
+          <div class="map-stat" id="map-stat-gws-card">
+            <div class="map-stat-k">Gateways</div>
+            <div class="map-stat-v" id="map-stat-gws">—</div>
+            <div class="map-stat-sub">Online / Total</div>
+          </div>
+          <div class="map-stat accent-red">
+            <div class="map-stat-k">Critical</div>
+            <div class="map-stat-v" id="map-stat-critical">—</div>
+          </div>
+          <div class="map-stat accent-yellow">
+            <div class="map-stat-k">Minor</div>
+            <div class="map-stat-v" id="map-stat-minor">—</div>
+          </div>
+          <div class="map-stat">
+            <div class="map-stat-k">Last Update</div>
+            <div class="map-stat-v map-stat-v-ts" id="map-stat-updated">—</div>
+          </div>
+        </div>
         <p class="hint map-unmapped" id="map-unmapped" hidden></p>
         <div class="map-shell">
           <div class="map-canvas-wrap">
@@ -452,30 +518,32 @@
           </div>
           <aside class="map-side" id="map-side">
             <div id="map-side-empty" class="map-side-empty">
-              <p class="hint">Click a site on the map.</p>
-              <p class="hint">Edit coordinates in <span class="mono">map/sites.json</span> on this web server, then refresh this tab.</p>
+              <div class="map-side-empty-mark" aria-hidden="true"></div>
+              <p class="map-side-empty-title">No site selected</p>
+              <p class="hint">Click a pin on the map to view site status and gateways.</p>
             </div>
-            <div id="map-side-body" hidden>
+            <div id="map-side-body" class="map-side-body" hidden>
               <div class="map-side-head">
-                <div>
+                <div class="map-side-ident">
                   <h3 id="map-side-title">—</h3>
                   <p class="hint" id="map-side-sub"></p>
                 </div>
                 <div class="map-side-head-actions">
-                  <span class="map-light green" id="map-side-light">GREEN</span>
-                  <button type="button" class="btn" id="map-side-close" title="Close">×</button>
+                  <span class="map-light green" id="map-side-light">HEALTHY</span>
+                  <button type="button" class="btn map-side-close" id="map-side-close" title="Close">×</button>
                 </div>
               </div>
-              <div class="cdr-kpi-row" id="map-side-meta"></div>
-              <div class="table-wrap">
+              <div class="cdr-kpi-row map-side-kpis" id="map-side-meta"></div>
+              <div class="table-wrap map-side-table-wrap">
                 <table class="data-table" id="map-side-table">
                   <thead>
                     <tr>
                       <th>MG</th>
                       <th>Hostname</th>
+                      <th>IP</th>
                       <th>Node</th>
-                      <th>MJ</th>
-                      <th>MN</th>
+                      <th>Major</th>
+                      <th>Minor</th>
                     </tr>
                   </thead>
                   <tbody id="map-side-tbody"></tbody>

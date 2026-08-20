@@ -159,6 +159,8 @@ _SAT_BOARD = re.compile(
     re.I,
 )
 _PORT_TOK = re.compile(r"^(?:u|t|p|[0-9]{1,2})$", re.I)
+_CODE_CORE = re.compile(r"^(MM|TN|S)\d+$", re.I)
+_CODE_SFX = re.compile(r"^[A-Z]$", re.I)
 _SKIP_CFG = re.compile(
     r"system configuration|board\s+number|assigned ports|command:|"
     r"command successfully|more\?|u=unassigned",
@@ -216,18 +218,35 @@ def _new_board(board: str, typ: str, code: str, vintage: str) -> dict[str, Any]:
     }
 
 
+def noc_board_type(typ: str, code: str = "") -> str:
+    """NOC labels: Trunk / Analog / Digital / LSP / Announcements."""
+    t = f"{typ} {code}".upper()
+    if any(k in t for k in ("DS1", "TRUNK", "BRI", "MM710", "MM714", "MM718")):
+        return "Trunk"
+    if any(k in t for k in ("ANA", "ANALOG", "MM716")):
+        return "Analog"
+    if any(k in t for k in ("DCP", "DIGITAL", "MM717")):
+        return "Digital"
+    if any(k in t for k in ("ICC", "S8300", "LSP")):
+        return "LSP"
+    if any(k in t for k in ("ANN", "VAL", "ANNOUNCE")):
+        return "Announcements"
+    return (typ or "—").strip() or "—"
+
+
 def _append_port_tokens(board: dict[str, Any], tokens: list[str]) -> None:
     for raw in tokens:
         tok = (raw or "").strip()
         if not tok or not _PORT_TOK.match(tok):
             continue
         circ, state = _port_state(tok)
-        n = circ or tok.lower()
+        idx = len(board["ports"]) + 1
+        n = circ if circ else f"{idx:02d}"
         board["ports"].append(
             {
                 "n": n,
                 "state": state,
-                "port": avaya_port(board["mg"], board["slot"], circ) if state == "assigned" and circ else "",
+                "port": avaya_port(board["mg"], board["slot"], n) if str(n).isdigit() else "",
             }
         )
 
@@ -243,6 +262,8 @@ def parse_list_configuration_media_gateway(text: str, mg: int | None = None) -> 
             boards.append(b)
 
     for ln in lines:
+        if ln.lower() in ("n", "t", "y"):
+            continue
         if _SKIP_CFG.search(ln) and not ln.startswith("d"):
             continue
         f = _d_fields(ln)
@@ -262,15 +283,23 @@ def parse_list_configuration_media_gateway(text: str, mg: int | None = None) -> 
                 elif rest:
                     typ = rest[0]
                     port_at = 1
-                if port_at < len(rest) and rest[port_at] and not _PORT_TOK.match(rest[port_at]) and not rest[port_at].upper().startswith("HW"):
-                    code = rest[port_at]
-                    port_at += 1
+                if port_at < len(rest) and rest[port_at] and not rest[port_at].upper().startswith("HW"):
+                    # OSSI splits MM716AP → MM716 / A / P (do not treat P as PSA)
+                    if _CODE_CORE.match(rest[port_at]) or (
+                        rest[port_at] and not _PORT_TOK.match(rest[port_at])
+                    ):
+                        code = rest[port_at]
+                        port_at += 1
+                        while port_at < len(rest) and _CODE_SFX.match(rest[port_at]):
+                            code += rest[port_at].upper()
+                            port_at += 1
                 hw_bits: list[str] = []
                 while port_at < len(rest) and rest[port_at].upper().startswith(("HW", "FW")):
                     hw_bits.append(rest[port_at])
                     port_at += 1
                 vintage = " ".join(hw_bits)
                 cur = _new_board(head, typ, code, vintage)
+                cur["nocType"] = noc_board_type(typ, code)
                 if mg and cur["mg"] and int(mg) != cur["mg"]:
                     cur = None
                     continue
@@ -278,9 +307,15 @@ def parse_list_configuration_media_gateway(text: str, mg: int | None = None) -> 
                 continue
             if cur is not None:
                 toks = [(x or "").strip() for x in f if (x or "").strip()]
-                if toks and all(_PORT_TOK.match(t) for t in toks):
-                    _append_port_tokens(cur, toks)
+                if not toks:
                     continue
+                if toks[0].upper().startswith("HW"):
+                    if not cur.get("vintage"):
+                        cur["vintage"] = toks[0]
+                    toks = toks[1:]
+                if toks:
+                    _append_port_tokens(cur, toks)
+                continue
             continue
 
         sat = _SAT_BOARD.match(ln)
@@ -288,6 +323,7 @@ def parse_list_configuration_media_gateway(text: str, mg: int | None = None) -> 
             _keep(cur)
             vintage = " ".join(x for x in (sat.group("hw"), sat.group("fw")) if x)
             cur = _new_board(sat.group("board"), sat.group("typ"), sat.group("code"), vintage)
+            cur["nocType"] = noc_board_type(sat.group("typ") or "", sat.group("code") or "")
             if mg and cur["mg"] and int(mg) != cur["mg"]:
                 cur = None
                 continue
@@ -303,6 +339,48 @@ def parse_list_configuration_media_gateway(text: str, mg: int | None = None) -> 
     if mg:
         boards = [b for b in boards if int(b.get("mg") or 0) == int(mg)]
     return boards
+
+
+def attach_board_alarms(
+    boards: list[dict[str, Any]],
+    alarms: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Join Active alarms onto boards by Port prefix (051V5…). No extra OSSI."""
+    for b in boards:
+        prefix = str(b.get("board") or "").upper()
+        mj = mn = wn = 0
+        for a in alarms or []:
+            p = str(a.get("port") or "").upper().replace(" ", "")
+            if not prefix or not p.startswith(prefix):
+                continue
+            sev = str(a.get("severity") or "").upper()
+            if sev in ("MAJOR", "MAJ"):
+                mj += 1
+            elif sev in ("MINOR", "MIN"):
+                mn += 1
+            else:
+                wn += 1
+        b["mj"] = mj
+        b["mn"] = mn
+        b["wn"] = wn
+    return boards
+
+
+def scan_gw_hw_faults(alarms: list[dict[str, Any]] | None, mg: int) -> dict[str, bool]:
+    """PSU / FAN keywords on this MG — 3D can pulse when present; else stay ready."""
+    psu = fan = False
+    for a in alarms or []:
+        port_mg = mg_from_port(a.get("port"))
+        if port_mg is not None and int(port_mg) != int(mg):
+            continue
+        name = " ".join(
+            str(a.get(k) or "") for k in ("mtceName", "mtceType", "mtce")
+        )
+        if re.search(r"psu|power\s*sup", name, re.I):
+            psu = True
+        if re.search(r"\bfan\b", name, re.I):
+            fan = True
+    return {"psuFault": psu, "fanFault": fan}
 
 
 def join_config_extensions(

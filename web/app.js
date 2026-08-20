@@ -133,7 +133,7 @@ async function pumpQueue() {
         await runQueuedJob(job);
       } catch (e) {
         console.warn("queue job failed:", job?.kind, e?.message || e);
-        if (job?.kind === "add" || job?.kind === "status") {
+        if (job?.kind === "add" || job?.kind === "status" || job?.kind === "gw-config") {
           finishProgress(false, String(e.message || e));
           const btn = $("btn-progress-close");
           if (btn) btn.hidden = false;
@@ -260,10 +260,20 @@ function enqueueExtensionRefresh(opts = {}) {
 function enqueueGwConfig(mg, opts = {}) {
   const n = Number(mg);
   if (!n) return;
+  const showModal = opts.showModal !== false;
+  if (showModal) {
+    showProgress(`MG ${n} configuration`, "OSSI list configuration media-gateway…");
+    setProgress(
+      state.refreshing ? 12 : 20,
+      state.refreshing
+        ? `Waiting for OSSI… then list configuration media-gateway ${n}`
+        : `list configuration media-gateway ${n}…`
+    );
+  }
   for (let i = cmdQueue.length - 1; i >= 0; i -= 1) {
     if (cmdQueue[i].kind === "gw-config") cmdQueue.splice(i, 1);
   }
-  enqueueJob({ kind: "gw-config", mg: n, showModal: opts.showModal !== false });
+  enqueueJob({ kind: "gw-config", mg: n, showModal });
 }
 
 /** Hourly list extension while session is live (not every 60s). */
@@ -2077,6 +2087,10 @@ async function progressiveRefresh(opts = {}) {
         .then(() => {
           const mg = getOpenGatewayDetailMg();
           if (!mg) return null;
+          const queued = cmdQueue.find(
+            (j) => j.kind === "gw-config" && Number(j.mg) === Number(mg)
+          );
+          if (queued && queued.showModal) return null;
           for (let i = cmdQueue.length - 1; i >= 0; i -= 1) {
             if (cmdQueue[i].kind === "gw-config" && Number(cmdQueue[i].mg) === Number(mg)) {
               cmdQueue.splice(i, 1);

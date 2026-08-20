@@ -60,11 +60,13 @@ from trunk_parse import (  # noqa: E402
 )
 from alarm_parse import parse_alarms  # noqa: E402
 from gateway_parse import (  # noqa: E402
+    attach_board_alarms,
     gateway_summary,
     join_config_extensions,
     join_gateways,
     parse_list_configuration_media_gateway,
     parse_list_media_gateway,
+    scan_gw_hw_faults,
 )
 from extension_parse import (  # noqa: E402
     extension_summary,
@@ -1276,6 +1278,7 @@ def refresh_gateway_config(mg: int) -> dict[str, Any]:
             raise RuntimeError("Not connected")
         sess = _session
         ext_items = list(_extension_items)
+        alarms = list(_alarm_active)
 
     cmd = f"list configuration media-gateway {mg_i}"
     text = ""
@@ -1311,6 +1314,8 @@ def refresh_gateway_config(mg: int) -> dict[str, Any]:
         time.sleep(0.15)
 
     boards = parse_list_configuration_media_gateway(text, mg_i)
+    attach_board_alarms(boards, alarms)
+    hw = scan_gw_hw_faults(alarms, mg_i)
     assigned = join_config_extensions(boards, ext_items)
     assigned_n = sum(
         1 for b in boards for p in (b.get("ports") or []) if p.get("state") == "assigned"
@@ -1318,6 +1323,7 @@ def refresh_gateway_config(mg: int) -> dict[str, Any]:
     unassigned_n = sum(
         1 for b in boards for p in (b.get("ports") or []) if p.get("state") == "unassigned"
     )
+    meta = _gw_meta(mg_i)
     payload = {
         "ok": err is None,
         "connected": True,
@@ -1334,7 +1340,12 @@ def refresh_gateway_config(mg: int) -> dict[str, Any]:
         "lastUpdate": _now_iso(),
         "timing": {"listSec": sec},
         "cached": False,
-        **{k: v for k, v in _gw_meta(mg_i).items() if k not in ("mj", "mn", "wn")},
+        "mj": int(meta.get("mj") or 0),
+        "mn": int(meta.get("mn") or 0),
+        "wn": int(meta.get("wn") or 0),
+        "psuFault": bool(hw.get("psuFault")),
+        "fanFault": bool(hw.get("fanFault")),
+        **{k: v for k, v in meta.items() if k not in ("mj", "mn", "wn")},
     }
     if err:
         payload["error"] = err

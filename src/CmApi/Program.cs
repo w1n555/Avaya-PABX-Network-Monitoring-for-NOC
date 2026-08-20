@@ -333,6 +333,32 @@ app.MapPost("/gateways/refresh", async (OssiBridgeClient bridge) =>
     }
 });
 
+app.MapPost("/gateways/config", async (HttpRequest req, OssiBridgeClient bridge) =>
+{
+    try
+    {
+        using var doc = await JsonDocument.ParseAsync(req.Body);
+        var mg = 0;
+        if (doc.RootElement.ValueKind == JsonValueKind.Object)
+        {
+            if (doc.RootElement.TryGetProperty("mg", out var m) && m.TryGetInt32(out var v))
+                mg = v;
+            else if (doc.RootElement.TryGetProperty("Mg", out var m2) && m2.TryGetInt32(out var v2))
+                mg = v2;
+        }
+        if (mg < 1)
+            return Results.BadRequest(new { ok = false, error = "mg must be >= 1" });
+        var el = await bridge.PostAsync("gateways/config", new { mg });
+        return Results.Json(el);
+    }
+    catch (Exception ex)
+    {
+        var msg = ex.Message ?? "";
+        var code = msg.Contains("Not connected", StringComparison.OrdinalIgnoreCase) ? 401 : 502;
+        return Results.Json(new { ok = false, error = msg }, statusCode: code);
+    }
+});
+
 app.MapGet("/gateways/{mg:int}/config", async (int mg, HttpRequest req, OssiBridgeClient bridge) =>
 {
     if (mg < 1)

@@ -230,6 +230,7 @@ function renderSide(site) {
       { k: "Down", v: site.down },
       { k: "Major", v: site.mj },
       { k: "Minor", v: site.mn },
+      { k: "Warning", v: site.wn },
     ]
       .map(
         (it) => `<div class="cdr-kpi"><div class="cdr-kpi-v">${escapeHtml(String(it.v))}</div>
@@ -240,7 +241,7 @@ function renderSide(site) {
   const tbody = document.getElementById("map-side-tbody");
   if (!tbody) return;
   if (!site.gws.length) {
-    tbody.innerHTML = `<tr class="empty"><td colspan="6">${
+    tbody.innerHTML = `<tr class="empty"><td colspan="7">${
       MAP.connected ? "No live GW for this code yet." : "Login to load live GW / alarms."
     }</td></tr>`;
     return;
@@ -260,6 +261,7 @@ function renderSide(site) {
         <td><span class="badge-node ${nodeCls}">${node}</span></td>
         <td class="mono">${g.mj || 0}</td>
         <td class="mono">${g.mn || 0}</td>
+        <td class="mono">${g.wn || 0}</td>
       </tr>`;
     })
     .join("");
@@ -295,6 +297,7 @@ function tooltipHtml(site) {
   if (site.down > 0) bits.push(`DOWN ${site.down}`);
   if (site.mj > 0) bits.push(`MJ ${site.mj}`);
   if (site.mn > 0) bits.push(`MN ${site.mn}`);
+  if (site.wn > 0) bits.push(`WN ${site.wn}`);
   const name = site.name
     ? `<div class="map-tip-name">${escapeHtml(site.name)}</div>`
     : "";

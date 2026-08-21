@@ -29,7 +29,7 @@ if (-not (Test-Path $Py)) {
 if (-not (Test-Path $Script)) { throw "Missing $Script" }
 if (-not (Test-Path $DataDir)) { New-Item -ItemType Directory -Force -Path $DataDir | Out-Null }
 
-$arg = "`"$Script`" --host 127.0.0.1 --port $Port --data-dir `"$DataDir`""
+$arg = "`"$Script`" --host 0.0.0.0 --port $Port --data-dir `"$DataDir`""
 $action = New-ScheduledTaskAction -Execute $Py -Argument $arg -WorkingDirectory $WorkDir
 $trigger = New-ScheduledTaskTrigger -AtLogOn
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable

@@ -38,7 +38,7 @@ REM Drop stale locks from crashed instances
 if exist "%DATA%\ossi_bridge_%PORT%.lock" del /f /q "%DATA%\ossi_bridge_%PORT%.lock" >nul 2>&1
 
 REM start: first quoted token is window title
-start "CM-OSSI-Bridge" /B "%PY%" "%SITE%\python\ossi_service.py" --host 127.0.0.1 --port %PORT% --data-dir "%DATA%"
+start "CM-OSSI-Bridge" /B "%PY%" "%SITE%\python\ossi_service.py" --host 0.0.0.0 --port %PORT% --data-dir "%DATA%"
 endlocal
 exit /b 0
 

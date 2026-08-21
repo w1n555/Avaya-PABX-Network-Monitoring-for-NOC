@@ -43,7 +43,7 @@ $env:PYTHONUNBUFFERED = "1"
 $py = "$SITE\python\.venv\Scripts\python.exe"
 if (-not (Test-Path $py)) { $py = "$SITE\python\runtime\python.exe" }
 $p = Start-Process -FilePath $py -ArgumentList @(
-  "$SITE\python\ossi_service.py","--host","127.0.0.1","--port","$PORT","--data-dir","$SITE\data_live"
+  "$SITE\python\ossi_service.py","--host","0.0.0.0","--port","$PORT","--data-dir","$SITE\data_live"
 ) -WorkingDirectory "$SITE\python" -WindowStyle Hidden -PassThru
 L "started bridge pid=$($p.Id)"
 Start-Sleep 2

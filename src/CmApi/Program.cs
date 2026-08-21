@@ -5,7 +5,17 @@ using CmApi.Services;
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddSingleton<OssiBridgeClient>();
+builder.Services.AddSingleton(sp =>
+{
+    var env = sp.GetRequiredService<IWebHostEnvironment>();
+    var cfg = sp.GetRequiredService<IConfiguration>();
+    var root = cfg["OssiBridge:SiteRoot"];
+    if (string.IsNullOrWhiteSpace(root))
+        root = Path.GetFullPath(Path.Combine(env.ContentRootPath, ".."));
+    return new CdrLoggerHost(root.Trim(), cfg, sp.GetRequiredService<ILogger<CdrLoggerHost>>());
+});
 builder.Services.AddHostedService<BridgeWarmupService>();
+builder.Services.AddHostedService<CdrLoggerWarmupService>();
 builder.Services.ConfigureHttpJsonOptions(o =>
 {
     o.SerializerOptions.PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase;
@@ -27,10 +37,13 @@ app.UseCors();
 
 // Resolve data dir relative to published api/ → site root data/
 var siteRoot = Path.GetFullPath(Path.Combine(app.Environment.ContentRootPath, ".."));
+var cfgRoot = app.Configuration["OssiBridge:SiteRoot"];
+if (!string.IsNullOrWhiteSpace(cfgRoot)) siteRoot = cfgRoot.Trim();
 var dataDir = Path.Combine(siteRoot, "data");
 var dataLiveDir = Path.Combine(siteRoot, "data_live");
 Directory.CreateDirectory(dataDir);
 var cdrFiles = new CmApi.Services.CdrFileService(siteRoot);
+var cdrLogger = app.Services.GetRequiredService<CdrLoggerHost>();
 
 static async Task<IResult> ReadAlarmsFallback(string siteRoot, string dataLiveDir)
 {
@@ -68,7 +81,10 @@ app.MapGet("/health", async (OssiBridgeClient bridge, HttpRequest req) =>
     try
     {
         if (ensure)
+        {
             await bridge.EnsureBridgeRunningAsync();
+            _ = cdrLogger.EnsureRunningAsync();
+        }
         bridgeOk = await bridge.HealthyAsync();
     }
     catch (Exception ex)
@@ -98,6 +114,8 @@ app.MapPost("/session/connect", async (ConnectRequest req, OssiBridgeClient brid
     {
         // Always auto-start OSSI bridge here if needed (no manual start-ossi-bridge.ps1)
         await bridge.EnsureBridgeRunningAsync();
+        // CDR logger is independent of OSSI — never block Login
+        _ = cdrLogger.EnsureRunningAsync();
 
         var el = await bridge.PostAsync("session/connect", new
         {
@@ -333,6 +351,60 @@ app.MapPost("/gateways/refresh", async (OssiBridgeClient bridge) =>
     }
 });
 
+static async Task<IResult> ReadExtensionsFallback(string siteRoot, string dataLiveDir)
+{
+    foreach (var p in new[]
+             {
+                 Path.Combine(siteRoot, "extensions_cache.json"),
+                 Path.Combine(dataLiveDir, "extensions.json"),
+                 Path.Combine(siteRoot, "data", "extensions.json"),
+             })
+    {
+        if (!File.Exists(p)) continue;
+        try
+        {
+            var json = await File.ReadAllTextAsync(p);
+            return Results.Content(json, "application/json");
+        }
+        catch { /* try next */ }
+    }
+    return Results.Json(new
+    {
+        ok = true,
+        items = Array.Empty<object>(),
+        summary = new { total = 0 },
+    });
+}
+
+app.MapGet("/extensions", async (HttpRequest req, OssiBridgeClient bridge) =>
+{
+    var force = string.Equals(req.Query["force"], "1", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(req.Query["refresh"], "1", StringComparison.OrdinalIgnoreCase);
+    try
+    {
+        var path = force ? "extensions?force=1" : "extensions";
+        var el = await bridge.GetAsync(path);
+        return Results.Json(el);
+    }
+    catch
+    {
+        return await ReadExtensionsFallback(siteRoot, dataLiveDir);
+    }
+});
+
+app.MapPost("/extensions/refresh", async (OssiBridgeClient bridge) =>
+{
+    try
+    {
+        var el = await bridge.PostAsync("extensions/refresh", new { });
+        return Results.Json(el);
+    }
+    catch
+    {
+        return await ReadExtensionsFallback(siteRoot, dataLiveDir);
+    }
+});
+
 app.MapPost("/gateways/config", async (HttpRequest req, OssiBridgeClient bridge) =>
 {
     try
@@ -490,7 +562,7 @@ app.MapGet("/trunks/{tg:int}/detail", async (int tg, HttpRequest req, OssiBridge
 app.MapGet("/cdr/status", () =>
 {
     var days = cdrFiles.ListDays(null, null);
-    var logger = cdrFiles.GetLoggerSnapshot();
+    var logger = cdrFiles.GetLoggerSnapshot(cdrLogger.Port);
     return Results.Ok(new
     {
         ok = true,
@@ -507,9 +579,35 @@ app.MapGet("/cdr/status", () =>
     });
 });
 
+app.MapPost("/cdr/logger/ensure", async () =>
+{
+    try
+    {
+        var r = await cdrLogger.EnsureRunningAsync();
+        var snap = cdrFiles.GetLoggerSnapshot(cdrLogger.Port);
+        return Results.Ok(new
+        {
+            ok = r.Ok,
+            started = r.Started,
+            reason = r.Reason,
+            bind = r.Bind,
+            up = snap.Listening,
+            port = snap.Port,
+            todayFile = snap.TodayFile,
+            lastCall = snap.LastWrite,
+            lastCallAgeSec = snap.LastWriteAgeSec,
+            todayBytes = snap.TodayBytes,
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Ok(new { ok = false, up = false, error = ex.Message });
+    }
+});
+
 app.MapGet("/cdr/logger", () =>
 {
-    var logger = cdrFiles.GetLoggerSnapshot();
+    var logger = cdrFiles.GetLoggerSnapshot(cdrLogger.Port);
     return Results.Ok(new
     {
         ok = true,

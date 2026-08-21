@@ -64,7 +64,9 @@ public sealed class OssiBridgeClient
             _pythonExe = FindPythonWithAvayaOssi();
 
         var bridgeUri = new Uri(baseUrl.TrimEnd('/') + "/");
-        _bridgeListenHost = string.IsNullOrWhiteSpace(bridgeUri.Host) ? "127.0.0.1" : bridgeUri.Host;
+        // Bind is the listen address (0.0.0.0). BaseUrl stays loopback for CmApi → bridge HTTP.
+        var bind = (config["OssiBridge:Bind"] ?? "0.0.0.0").Trim();
+        _bridgeListenHost = string.IsNullOrWhiteSpace(bind) ? "0.0.0.0" : bind;
         _bridgeListenPort = bridgeUri.IsDefaultPort ? 18776 : bridgeUri.Port;
 
         _http = new HttpClient

@@ -129,9 +129,11 @@ def join_gateways(
 
 
 def gateway_summary(items: list[dict[str, Any]]) -> dict[str, int]:
-    up = down = mj = mn = wn = 0
+    up = down = failed = mj = mn = wn = 0
     for it in items:
-        if str(it.get("node") or "").upper() == "UP":
+        if it.get("error"):
+            failed += 1
+        elif str(it.get("node") or "").upper() == "UP":
             up += 1
         else:
             down += 1
@@ -142,6 +144,7 @@ def gateway_summary(items: list[dict[str, Any]]) -> dict[str, int]:
         "total": len(items),
         "up": up,
         "down": down,
+        "failed": failed,
         "mj": mj,
         "mn": mn,
         "wn": wn,
@@ -345,24 +348,44 @@ def attach_board_alarms(
     boards: list[dict[str, Any]],
     alarms: list[dict[str, Any]] | None,
 ) -> list[dict[str, Any]]:
-    """Join Active alarms onto boards by Port prefix (051V5…). No extra OSSI."""
+    """Join Active alarms onto boards (prefix) and circuits (exact Port). No extra OSSI."""
     for b in boards:
         prefix = str(b.get("board") or "").upper()
         mj = mn = wn = 0
+        by_port: dict[str, dict[str, int]] = {}
         for a in alarms or []:
-            p = str(a.get("port") or "").upper().replace(" ", "")
-            if not prefix or not p.startswith(prefix):
+            raw = str(a.get("port") or "").upper().replace(" ", "")
+            if not prefix or not raw.startswith(prefix):
                 continue
             sev = str(a.get("severity") or "").upper()
             if sev in ("MAJOR", "MAJ"):
                 mj += 1
+                key = "mj"
             elif sev in ("MINOR", "MIN"):
                 mn += 1
+                key = "mn"
             else:
                 wn += 1
+                key = "wn"
+            nk = norm_avaya_port(raw)
+            if nk == prefix:
+                for p in b.get("ports") or []:
+                    pk = norm_avaya_port(p.get("port"))
+                    if not pk:
+                        continue
+                    slot = by_port.setdefault(pk, {"mj": 0, "mn": 0, "wn": 0})
+                    slot[key] += 1
+            else:
+                slot = by_port.setdefault(nk, {"mj": 0, "mn": 0, "wn": 0})
+                slot[key] += 1
         b["mj"] = mj
         b["mn"] = mn
         b["wn"] = wn
+        for p in b.get("ports") or []:
+            hit = by_port.get(norm_avaya_port(p.get("port"))) or {}
+            p["mj"] = int(hit.get("mj") or 0)
+            p["mn"] = int(hit.get("mn") or 0)
+            p["wn"] = int(hit.get("wn") or 0)
     return boards
 
 

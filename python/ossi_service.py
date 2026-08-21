@@ -488,6 +488,22 @@ def _status_one_tg(sess: OssiSession, tg: int, catalog: dict[int, dict[str, Any]
         oos = 0
     util = utilization_pct(busy, total if total > 0 else (idle + busy + oos))
     tot = total if total > 0 else (idle + busy + oos)
+    if tot <= 0:
+        return {
+            "tg": tg,
+            "name": meta.get("name") or f"TG {tg}",
+            "type": meta.get("type") or "",
+            "tac": meta.get("tac") or "",
+            "total": None,
+            "idle": None,
+            "busy": None,
+            "oos": None,
+            "utilizationPct": None,
+            "statusColor": "red",
+            "lastUpdate": _now_iso(),
+            "error": "UPDATE FAILED",
+            "channels": [],
+        }
     color = status_color(idle, util)
     return {
         "tg": tg,
@@ -1172,7 +1188,7 @@ def refresh_gateways() -> dict[str, Any]:
         try:
             st = sess.run(
                 "list media-gateway",
-                max_more_pages=40,
+                max_more_pages=80,
                 retry_on_error=False,
             )
             text = st.text or ""
@@ -1180,7 +1196,7 @@ def refresh_gateways() -> dict[str, Any]:
             try:
                 p = PATHS.data_dir / "list_media-gateway_last.txt"
                 PATHS.data_dir.mkdir(parents=True, exist_ok=True)
-                p.write_text(text[:120000], encoding="utf-8", errors="replace")
+                p.write_text(text[:400000], encoding="utf-8", errors="replace")
             except Exception:
                 pass
             parsed = parse_list_media_gateway(text)
@@ -1197,9 +1213,20 @@ def refresh_gateways() -> dict[str, Any]:
         if new_items is not None:
             prev_n = len(_gateway_items)
             new_n = len(new_items)
-            if prev_n >= 10 and new_n < prev_n * 0.5:
-                # empty or half-list from desync — keep fuller cache
+            if new_n == 0 and prev_n > 0:
+                # Command returned nothing — retry next Auto, do not zero the table
                 kept_prev = True
+            elif prev_n > new_n > 0:
+                seen = {int(x.get("mg") or 0) for x in new_items}
+                extra = []
+                for old in _gateway_items:
+                    if int(old.get("mg") or 0) in seen:
+                        continue
+                    row = dict(old)
+                    row["error"] = "UPDATE FAILED"
+                    extra.append(row)
+                new_items = list(new_items) + extra
+                _gateway_items = new_items
             else:
                 _gateway_items = new_items
         _last_gateway_at = time.monotonic()
@@ -2143,7 +2170,8 @@ def _health_already_up(host: str, port: int) -> bool:
     import urllib.error
     import urllib.request
 
-    url = f"http://{host}:{port}/health"
+    probe = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
+    url = f"http://{probe}:{port}/health"
     try:
         with urllib.request.urlopen(url, timeout=1.5) as resp:
             body = (resp.read() or b"").decode("utf-8", errors="replace")
@@ -2154,7 +2182,7 @@ def _health_already_up(host: str, port: int) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="OSSI bridge for CM NOC")
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=18765)
     parser.add_argument("--data-dir", default=str(PATHS.data_dir))
     args = parser.parse_args()

@@ -19,7 +19,7 @@ import {
   refreshAlarmsSilent,
   syncAlarmCountdown,
   setOssiBusy as setAlarmOssiBusy,
-} from "./alarm-ui.js";
+} from "./alarm-ui.js?v=20260821s";
 import {
   initGatewayUi,
   onGatewayTabShow,
@@ -30,7 +30,7 @@ import {
   setOssiBusy as setGatewayOssiBusy,
   runGatewayConfigRefresh,
   getOpenGatewayDetailMg,
-} from "./gateway-ui.js";
+} from "./gateway-ui.js?v=20260821s";
 import {
   initExtensionUi,
   onExtensionTabShow,
@@ -47,7 +47,9 @@ import {
   setMapSessionConnected,
   setMapTabActive,
   refreshMapFromCache,
-} from "./map-ui.js";
+  syncMapCountdown,
+  setOssiBusy as setMapOssiBusy,
+} from "./map-ui.js?v=20260821s";
 
 function setOssiBusy(busy) {
   try {
@@ -65,10 +67,15 @@ function setOssiBusy(busy) {
   } catch {
     /* ignore */
   }
+  try {
+    setMapOssiBusy(busy);
+  } catch {
+    /* ignore */
+  }
 }
 
 const API = "api";
-const REFRESH_INTERVAL_SEC = 60;
+const REFRESH_INTERVAL_SEC = 90;
 /** This browser tab explicitly clicked Login (not auto-resume from leftover OSSI). */
 const UI_SESSION_KEY = "cm_noc_ui_logged_in";
 const NOTES_LS_KEY = "cm_noc_notes";
@@ -235,6 +242,7 @@ async function runQueuedJob(job) {
       } catch {
         /* ignore */
       }
+      healAutoCountdown();
     }
   }
 }
@@ -274,6 +282,7 @@ function enqueueGwConfig(mg, opts = {}) {
     if (cmdQueue[i].kind === "gw-config") cmdQueue.splice(i, 1);
   }
   enqueueJob({ kind: "gw-config", mg: n, showModal });
+  healAutoCountdown();
 }
 
 /** Hourly list extension while session is live (not every 60s). */
@@ -298,6 +307,7 @@ const $ = (id) => document.getElementById(id);
 
 const state = {
   connected: false,
+  connecting: false,
   timer: null,
   heartbeatTimer: null,
   countdownTimer: null,
@@ -420,18 +430,22 @@ function setError(msg) {
  * Login / connect messages stay on connect-panel status-line.
  */
 function setStatus(msg) {
-  const trunkEl = $("trunk-auto-status");
   const connectEl = $("status-line");
-  const preferTrunk = trunkEl && state.connected;
-  if (preferTrunk) {
-    if (!msg) {
-      trunkEl.hidden = true;
-      trunkEl.textContent = "";
-      trunkEl.removeAttribute("title");
-    } else {
-      trunkEl.hidden = false;
-      trunkEl.textContent = msg;
-      trunkEl.title = msg;
+  const barIds = ["trunk-auto-status", "map-auto-status"];
+  const preferBar = state.connected && barIds.some((id) => $(id));
+  if (preferBar) {
+    for (const id of barIds) {
+      const el = $(id);
+      if (!el) continue;
+      if (!msg) {
+        el.hidden = true;
+        el.textContent = "";
+        el.removeAttribute("title");
+      } else {
+        el.hidden = false;
+        el.textContent = msg;
+        el.title = msg;
+      }
     }
     if (connectEl) {
       connectEl.hidden = true;
@@ -460,7 +474,6 @@ function applyUiMode() {
   const tabs = $("main-tabs");
   const panel = $("panel-trunk");
   const card = $("trunk-card");
-  const btnRef = $("btn-refresh-now");
   const btnDisc = $("btn-disconnect");
   const btnConn = $("btn-connect");
   const fields = ["inp-host", "inp-port", "inp-user", "inp-pass"];
@@ -472,9 +485,9 @@ function applyUiMode() {
   if (state.connected) {
     // Logged in: never leave the trunk card dimmed (user may have logged in on another tab)
     if (card) card.classList.remove("dimmed");
-    btnRef.disabled = false;
-    btnDisc.disabled = false;
-    btnConn.disabled = true;
+    if (btnDisc) btnDisc.disabled = false;
+    // Login stays clickable so a dead OSSI session can be re-authed
+    if (btnConn) btnConn.disabled = !!state.connecting;
     fields.forEach((id) => {
       const el = $(id);
       if (el) el.disabled = true;
@@ -487,9 +500,8 @@ function applyUiMode() {
   } else {
     // Trunk panel: dim if visible; keep structure when user is on Trunk tab
     if (card) card.classList.add("dimmed");
-    btnRef.disabled = true;
-    btnDisc.disabled = true;
-    btnConn.disabled = false;
+    if (btnDisc) btnDisc.disabled = true;
+    if (btnConn) btnConn.disabled = !!state.connecting;
     fields.forEach((id) => {
       const el = $(id);
       if (el) el.disabled = false;
@@ -567,7 +579,13 @@ function mergeRows() {
   return mon.map((m) => {
     const live = byTg.get(m.tg) || {};
     const sticky = !!(state.tgStickyError && state.tgStickyError[m.tg]);
-    const err = live.error || (sticky ? "UPDATE FAILED" : null);
+    const emptyCounts =
+      live.tg != null &&
+      !live.error &&
+      Number(live.total || 0) === 0 &&
+      Number(live.idle || 0) === 0 &&
+      Number(live.busy || 0) === 0;
+    const err = live.error || (sticky ? "UPDATE FAILED" : null) || (emptyCounts ? "UPDATE FAILED" : null);
     return {
       tg: m.tg,
       order: m.order,
@@ -615,10 +633,11 @@ function statusCellHtml(it) {
   if (!it.hasLive) return `<span class="badge muted">—</span>`;
   // Per-TG OSSI get fail → Status only (no login popup / no global error banner)
   if (it.error) {
-    return `<span class="badge red" title="UPDATE FAILED"><span class="dot"></span>UPDATE FAILED</span>`;
+    return `<span class="badge fail" title="UPDATE FAILED"><span class="dot"></span>UPDATE FAILED</span>`;
   }
   const color = utilColorClass(it);
-  return `<span class="badge ${color}"><span class="dot"></span>${color}</span>`;
+  const label = color === "red" ? "MAJOR" : color === "yellow" ? "MINOR" : "GREEN";
+  return `<span class="badge ${color}" title="${label}"><span class="dot"></span>${label}</span>`;
 }
 
 function buildTrunkRow(it) {
@@ -803,7 +822,10 @@ function applyStickyTrunkErrors(items) {
 function applyOneTrunkItem(item) {
   if (!item || item.tg == null) return;
   const tg = Number(item.tg);
-  if (item.error) {
+  if (
+    item.error ||
+    (Number(item.total || 0) === 0 && Number(item.idle || 0) === 0 && Number(item.busy || 0) === 0)
+  ) {
     markTrunkStickyError(tg, true);
     item = stripStaleTrunkCounts({
       ...item,
@@ -862,7 +884,10 @@ function paintCountdown() {
     el.classList.remove("is-updating");
     return;
   }
-  const sec = Math.max(0, Math.ceil((state.nextRefreshAt - Date.now()) / 1000));
+  const sec = Math.min(
+    REFRESH_INTERVAL_SEC,
+    Math.max(0, Math.ceil((state.nextRefreshAt - Date.now()) / 1000))
+  );
   el.textContent = `Next: ${sec}s`;
   el.classList.remove("is-updating");
 }
@@ -878,7 +903,8 @@ function startCountdownClock() {
       armNextRefresh(5);
     }
     paintCountdown();
-    // Auto refresh: no popup; only when countdown hits 0 on Trunk tab
+    healAutoCountdown();
+    // Auto refresh: no popup; open OSSI tabs pack Trunk+Alarm+Gateway
     if (
       state.connected &&
       $("chk-auto")?.checked &&
@@ -886,10 +912,10 @@ function startCountdownClock() {
       state.nextRefreshAt > 0 &&
       Date.now() >= state.nextRefreshAt &&
       document.visibilityState === "visible" &&
-      (state.activeTab === "trunk" || !!getOpenGatewayDetailMg())
+      autoPackTabOpen()
     ) {
       // fire-and-forget; progressiveRefresh guards with state.refreshing
-      // Gateway Details keeps global 60s + this-GW list configuration in the same pack
+      // Gateway Details keeps global 90s + this-GW list configuration in the same pack
       progressiveRefresh({ reason: "auto", showModal: false }).catch((e) => {
         console.warn("auto refresh:", e?.message || e);
         state.refreshing = false;
@@ -900,8 +926,17 @@ function startCountdownClock() {
   }, 250);
 }
 
+function autoPackTabOpen() {
+  const t = state.activeTab;
+  return t === "trunk" || t === "gateway" || t === "alarm" || t === "map" || !!getOpenGatewayDetailMg();
+}
+
 function armNextRefresh(fromNowSec = REFRESH_INTERVAL_SEC) {
-  state.nextRefreshAt = Date.now() + Math.max(1, fromNowSec) * 1000;
+  let sec = Number(fromNowSec);
+  if (!Number.isFinite(sec) || sec < 1) sec = REFRESH_INTERVAL_SEC;
+  // Never park Auto for hours — leftover 24h lock showed "Next: 86373s" on Gateway Details.
+  if (sec > REFRESH_INTERVAL_SEC) sec = REFRESH_INTERVAL_SEC;
+  state.nextRefreshAt = Date.now() + sec * 1000;
   try {
     syncAlarmCountdown(state.nextRefreshAt);
   } catch {
@@ -912,7 +947,33 @@ function armNextRefresh(fromNowSec = REFRESH_INTERVAL_SEC) {
   } catch {
     /* gateway ui optional */
   }
+  try {
+    syncMapCountdown(state.nextRefreshAt);
+  } catch {
+    /* map ui optional */
+  }
   paintCountdown();
+}
+
+/** If Next is >90s (stale 24h park), snap back so Auto actually runs. */
+function healAutoCountdown() {
+  if (!state.connected) return;
+  if ($("chk-auto")?.checked === false) return;
+  const maxAt = Date.now() + REFRESH_INTERVAL_SEC * 1000;
+  if (!state.nextRefreshAt || state.nextRefreshAt > maxAt + 1500) {
+    armNextRefresh(REFRESH_INTERVAL_SEC);
+  } else {
+    try {
+      syncGatewayCountdown(state.nextRefreshAt);
+    } catch {
+      /* ignore */
+    }
+    try {
+      syncMapCountdown(state.nextRefreshAt);
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 function bindRowInteractions(tbody) {
@@ -1159,11 +1220,16 @@ function showLoginModal(title = "Connecting to CM") {
   const m = $("login-modal");
   if (!m) return;
   m.hidden = false;
-  $("btn-login-modal-close").hidden = true;
-  $("login-modal-spinner").className = "modal-spinner";
-  $("login-modal-title").textContent = title;
-  $("login-modal-sub").textContent = "Please wait…";
-  $("login-modal-detail").textContent = "";
+  const close = $("btn-login-modal-close");
+  if (close) close.hidden = true;
+  const spin = $("login-modal-spinner");
+  if (spin) spin.className = "modal-spinner";
+  const titleEl = $("login-modal-title");
+  if (titleEl) titleEl.textContent = title;
+  const sub = $("login-modal-sub");
+  if (sub) sub.textContent = "Please wait…";
+  const detail = $("login-modal-detail");
+  if (detail) detail.textContent = "";
   setLoginPct(0, "");
   const isLogout = /log\s*out/i.test(title);
   const labels = isLogout
@@ -1267,7 +1333,7 @@ function paintDetailFromItem(item, opts = {}) {
     tbody.innerHTML = `<tr class="empty"><td colspan="5">${
       item.error ||
       opts.error ||
-      "未有 channel cache — 等下一次 Auto 60s，或撳 Refresh 此 TG。"
+      "未有 channel cache — 等下一次 Auto 90s。"
     }</td></tr>`;
     return;
   }
@@ -1484,12 +1550,39 @@ async function runLoginOssiCache() {
   }
 }
 
+function forceSessionDropped(reason) {
+  if (!state.connected && !state.connecting) {
+    applyUiMode();
+    return;
+  }
+  state.connected = false;
+  state.connecting = false;
+  clearUiLoggedIn();
+  stopHeartbeat();
+  stopLivePoll();
+  stopExtensionHourlyTimer();
+  setAlarmSessionConnected(false);
+  setGatewaySessionConnected(false);
+  setExtensionSessionConnected(false);
+  setMapSessionConnected(false);
+  setSessionLabel("Disconnected", false);
+  if (reason) setStatus(reason);
+  applyUiMode();
+}
+
 async function connect() {
+  if (state.connecting) return;
   setError("");
   setStatus("Login…");
   setSessionLabel("Connecting…", false);
-  $("btn-connect").disabled = true;
-  showLoginModal();
+  state.connecting = true;
+  const btn = $("btn-connect");
+  if (btn) btn.disabled = true;
+  try {
+    showLoginModal();
+  } catch (e) {
+    console.warn("showLoginModal:", e);
+  }
   try {
     const body = {
       host: $("inp-host").value.trim(),
@@ -1580,10 +1673,14 @@ async function connect() {
     setError(msg);
     setSessionLabel("Disconnected", false);
     setStatus("");
-    applyUiMode();
-    failLoginModal(msg);
+    try {
+      failLoginModal(msg);
+    } catch {
+      /* modal optional */
+    }
   } finally {
-    $("btn-connect").disabled = false;
+    state.connecting = false;
+    applyUiMode();
   }
 }
 
@@ -1605,7 +1702,21 @@ function startHeartbeat() {
         tab: state.activeTab || "trunk",
         skipTime: !!state.refreshing,
       }),
-    }).catch(() => {});
+    })
+      .then((r) => {
+        state._hbFails = 0;
+        if (!state.connected) return;
+        if (r && r.connected === false) {
+          forceSessionDropped("OSSI session ended — please Login again.");
+        }
+      })
+      .catch(() => {
+        if (!state.connected) return;
+        state._hbFails = (state._hbFails || 0) + 1;
+        if (state._hbFails >= 2) {
+          forceSessionDropped("OSSI unreachable — please Login again.");
+        }
+      });
   };
   state.heartbeatTimer = setInterval(beat, 30_000);
   beat();
@@ -1935,7 +2046,6 @@ async function progressiveRefresh(opts = {}) {
 
   state.refreshing = true;
   state.refreshingSince = Date.now();
-  state.nextRefreshAt = Date.now() + 24 * 3600 * 1000;
   paintCountdown();
   if (showModal) setError("");
 
@@ -2018,7 +2128,7 @@ async function progressiveRefresh(opts = {}) {
         const tr2 = document.querySelector(`tr.tg-row[data-tg="${tg}"]`);
         if (tr2) tr2.classList.remove("row-updating");
         if (i < list.length - 1) {
-          await new Promise((r) => setTimeout(r, 250));
+          await new Promise((r) => setTimeout(r, 300));
         }
       }
     }
@@ -2071,17 +2181,26 @@ async function progressiveRefresh(opts = {}) {
       if (btn) btn.hidden = false;
     }
   } finally {
-    state.refreshing = false;
-    state.refreshingSince = 0;
-    try {
-      setOssiBusy(false);
-    } catch {
-      /* ignore */
-    }
-    armNextRefresh(REFRESH_INTERVAL_SEC);
-    // Pack Active Alarm after trunks (one OSSI owner — do not overlap)
+    const finishCycle = () => {
+      state.refreshing = false;
+      state.refreshingSince = 0;
+      try {
+        setOssiBusy(false);
+      } catch {
+        /* ignore */
+      }
+      armNextRefresh(REFRESH_INTERVAL_SEC);
+      pumpQueue();
+    };
+    // Pack after trunks while still holding the cycle — do not arm 60s until pack ends.
+    // Otherwise Auto fires again during list configuration and CmApi returns 502.
     const pack = ["auto", "auto-on", "login", "visible", "resume", "tab"].includes(reason);
     if (pack && state.connected && $("chk-auto")?.checked) {
+      try {
+        setOssiBusy(true);
+      } catch {
+        /* ignore */
+      }
       refreshAlarmsSilent()
         .then(() => refreshGatewaysSilent())
         .then(() => {
@@ -2090,7 +2209,7 @@ async function progressiveRefresh(opts = {}) {
           const queued = cmdQueue.find(
             (j) => j.kind === "gw-config" && Number(j.mg) === Number(mg)
           );
-          if (queued && queued.showModal) return null;
+          if (queued) return null;
           for (let i = cmdQueue.length - 1; i >= 0; i -= 1) {
             if (cmdQueue[i].kind === "gw-config" && Number(cmdQueue[i].mg) === Number(mg)) {
               cmdQueue.splice(i, 1);
@@ -2099,10 +2218,10 @@ async function progressiveRefresh(opts = {}) {
           return runGatewayConfigRefresh(mg, { showModal: false });
         })
         .then(() => refreshMapFromCache())
-        .then(() => pumpQueue())
-        .catch((e) => console.warn("packed alarm/gw:", e?.message || e));
+        .catch((e) => console.warn("packed alarm/gw:", e?.message || e))
+        .finally(() => finishCycle());
     } else {
-      pumpQueue();
+      finishCycle();
     }
   }
 }
@@ -2319,6 +2438,7 @@ function bindTabs() {
         setAlarmTabActive(false);
         setExtensionTabActive(false);
         setMapTabActive(false);
+        healAutoCountdown();
         paintCountdown();
       } else if (name === "map") {
         try {
@@ -2329,6 +2449,7 @@ function bindTabs() {
         setAlarmTabActive(false);
         setGatewayTabActive(false);
         setExtensionTabActive(false);
+        healAutoCountdown();
         paintCountdown();
       } else if (name === "extension") {
         try {
@@ -2382,8 +2503,20 @@ function initThemeToggle() {
 }
 
 async function init() {
-  initThemeToggle();
-  bindTabs();
+  window.__cmConnect = connect;
+  window.__cmDisconnect = disconnect;
+  $("btn-connect")?.addEventListener("click", connect);
+  $("btn-disconnect")?.addEventListener("click", disconnect);
+  try {
+    initThemeToggle();
+  } catch (e) {
+    console.warn("theme:", e);
+  }
+  try {
+    bindTabs();
+  } catch (e) {
+    console.warn("tabs:", e);
+  }
   tickClock();
   setInterval(tickClock, 1000);
   try {
@@ -2415,52 +2548,19 @@ async function init() {
   window.__cmEnqueueExtension = (opts) => enqueueExtensionRefresh(opts || {});
   window.__cmEnqueueGwConfig = (mg, opts) => enqueueGwConfig(mg, opts || {});
 
-  $("btn-connect").addEventListener("click", connect);
-  $("btn-disconnect").addEventListener("click", disconnect);
-  $("btn-refresh-now").addEventListener("click", refreshNow);
   const modalClose = $("btn-login-modal-close");
   if (modalClose) {
     modalClose.addEventListener("click", () => hideLoginModal());
   }
-  $("btn-add-tg").addEventListener("click", addTg);
-  $("btn-detail-back").addEventListener("click", closeDetail);
-  $("btn-detail-refresh").addEventListener("click", async () => {
-    if (!state.detailTg) return;
-    const tg = state.detailTg;
-    const btn = $("btn-detail-refresh");
-    if (btn) {
-      btn.disabled = true;
-      btn.classList.add("is-loading");
-      btn.textContent = "Refreshing…";
-    }
-    try {
-      if (state.refreshing) {
-        enqueueJob({ kind: "status", tg });
-        showProgress("Refresh TG", `Queued status trunk ${tg} — waiting for OSSI…`);
-        finishProgress(true, `Queued status trunk ${tg}`);
-      } else {
-        await loadDetail(tg, { force: true });
-      }
-    } catch (e) {
-      showProgress("Refresh TG", String(e.message || e));
-      finishProgress(false, String(e.message || e));
-      const closeBtn = $("btn-progress-close");
-      if (closeBtn) closeBtn.hidden = false;
-    } finally {
-      if (btn) {
-        btn.disabled = false;
-        btn.classList.remove("is-loading");
-        btn.textContent = "Refresh 此 TG";
-      }
-    }
-  });
-  $("inp-tg").addEventListener("keydown", (e) => {
+  $("btn-add-tg")?.addEventListener("click", addTg);
+  $("btn-detail-back")?.addEventListener("click", closeDetail);
+  $("inp-tg")?.addEventListener("keydown", (e) => {
     if (e.key === "Enter") addTg();
   });
-  $("inp-tg-note").addEventListener("keydown", (e) => {
+  $("inp-tg-note")?.addEventListener("keydown", (e) => {
     if (e.key === "Enter") addTg();
   });
-  $("chk-auto").addEventListener("change", () => {
+  $("chk-auto")?.addEventListener("change", () => {
     if (state.connected && $("chk-auto").checked) {
       // Turn auto on → silent update now, then 60s (no popup for auto path)
       progressiveRefresh({ reason: "auto-on", showModal: false }).catch((e) =>
@@ -2484,11 +2584,11 @@ async function init() {
       document.visibilityState === "visible" &&
       state.connected &&
       $("chk-auto")?.checked &&
-      (state.activeTab === "trunk" || !!getOpenGatewayDetailMg())
+      autoPackTabOpen()
     ) {
-      progressiveRefresh({ reason: "visible", showModal: false }).catch((e) =>
-        console.warn("visible refresh:", e?.message || e)
-      );
+      progressiveRefresh({ reason: "visible", showModal: false }).catch((e) => {
+        console.warn("visible refresh:", e?.message || e);
+      });
     }
   });
 
@@ -2577,4 +2677,14 @@ async function init() {
   }
 }
 
-init();
+window.__cmConnect = connect;
+window.__cmDisconnect = disconnect;
+init().catch((e) => {
+  const msg = String((e && e.message) || e || "init failed");
+  console.error("UI init:", e);
+  const el = document.getElementById("error-line");
+  if (el) {
+    el.hidden = false;
+    el.textContent = "UI init failed: " + msg;
+  }
+});

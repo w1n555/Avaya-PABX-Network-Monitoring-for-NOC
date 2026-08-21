@@ -710,7 +710,7 @@ function Install-BridgeTask([string]$root, [string]$venvPy) {
     $script = Join-Path $root "python\ossi_service.py"
     $data = Join-Path $root "data"
     $work = Join-Path $root "python"
-    $arg = "`"$script`" --host 127.0.0.1 --port 18765 --data-dir `"$data`""
+    $arg = "`"$script`" --host 0.0.0.0 --port 18765 --data-dir `"$data`""
 
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
     $action = New-ScheduledTaskAction -Execute $venvPy -Argument $arg -WorkingDirectory $work
@@ -791,14 +791,14 @@ function Start-BridgeNow([string]$root, [string]$venvPy, [switch]$ForceRestart) 
         }
 
         Write-Info "Starting bridge: $py"
-        $arg = "`"$script`" --host 127.0.0.1 --port 18765 --data-dir `"$data`""
+        $arg = "`"$script`" --host 0.0.0.0 --port 18765 --data-dir `"$data`""
         # Use cmd start so short-lived wrappers / venv stubs work on more machines
         $cmd = "start `"`" /B `"$py`" $arg"
         $p = Start-Process -FilePath "$env:ComSpec" -ArgumentList @("/c", $cmd) -WorkingDirectory $work -WindowStyle Hidden -PassThru -ErrorAction SilentlyContinue
         if (-not $p) {
             # Fallback: direct Start-Process
             Start-Process -FilePath $py -ArgumentList @(
-                $script, "--host", "127.0.0.1", "--port", "18765", "--data-dir", $data
+                $script, "--host", "0.0.0.0", "--port", "18765", "--data-dir", $data
             ) -WorkingDirectory $work -WindowStyle Hidden -ErrorAction SilentlyContinue | Out-Null
         }
 

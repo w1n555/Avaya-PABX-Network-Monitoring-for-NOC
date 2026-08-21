@@ -54,6 +54,9 @@ const GW = {
   pendingSilent: false,
   detailMg: null,
   configByMg: {},
+  alarmByPort: {},
+  configLoadingMg: 0,
+  detailQuery: "",
 };
 
 function escapeHtml(s) {
@@ -95,6 +98,58 @@ function paintGwUpdated() {
   if (el) el.textContent = fmtUpdated(GW.data.lastUpdate);
 }
 
+function normPortKey(port) {
+  const s = String(port || "")
+    .trim()
+    .toUpperCase()
+    .replace(/\s/g, "");
+  const m = s.match(/^0*(\d+)V(\d+)$/i);
+  if (!m) return s;
+  const gw = m[1];
+  const rest = m[2];
+  if (rest.length <= 2) return `${String(Number(gw)).padStart(3, "0")}V${Number(rest)}`;
+  const slot = rest.slice(0, -2);
+  const circ = rest.slice(-2);
+  return `${String(Number(gw)).padStart(3, "0")}V${Number(slot)}${String(Number(circ)).padStart(2, "0")}`;
+}
+
+async function refreshAlarmPortMap() {
+  try {
+    const data = await fetchJsonGw(apiUrlGw("alarms"));
+    const items = (data && (data.active || data.items)) || [];
+    const map = {};
+    for (const a of items) {
+      const key = normPortKey(a.port);
+      if (!key) continue;
+      const sev = String(a.severity || "").toUpperCase();
+      const rank = sev.startsWith("MAJ") ? 3 : sev.startsWith("MIN") ? 2 : 1;
+      const label = rank === 3 ? "MAJOR" : rank === 2 ? "MINOR" : "WARNING";
+      if (!map[key] || rank > map[key].rank) map[key] = { rank, label };
+    }
+    GW.alarmByPort = map;
+  } catch {
+    /* keep last map */
+  }
+}
+
+function chipAlarm(p, board) {
+  if (Number(p.mj) > 0) return { cls: "alarm-major", label: "MAJOR" };
+  if (Number(p.mn) > 0) return { cls: "alarm-minor", label: "MINOR" };
+  if (Number(p.wn) > 0) return { cls: "alarm-warn", label: "WARNING" };
+  const hit = GW.alarmByPort && GW.alarmByPort[normPortKey(p.port)];
+  if (hit) {
+    if (hit.rank === 3) return { cls: "alarm-major", label: hit.label };
+    if (hit.rank === 2) return { cls: "alarm-minor", label: hit.label };
+    return { cls: "alarm-warn", label: hit.label };
+  }
+  const bkey = board ? normPortKey(board.board) : "";
+  const boardHit = bkey && GW.alarmByPort && GW.alarmByPort[bkey];
+  if (boardHit && boardHit.rank === 3) {
+    return { cls: "alarm-major", label: "MAJOR" };
+  }
+  return { cls: "", label: "" };
+}
+
 function filteredGwRows() {
   const q = (GW.query || "").trim().toLowerCase();
   const items = GW.data.items || [];
@@ -112,12 +167,16 @@ function setText(id, text) {
 }
 
 function paintGwSummary() {
-  const s = GW.data.summary || {};
   const items = GW.data.items || [];
-  const total = s.total ?? items.length;
-  const online =
-    s.up ?? items.filter((r) => String(r.node || "").toUpperCase() === "UP").length;
-  const down = s.down ?? Math.max(0, total - online);
+  const total = items.length;
+  const failed = items.filter((r) => r.error).length;
+  const online = items.filter(
+    (r) => !r.error && String(r.node || "").toUpperCase() === "UP"
+  ).length;
+  const down = items.filter(
+    (r) => !r.error && String(r.node || "").toUpperCase() !== "UP"
+  ).length;
+  const s = GW.data.summary || {};
   setText("gw-stat-online", `${online} / ${total}`);
   setText("gw-stat-down", String(down));
   setText("gw-stat-mj", String(s.mj ?? 0));
@@ -126,12 +185,13 @@ function paintGwSummary() {
   const onlineCard = document.getElementById("gw-stat-online-card");
   if (onlineCard) {
     onlineCard.classList.remove("accent-red", "accent-green");
-    if (total > 0 && down === 0) onlineCard.classList.add("accent-green");
-    else if (down > 0) onlineCard.classList.add("accent-red");
+    if (total > 0 && down === 0 && failed === 0) onlineCard.classList.add("accent-green");
+    else if (down > 0 || failed > 0) onlineCard.classList.add("accent-red");
   }
 }
 
 function rowClass(r) {
+  if (r.error) return "sev-fail";
   if (String(r.node || "").toUpperCase() === "DOWN") return "sev-major";
   if (Number(r.mj) > 0) return "sev-major";
   if (Number(r.mn) > 0) return "sev-minor";
@@ -153,6 +213,13 @@ function renderGwTable() {
     return;
   }
   const rows = filteredGwRows();
+  const countEl = document.getElementById("gw-list-count");
+  if (countEl) {
+    const all = (GW.data.items || []).length;
+    const nums = (all ? GW.data.items : []).map((r) => Number(r.mg)).filter((n) => n > 0);
+    const span = nums.length ? `MG ${Math.min(...nums)}–${Math.max(...nums)}` : "";
+    countEl.textContent = all ? `${all} gateways${span ? " · " + span : ""}` : "";
+  }
   if (!rows.length) {
     const q = (GW.query || "").trim();
     const msg = !GW.connected
@@ -165,8 +232,13 @@ function renderGwTable() {
   }
   tbody.innerHTML = rows
     .map((r) => {
-      const node = String(r.node || "").toUpperCase() === "DOWN" ? "DOWN" : "UP";
-      const nodeCls = node === "UP" ? "node-up" : "node-down";
+      const failed = !!r.error;
+      const node = failed
+        ? "UPDATE FAILED"
+        : String(r.node || "").toUpperCase() === "DOWN"
+          ? "DOWN"
+          : "UP";
+      const nodeCls = failed ? "node-fail" : node === "UP" ? "node-up" : "node-down";
       const host = r.hostname || "—";
       return `<tr class="${rowClass(r)}" data-mg="${escapeHtml(String(r.mg ?? ""))}">
         <td class="mono">${escapeHtml(String(r.mg ?? "—"))}</td>
@@ -192,15 +264,18 @@ function paintGwCountdown() {
     setBoth("Next: —");
     return;
   }
-  if (GW.loading) {
+  if (GW.loading || GW.ossiBusy) {
     setBoth("Updating…");
     return;
   }
   if (!GW.nextAt) {
-    setBoth("Next: session Auto 60s");
+    setBoth("Next: session Auto 90s");
     return;
   }
-  const sec = Math.max(0, Math.ceil((GW.nextAt - Date.now()) / 1000));
+  const sec = Math.min(
+    90,
+    Math.max(0, Math.ceil((GW.nextAt - Date.now()) / 1000))
+  );
   const extra = GW.detailMg && !document.getElementById("gw-detail-view")?.hidden
     ? ` · this GW + global`
     : "";
@@ -214,6 +289,18 @@ export function getOpenGatewayDetailMg() {
   return GW.detailMg;
 }
 
+/** Port-joined MJ/MN on live GWs (not UPDATE FAILED, not DOWN-only). */
+export function getGatewayMjMn() {
+  let mj = 0;
+  let mn = 0;
+  for (const r of GW.data.items || []) {
+    if (r.error) continue;
+    mj += Number(r.mj || 0);
+    mn += Number(r.mn || 0);
+  }
+  return { mj, mn };
+}
+
 function applyGwPayload(data) {
   if (!data || typeof data !== "object") return false;
   let d = data;
@@ -224,13 +311,21 @@ function applyGwPayload(data) {
     d = d.data.gateways;
   }
   if (!Array.isArray(d.items) && !d.summary) return false;
-  const incoming = Array.isArray(d.items) ? d.items : [];
+  let incoming = Array.isArray(d.items) ? d.items : [];
   const prev = GW.data.items || [];
-  // Incomplete list media-gateway (more? cut short) — keep fuller cache
-  if (prev.length >= 20 && incoming.length > 0 && incoming.length < prev.length * 0.5) {
-    console.warn("gateway payload looks truncated", incoming.length, "vs", prev.length);
-    setGwStatus(`list media-gateway incomplete (${incoming.length}) — keeping last ${prev.length}`);
+  if (prev.length > 0 && incoming.length === 0) {
+    setGwStatus("list media-gateway empty — keeping last, Auto will retry");
     return false;
+  }
+  if (prev.length > incoming.length && incoming.length > 0) {
+    const seen = new Set(incoming.map((g) => Number(g.mg)));
+    const extra = prev
+      .filter((g) => !seen.has(Number(g.mg)))
+      .map((g) => ({ ...g, error: "UPDATE FAILED" }));
+    incoming = incoming.concat(extra);
+    setGwStatus(
+      `list media-gateway ${incoming.length - extra.length} live · ${extra.length} UPDATE FAILED`
+    );
   }
   GW.data = {
     ok: d.ok !== false,
@@ -242,6 +337,11 @@ function applyGwPayload(data) {
   paintGwSummary();
   renderGwTable();
   paintGwUpdated();
+  try {
+    if (typeof window.__cmApplyAlarmFlash === "function") window.__cmApplyAlarmFlash();
+  } catch {
+    /* alarm ui optional */
+  }
   return true;
 }
 
@@ -403,9 +503,13 @@ export async function refreshGatewaysSilent() {
   }
 }
 
-/** Trunk Auto countdown drives Gateway "Next" so all share one 60s. */
+/** Trunk Auto countdown drives Gateway "Next" so all share one 90s. */
 export function syncGatewayCountdown(nextAtMs) {
-  if (nextAtMs) GW.nextAt = nextAtMs;
+  const t = Number(nextAtMs);
+  if (t) {
+    const maxAt = Date.now() + 90 * 1000;
+    GW.nextAt = Math.min(t, maxAt);
+  }
   paintGwCountdown();
 }
 
@@ -426,31 +530,29 @@ function nocBoardType(typ, code) {
 function showGwList() {
   const list = document.getElementById("gw-list-view");
   const det = document.getElementById("gw-detail-view");
+  const card = document.getElementById("gateway-card");
   if (list) list.hidden = false;
   if (det) det.hidden = true;
+  if (card) card.classList.remove("gw-detail-open");
 }
 
 function showGwDetailPane() {
   const list = document.getElementById("gw-list-view");
   const det = document.getElementById("gw-detail-view");
+  const card = document.getElementById("gateway-card");
   if (list) list.hidden = true;
   if (det) det.hidden = false;
+  if (card) card.classList.add("gw-detail-open");
 }
 
 function paintGwDetailHeader(mg) {
   const row = gwRowByMg(mg) || {};
-  const node = String(row.node || "").toUpperCase() === "DOWN" ? "DOWN" : row.node ? "UP" : "—";
   setText("gw-detail-mg", `MG ${mg}`);
   setText("gw-detail-title", row.hostname || "—");
   const meta = document.getElementById("gw-detail-meta");
   if (meta) {
-    const bits = [row.ip, row.type, fmtUpdated(GW.data.lastUpdate)].filter(Boolean);
+    const bits = [row.ip, row.type].filter(Boolean);
     meta.textContent = bits.join(" · ");
-  }
-  const badge = document.getElementById("gw-detail-node");
-  if (badge) {
-    badge.textContent = node;
-    badge.className = `badge-node gw-ident-node ${node === "DOWN" ? "node-down" : "node-up"}`;
   }
 }
 
@@ -467,8 +569,14 @@ function portUsage(boards, kind) {
 }
 
 function paintGwDetailBody(payload, statusMsg) {
-  const boards = (payload && payload.boards) || [];
-  const assigned = (payload && payload.assigned) || [];
+  let boards = (payload && payload.boards) || [];
+  let assigned = (payload && payload.assigned) || [];
+  const prev = GW.detailMg ? GW.configByMg[GW.detailMg] : null;
+  if (!boards.length && prev && (prev.boards || []).length) {
+    payload = prev;
+    boards = prev.boards || [];
+    assigned = prev.assigned || [];
+  }
   const row = gwRowByMg(GW.detailMg) || {};
   const ana = portUsage(boards, "Analog");
   const dcp = portUsage(boards, "Digital");
@@ -480,7 +588,7 @@ function paintGwDetailBody(payload, statusMsg) {
   const bt = document.getElementById("gw-board-tbody");
   if (bt) {
     if (!boards.length) {
-      bt.innerHTML = `<tr class="empty"><td colspan="4">${escapeHtml(statusMsg || "Loading configuration…")}</td></tr>`;
+      bt.innerHTML = `<tr class="empty"><td colspan="4">${escapeHtml(statusMsg || "No modules yet.")}</td></tr>`;
     } else {
       bt.innerHTML = boards
         .map((b) => {
@@ -490,8 +598,10 @@ function paintGwDetailBody(payload, statusMsg) {
               const st = p.state || "unassigned";
               const ext = p.extension ? `<span class="gw-chip-ext">${escapeHtml(p.extension)}</span>` : "";
               const btype = nocBoardType(b.type, b.code);
+              const al = chipAlarm(p, b);
               const label =
-                st === "psa"
+                al.label ||
+                (st === "psa"
                   ? "PSA"
                   : st === "tti"
                     ? "TTI"
@@ -499,16 +609,23 @@ function paintGwDetailBody(payload, statusMsg) {
                       ? "empty"
                       : btype === "Trunk"
                         ? "trunk"
-                        : "station";
-              return `<span class="gw-chip ${escapeHtml(st)}" title="${escapeHtml(
+                        : "station");
+              const cls = ["gw-chip", st, al.cls].filter(Boolean).join(" ");
+              return `<span class="${escapeHtml(cls)}" title="${escapeHtml(
                 [`${p.port || p.n}`, label, p.extension].filter(Boolean).join(" · ")
               )}">${escapeHtml(p.n || "?")}${ext}</span>`;
             })
             .join("");
           const typ = nocBoardType(b.type, b.code);
-          return `<tr>
+          const q = (GW.detailQuery || "").trim().toLowerCase();
+          const hit =
+            !!q &&
+            [b.board, b.slot, typ, b.code, b.type]
+              .map((x) => String(x || "").toLowerCase())
+              .some((s) => s.includes(q));
+          return `<tr class="${hit ? "gw-mod-hit" : ""}">
             <td class="mono">${escapeHtml(b.board || "—")}</td>
-            <td class="gw-board-type">${escapeHtml(typ)}</td>
+            <td class="mono gw-board-type">${escapeHtml(typ)}</td>
             <td class="mono">${escapeHtml(b.code || "—")}</td>
             <td><div class="gw-chip-row">${chips || "—"}</div></td>
           </tr>`;
@@ -523,17 +640,30 @@ function paintGwDetailBody(payload, statusMsg) {
         boards.length ? "No assigned ports." : escapeHtml(statusMsg || "—")
       }</td></tr>`;
     } else {
-      pt.innerHTML = assigned
-        .map(
-          (a) => `<tr>
+      const q = (GW.detailQuery || "").trim().toLowerCase();
+      const shown = q
+        ? assigned.filter((a) =>
+            [a.port, a.extension, a.name, a.extType, a.code, a.type, a.board, a.slot]
+              .map((x) => String(x || "").toLowerCase())
+              .join(" ")
+              .includes(q)
+          )
+        : assigned;
+      if (!shown.length) {
+        pt.innerHTML = `<tr class="empty"><td colspan="5">No assigned ports match “${escapeHtml(q)}”.</td></tr>`;
+      } else {
+        pt.innerHTML = shown
+          .map(
+            (a) => `<tr>
             <td class="mono">${escapeHtml(a.port || "—")}</td>
             <td class="mono">${escapeHtml(a.extension || "—")}</td>
             <td>${escapeHtml(a.name || "—")}</td>
             <td>${escapeHtml(a.extType || "—")}</td>
             <td class="mono">${escapeHtml(a.code || a.type || "—")}</td>
           </tr>`
-        )
-        .join("");
+          )
+          .join("");
+      }
     }
   }
 }
@@ -551,6 +681,11 @@ export function openGatewayDetail(mg, opts = {}) {
   paintGwDetailHeader(n);
   const cached = GW.configByMg[n];
   paintGwDetailBody(cached || { boards: [], assigned: [] }, cached ? "" : "Click-in OSSI list configuration…");
+  refreshAlarmPortMap().then(() => {
+    if (GW.detailMg !== n) return;
+    const again = GW.configByMg[n];
+    if (again) paintGwDetailBody(again, "");
+  });
   if (!GW.connected) {
     paintGwDetailBody(cached || { boards: [], assigned: [] }, "Login required for list configuration media-gateway.");
     return;
@@ -575,13 +710,17 @@ function friendlyGwConfigError(err) {
 
 function pickGwConfigPayload(res) {
   if (!res || typeof res !== "object") return null;
-  if (Array.isArray(res.boards)) return res;
-  if (res.gatewayConfig && Array.isArray(res.gatewayConfig.boards)) return res.gatewayConfig;
-  if (res.gatewayConfigRefresh && Array.isArray(res.boards)) return res;
-  return null;
+  let p = null;
+  if (Array.isArray(res.boards)) p = res;
+  else if (res.gatewayConfig && Array.isArray(res.gatewayConfig.boards)) p = res.gatewayConfig;
+  else if (res.gatewayConfigRefresh && Array.isArray(res.boards)) p = res;
+  if (!p) return null;
+  if (!(p.boards || []).length && p.error) return null;
+  return p;
 }
 
 async function fetchGwConfigPayload(n) {
+  const haveCache = !!(GW.configByMg[n] && (GW.configByMg[n].boards || []).length);
   let lastErr = null;
   try {
     const res = await fetchJsonGw(apiUrlGw("refresh/one"), {
@@ -594,6 +733,7 @@ async function fetchGwConfigPayload(n) {
   } catch (e) {
     lastErr = e;
   }
+  if (haveCache) throw lastErr || new Error("refresh/one failed");
   try {
     const res = await fetchJsonGw(apiUrlGw("gateways/config"), {
       method: "POST",
@@ -623,6 +763,9 @@ export async function runGatewayConfigRefresh(mg, opts = {}) {
   const n = Number(mg);
   const showModal = !!opts.showModal;
   if (!n) return null;
+  if (GW.configLoadingMg === n && !showModal) return GW.configByMg[n] || null;
+  GW.configLoadingMg = n;
+  GW.loading = true;
   if (showModal) {
     showProgress(`MG ${n} configuration`, "OSSI list configuration media-gateway…");
     setProgress(25, `list configuration media-gateway ${n}…`);
@@ -633,14 +776,29 @@ export async function runGatewayConfigRefresh(mg, opts = {}) {
     payload = await fetchGwConfigPayload(n);
   } catch (e) {
     const msg = friendlyGwConfigError(e);
-    if (showModal) finishProgress(false, msg);
-    setGwStatus(msg);
+    const keep = GW.configByMg[n] && (GW.configByMg[n].boards || []).length ? GW.configByMg[n] : null;
+    setGwStatus(keep ? "OSSI busy — keeping last configuration" : msg);
     if (GW.detailMg === n) {
-      paintGwDetailBody(GW.configByMg[n] || { boards: [], assigned: [] }, msg);
+      paintGwDetailBody(keep || { boards: [], assigned: [] }, keep ? "" : msg);
     }
+    GW.configLoadingMg = 0;
+    GW.loading = false;
+    if (showModal) {
+      finishProgress(!!keep, keep ? "Showing last configuration — Auto will retry" : msg);
+    }
+    if (keep) return keep;
     throw new Error(msg);
   }
-  GW.configByMg[n] = payload;
+  const incoming = (payload.boards || []).length;
+  if (incoming) GW.configByMg[n] = payload;
+  else if (GW.configByMg[n] && (GW.configByMg[n].boards || []).length) {
+    setGwStatus(payload.error || "config incomplete — keeping last");
+    payload = GW.configByMg[n];
+  } else {
+    GW.configByMg[n] = payload;
+  }
+  GW.configLoadingMg = 0;
+  GW.loading = false;
   const t = payload.timing || {};
   const nBoard = (payload.boards || []).length;
   setGwStatus(
@@ -648,6 +806,7 @@ export async function runGatewayConfigRefresh(mg, opts = {}) {
       ? String(payload.error)
       : `list configuration media-gateway ${n} ${t.listSec != null ? t.listSec + "s" : ""} · ${nBoard} boards`
   );
+  await refreshAlarmPortMap();
   if (GW.detailMg === n) {
     paintGwDetailHeader(n);
     paintGwDetailBody(payload, payload.error || "");
@@ -660,6 +819,7 @@ export async function runGatewayConfigRefresh(mg, opts = {}) {
 
 export function initGatewayUi() {
   startGwCountdownPaint();
+  refreshAlarmPortMap().catch(() => {});
 
   const search = document.getElementById("gw-search");
   if (search) {
@@ -667,6 +827,15 @@ export function initGatewayUi() {
       GW.query = search.value || "";
       paintGwSummary();
       renderGwTable();
+    });
+  }
+  const dsearch = document.getElementById("gw-detail-search");
+  if (dsearch) {
+    dsearch.addEventListener("input", () => {
+      GW.detailQuery = dsearch.value || "";
+      const mg = GW.detailMg;
+      const cached = mg ? GW.configByMg[mg] : null;
+      if (cached) paintGwDetailBody(cached, "");
     });
   }
 
@@ -681,34 +850,6 @@ export function initGatewayUi() {
     });
   }
   document.getElementById("btn-gw-detail-back")?.addEventListener("click", () => closeGatewayDetail());
-  document.getElementById("btn-gw-detail-refresh")?.addEventListener("click", () => {
-    if (!GW.detailMg) return;
-    openGatewayDetail(GW.detailMg, { showModal: true });
-  });
-
-  document.getElementById("btn-gw-refresh")?.addEventListener("click", async () => {
-    const btn = document.getElementById("btn-gw-refresh");
-    if (btn) {
-      btn.disabled = true;
-      btn.textContent = "Refreshing…";
-    }
-    try {
-      if (GW.ossiBusy) {
-        setGwStatus("OSSI busy (Trunk updating) — will refresh when free");
-        GW.pendingSilent = true;
-        return;
-      }
-      await loadGateways({ force: true, showModal: true });
-    } catch (e) {
-      setGwStatus(String(e.message || e));
-      finishProgress(false, String(e.message || e));
-    } finally {
-      if (btn) {
-        btn.disabled = !GW.connected;
-        btn.textContent = "Refresh";
-      }
-    }
-  });
 
   paintGwSummary();
   renderGwTable();

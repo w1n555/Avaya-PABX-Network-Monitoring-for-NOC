@@ -6,6 +6,7 @@
  */
 
 import { showProgress, setProgress, finishProgress } from "./cdr-ui.js";
+import { getGatewayMjMn } from "./gateway-ui.js?v=20260821s";
 
 /** Magic TG for refresh/one when CmApi has no /alarms route. */
 const TG_ACTIVE = 9996;
@@ -43,6 +44,7 @@ async function fetchJson(url, opts = {}) {
 
 const ALARM = {
   data: { active: [], mtceTypes: [], summary: {} },
+  query: "",
   typeOn: {},
   nextAt: 0,
   countdownTimer: null,
@@ -78,8 +80,16 @@ function fmtUpdated(iso) {
   }
 }
 
+function gwMjMn() {
+  try {
+    return getGatewayMjMn();
+  } catch {
+    return { mj: 0, mn: 0 };
+  }
+}
+
 function alarmFingerprint(active) {
-  return (active || [])
+  const alarmPart = (active || [])
     .filter((a) => {
       const s = (a.severity || "").toUpperCase();
       return s === "MAJOR" || s === "MINOR";
@@ -87,9 +97,11 @@ function alarmFingerprint(active) {
     .map((a) => a.id || `${a.mtceName}|${a.severity}|${a.alarmedRaw}`)
     .sort()
     .join(";");
+  const g = gwMjMn();
+  return `${alarmPart}|gw:${g.mj}:${g.mn}`;
 }
 
-function applyAlarmFlash() {
+export function applyAlarmFlash() {
   const body = document.body;
   body.classList.remove("alarm-bg-major", "alarm-bg-minor");
   if (ALARM.manualRed) {
@@ -101,14 +113,17 @@ function applyAlarmFlash() {
     return;
   }
   const sum = ALARM.data.summary || {};
-  const maj = Number(sum.activeMajor || 0);
-  const min = Number(sum.activeMinor || 0);
+  const g = gwMjMn();
+  const maj = Number(sum.activeMajor || 0) + Number(g.mj || 0);
+  const min = Number(sum.activeMinor || 0) + Number(g.mn || 0);
   const fp = alarmFingerprint(ALARM.data.active);
   ALARM.lastFp = fp;
   if (ALARM.ackedFp && ALARM.ackedFp === fp) return;
   if (maj > 0) body.classList.add("alarm-bg-major");
   else if (min > 0) body.classList.add("alarm-bg-minor");
 }
+
+if (typeof window !== "undefined") window.__cmApplyAlarmFlash = applyAlarmFlash;
 
 function setAlarmStatus(msg) {
   const el = document.getElementById("alarm-auto-status");
@@ -186,10 +201,24 @@ function paintAlarmSummary() {
 }
 
 function filteredRows() {
+  const q = (ALARM.query || "").trim().toLowerCase();
   return (ALARM.data.active || []).filter((a) => {
     const t = a.mtceType || a.mtceName || "";
-    if (!t) return true;
-    return ALARM.typeOn[t] !== false;
+    if (t && ALARM.typeOn[t] === false) return false;
+    if (!q) return true;
+    const hay = [
+      a.alarmed,
+      a.alarmedRaw,
+      a.severity,
+      a.mtceName,
+      a.mtceType,
+      a.altName,
+      a.port,
+      a.status,
+    ]
+      .map((x) => String(x || "").toLowerCase())
+      .join(" ");
+    return hay.includes(q);
   });
 }
 
@@ -204,7 +233,9 @@ function renderAlarmTable() {
   const tbody = document.getElementById("alarm-tbody");
   if (!tbody) return;
   if (ALARM.loading && !(ALARM.data.active || []).length) {
-    tbody.innerHTML = `<tr class="empty"><td colspan="5">Updating… (waiting for OSSI — Trunk update may be running)</td></tr>`;
+    tbody.innerHTML = `<tr class="empty"><td colspan="5">${
+      ALARM.connected ? "No active alarms." : "Login required for live alarms."
+    }</td></tr>`;
     return;
   }
   const rows = filteredRows();
@@ -238,15 +269,18 @@ function paintAlarmCountdown() {
     el.textContent = "Next: —";
     return;
   }
-  if (ALARM.loading) {
+  if (ALARM.loading || ALARM.ossiBusy) {
     el.textContent = "Updating…";
     return;
   }
   if (!ALARM.nextAt) {
-    el.textContent = "Next: session Auto 60s";
+    el.textContent = "Next: session Auto 90s";
     return;
   }
-  const sec = Math.max(0, Math.ceil((ALARM.nextAt - Date.now()) / 1000));
+  const sec = Math.min(
+    90,
+    Math.max(0, Math.ceil((ALARM.nextAt - Date.now()) / 1000))
+  );
   el.textContent = `Next: ${sec}s`;
 }
 
@@ -262,6 +296,12 @@ function applyAlarmPayload(data) {
   if (!Array.isArray(d.active) && !d.summary) return false;
   const incoming = Array.isArray(d.active) ? d.active : [];
   const prev = ALARM.data.active || [];
+  if (prev.length > 0 && incoming.length === 0 && d.ok !== true) {
+    return false;
+  }
+  if (prev.length > 0 && incoming.length === 0 && d.error) {
+    return false;
+  }
   // Incomplete OSSI page-in: keep the fuller cache instead of shrinking the table
   if (prev.length >= 20 && incoming.length > 0 && incoming.length < prev.length * 0.5) {
     console.warn("alarm payload looks truncated", incoming.length, "vs", prev.length);
@@ -314,7 +354,6 @@ async function loadAlarms(opts = {}) {
   const showModal = !!opts.showModal;
   ALARM.loading = true;
   paintAlarmCountdown();
-  if (force) renderAlarmTable();
 
   let ok = false;
   try {
@@ -450,14 +489,26 @@ export async function refreshAlarmsSilent() {
   }
 }
 
-/** Trunk Auto countdown drives Alarm "Next" so both share one 60s. */
+/** Trunk Auto countdown drives Alarm "Next" so both share one 90s. */
 export function syncAlarmCountdown(nextAtMs) {
-  if (nextAtMs) ALARM.nextAt = nextAtMs;
+  const t = Number(nextAtMs);
+  if (t) {
+    const maxAt = Date.now() + 90 * 1000;
+    ALARM.nextAt = Math.min(t, maxAt);
+  }
   paintAlarmCountdown();
 }
 
 export function initAlarmUi() {
   startCountdownPaint();
+
+  const search = document.getElementById("alarm-search");
+  if (search) {
+    search.addEventListener("input", () => {
+      ALARM.query = search.value || "";
+      renderAlarmTable();
+    });
+  }
 
   document.getElementById("btn-alarm-refresh")?.addEventListener("click", async () => {
     const btn = document.getElementById("btn-alarm-refresh");

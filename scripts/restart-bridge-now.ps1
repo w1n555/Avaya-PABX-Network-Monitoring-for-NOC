@@ -42,7 +42,7 @@ L "appsettings BaseUrl :$PORT"
 
 $p = Start-Process -FilePath $py -ArgumentList @(
   "C:\inetpub\wwwroot\CM\python\ossi_service.py",
-  "--host", "127.0.0.1",
+  "--host", "0.0.0.0",
   "--port", "$PORT",
   "--data-dir", "C:\inetpub\wwwroot\CM\data_live"
 ) -WorkingDirectory "C:\inetpub\wwwroot\CM\python" -WindowStyle Hidden -PassThru

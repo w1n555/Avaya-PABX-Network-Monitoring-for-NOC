@@ -528,18 +528,5 @@ export function initExtensionUi() {
     });
   }
 
-  const btn = document.getElementById("btn-ext-refresh");
-  if (btn) {
-    btn.addEventListener("click", () => {
-      if (!EXT.connected) return;
-      // Queue via app when available; fallback direct
-      if (typeof window.__cmEnqueueExtension === "function") {
-        window.__cmEnqueueExtension({ showModal: true, reason: "manual" });
-      } else {
-        runExtensionRefresh({ showModal: true }).catch(() => {});
-      }
-    });
-  }
-
   loadExtensions({ force: false, showModal: false }).catch(() => {});
 }

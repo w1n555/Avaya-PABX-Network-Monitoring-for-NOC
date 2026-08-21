@@ -811,12 +811,49 @@ function fmtLastCall(st) {
   return `last call ${Math.floor(age / 3600)}h ago`;
 }
 
+async function apiPost(path, body) {
+  const res = await fetch(apiUrl(path), {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: body == null ? "{}" : JSON.stringify(body),
+  });
+  const text = await res.text();
+  let parsed = null;
+  try {
+    parsed = text ? JSON.parse(text) : null;
+  } catch {
+    parsed = { raw: text };
+  }
+  if (!res.ok) throw new Error((parsed && (parsed.error || parsed.Error)) || res.statusText);
+  return parsed;
+}
+
+async function ensureCdrLoggerIfDown(st) {
+  if (st && st.loggerUp === true) return st;
+  try {
+    const r = await apiPost("cdr/logger/ensure", {});
+    return {
+      ...st,
+      loggerUp: r.up === true,
+      loggerPort: r.port || (st && st.loggerPort),
+      todayFile: r.todayFile || (st && st.todayFile),
+      lastCall: r.lastCall || (st && st.lastCall),
+      lastCallAgeSec: r.lastCallAgeSec ?? (st && st.lastCallAgeSec),
+      todayBytes: r.todayBytes ?? (st && st.todayBytes),
+    };
+  } catch {
+    return st;
+  }
+}
+
 async function refreshCdrStatus() {
   const el = document.getElementById("cdr-status-line");
   const pill = document.getElementById("cdr-logger-pill");
   const banner = document.getElementById("cdr-live-banner");
   try {
-    const st = await apiGet("cdr/status");
+    let st = await apiGet("cdr/status");
+    if (st.loggerUp !== true) st = (await ensureCdrLoggerIfDown(st)) || st;
     const up = st.loggerUp === true;
     if (pill) pill.textContent = up ? "Logger UP" : "Logger DOWN";
     if (el) {
